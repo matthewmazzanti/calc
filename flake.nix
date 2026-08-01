@@ -34,6 +34,9 @@
             pkgs.clippy
             pkgs.rust-analyzer
           ];
+
+          # Point rust-analyzer at the stdlib source so it can resolve `std`.
+          RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
         };
       });
 }

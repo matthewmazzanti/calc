@@ -16,7 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 
-use crate::engine::{CalcError, Command, Engine, Value};
+use crate::engine::{Command, Engine, Outcome, Value};
 use crate::history::History;
 
 /// The stack is shown one value per row, up to this many rows; beyond it only
@@ -198,7 +198,8 @@ impl App {
     fn apply_operator(&mut self, op: Command) {
         let entry = self.input.clone();
         let ok = self.transform(|e| {
-            // Thread the engine through the entry (if any), then the operator.
+            // Thread the engine through the entry (if any), then the operator —
+            // both yield an EvalError, so `?` composes directly.
             let e = if entry.trim().is_empty() {
                 e
             } else {
@@ -212,24 +213,20 @@ impl App {
     }
 
     /// Run a transform against a copy of the current engine. On success the
-    /// returned engine is committed as one undo point; on failure it was
-    /// consumed by the error (leaving the live engine unchanged) and the error
+    /// returned engine is committed as one undo point; on failure the error
+    /// (which carries the engine it consumed, leaving the live engine unchanged)
     /// is shown. Returns success.
-    fn transform(&mut self, f: impl FnOnce(Engine) -> Result<Engine, CalcError>) -> bool {
+    fn transform(&mut self, f: impl FnOnce(Engine) -> Outcome) -> bool {
         match f(self.engine().clone()) {
             Ok(next) => {
                 self.history.commit(next);
                 true
             }
             Err(e) => {
-                self.report_err(e);
+                self.status = format!("error: {e}");
                 false
             }
         }
-    }
-
-    fn report_err(&mut self, e: CalcError) {
-        self.status = format!("error: {e}");
     }
 }
 

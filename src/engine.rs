@@ -1,13 +1,15 @@
 //! The RPN calculator engine: an [`Engine`] wrapping a stack of floating-point
-//! values (and, later, evaluation settings). No I/O, no history — its transforms
-//! *consume* `self` and return the new engine, so a sequence of commands folds
-//! through with no intermediate copies: the same value is moved from step to
-//! step. [`Engine::eval`] is literally `commands.try_fold(self, Engine::apply)`.
+//! values (and, later, evaluation settings). No I/O and no history — its
+//! transforms *consume* `self` and return the new engine, so a sequence of
+//! commands folds through with no intermediate copies: the same value is moved
+//! from step to step. [`Engine::eval`] is essentially
+//! `commands.try_fold(self, Engine::apply)`.
 //!
-//! Because a transform takes `self` by value, an error consumes it — `eval`
-//! returns `Err` and the partial engine is dropped. Evaluation is therefore
-//! atomic from the caller's side: they keep their own copy (see the `history`
-//! module) and commit the returned engine only on `Ok`.
+//! On failure a transform moves `self` *into* the error rather than dropping it:
+//! [`CalcError`] carries the engine as it stood when the command failed — its
+//! stack is exactly the state the command saw, since ops check before mutating —
+//! so callers can inspect it. The caller keeps its own copy for undo (see the
+//! `history` module) and commits the returned engine only on `Ok`.
 
 /// The value type held on the stack. Aliased so it can grow later (complex,
 /// rationals, …) without touching every call site.
@@ -17,9 +19,11 @@ pub type Value = f64;
 /// Internal — the public handle is [`Engine`].
 type Stack = Vec<Value>;
 
-/// Everything that can go wrong while evaluating a token.
+/// What went wrong — the semantic error, independent of any engine state. This
+/// is what the pure parsing/index helpers produce; a failing engine op pairs it
+/// with the engine to form a [`CalcError`].
 #[derive(Debug, Clone, PartialEq)]
-pub enum CalcError {
+pub enum ErrorKind {
     /// An operation needed more operands than the stack held.
     StackUnderflow,
     /// Division with a zero divisor.
@@ -28,17 +32,15 @@ pub enum CalcError {
     UnknownCommand(String),
 }
 
-impl std::fmt::Display for CalcError {
+impl std::fmt::Display for ErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CalcError::StackUnderflow => write!(f, "too few arguments"),
-            CalcError::DivideByZero => write!(f, "divide by zero"),
-            CalcError::UnknownCommand(c) => write!(f, "unknown command: {c}"),
+            ErrorKind::StackUnderflow => write!(f, "too few arguments"),
+            ErrorKind::DivideByZero => write!(f, "divide by zero"),
+            ErrorKind::UnknownCommand(c) => write!(f, "unknown command: {c}"),
         }
     }
 }
-
-impl std::error::Error for CalcError {}
 
 /// A single parsed instruction. Parsing turns text into these; evaluation
 /// consumes them. `Push` carries its literal, so the whole program is a flat
@@ -70,7 +72,7 @@ impl Command {
     ///
     /// A token that parses as a number becomes `Push`; otherwise it must be a
     /// known command word. This is the only place text becomes a `Command`.
-    pub fn parse(token: &str) -> Result<Command, CalcError> {
+    pub fn parse(token: &str) -> Result<Command, ErrorKind> {
         if let Ok(n) = token.parse::<Value>() {
             return Ok(Command::Push(n));
         }
@@ -88,10 +90,77 @@ impl Command {
             "over" => Command::Over,
             "rot" => Command::Roll(3),
             "clear" => Command::Clear,
-            other => return Err(CalcError::UnknownCommand(other.to_string())),
+            other => return Err(ErrorKind::UnknownCommand(other.to_string())),
         })
     }
 }
+
+impl std::fmt::Display for Command {
+    /// The canonical token, so errors can name the command that failed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Command::Push(n) => write!(f, "{n}"),
+            Command::Add => write!(f, "+"),
+            Command::Sub => write!(f, "-"),
+            Command::Mul => write!(f, "*"),
+            Command::Div => write!(f, "/"),
+            Command::Neg => write!(f, "neg"),
+            Command::Dup(1) => write!(f, "dup"),
+            Command::Dup(l) => write!(f, "dup {l}"),
+            Command::Drop(1) => write!(f, "drop"),
+            Command::Drop(l) => write!(f, "drop {l}"),
+            Command::Swap(1) => write!(f, "swap"),
+            Command::Swap(l) => write!(f, "swap {l}"),
+            Command::Over => write!(f, "over"),
+            Command::Roll(3) => write!(f, "rot"),
+            Command::Roll(l) => write!(f, "roll {l}"),
+            Command::Clear => write!(f, "clear"),
+        }
+    }
+}
+
+/// A semantic error plus the context to inspect it: the engine as it stood when
+/// evaluation failed, and where in the line it happened.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CalcError {
+    /// What went wrong.
+    pub kind: ErrorKind,
+    /// The engine at the moment of failure. Since every op checks its
+    /// preconditions before mutating, its stack is exactly the state the failing
+    /// command saw — nothing partially applied.
+    pub engine: Engine,
+    /// The failing command and its 0-based position in the line, when the
+    /// failure was a runtime error on a specific command. `None` for parse
+    /// errors, whose offending token is already named in `kind`.
+    pub at: Option<(usize, Command)>,
+}
+
+impl CalcError {
+    fn new(engine: Engine, kind: ErrorKind) -> Self {
+        Self {
+            kind,
+            engine,
+            at: None,
+        }
+    }
+}
+
+impl std::fmt::Display for CalcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.kind)?;
+        if let Some((position, command)) = self.at {
+            // Positions are 0-based internally; show them 1-based.
+            write!(f, " (at #{}: `{}`)", position + 1, command)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for CalcError {}
+
+/// The result of a transform: the new engine, or a [`CalcError`] carrying the
+/// engine at the point of failure.
+pub type Outcome = Result<Engine, CalcError>;
 
 /// The calculator engine: the RPN stack, plus (later) evaluation settings such
 /// as angle mode, display precision, or named registers.
@@ -117,27 +186,43 @@ impl Engine {
 
     /// Evaluate a whitespace-separated line, threading the engine through each
     /// command. The line is parsed first, so a malformed token fails before
-    /// anything runs; the first runtime error short-circuits the fold and the
-    /// partial engine is dropped with it.
-    pub fn eval(self, input: &str) -> Result<Self, CalcError> {
-        let program = input
+    /// anything runs; the first runtime error short-circuits the fold. Errors
+    /// carry the engine at the point of failure and which command failed.
+    pub fn eval(self, input: &str) -> Outcome {
+        let program = match input
             .split_whitespace()
             .map(Command::parse)
-            .collect::<Result<Vec<_>, _>>()?;
-        program.into_iter().try_fold(self, Engine::apply)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(program) => program,
+            // Parse failed before any command ran; attach the untouched engine.
+            Err(kind) => return self.fail(kind),
+        };
+        program
+            .into_iter()
+            .enumerate()
+            .try_fold(self, |engine, (position, command)| {
+                engine.apply(command).map_err(|mut e| {
+                    e.at = Some((position, command));
+                    e
+                })
+            })
     }
 
-    /// Apply a single command by dispatching to a stack transform. A total
-    /// match, so a new command variant is a compile error until handled.
-    pub fn apply(self, cmd: Command) -> Result<Self, CalcError> {
+    /// Apply a single command, consuming `self` and returning the new engine.
+    /// A total match, so a new command variant is a compile error until handled.
+    pub fn apply(mut self, cmd: Command) -> Outcome {
         match cmd {
-            Command::Push(n) => self.push(n),
+            Command::Push(n) => {
+                self.stack.push(n);
+                Ok(self)
+            }
             Command::Add => self.binary(|a, b| Ok(a + b)),
             Command::Sub => self.binary(|a, b| Ok(a - b)),
             Command::Mul => self.binary(|a, b| Ok(a * b)),
             Command::Div => self.binary(|a, b| {
                 if b == 0.0 {
-                    Err(CalcError::DivideByZero)
+                    Err(ErrorKind::DivideByZero)
                 } else {
                     Ok(a / b)
                 }
@@ -149,27 +234,30 @@ impl Engine {
             // `over` copies the second-from-top value to the top.
             Command::Over => self.dup(2),
             Command::Roll(level) => self.roll(level),
-            Command::Clear => self.clear(),
+            Command::Clear => {
+                self.stack.clear();
+                Ok(self)
+            }
         }
     }
 
-    // Stack transforms. Each consumes `self`, mutates the stack, and returns the
-    // new engine — so a command is just `self.<op>(…)`, other engine state rides
-    // along untouched, and errors flow out through `?`.
+    // Stack transforms. Each consumes `self`; on failure it moves `self` into
+    // the error (via `fail`) instead of dropping it, so the engine is available
+    // for inspection. The pure checks return an `ErrorKind`; the one `match`
+    // per op is where `self` gets attached.
 
-    /// The `Vec` index for a 1-based level (level 1 == top of stack). Errors if
-    /// the level doesn't exist.
-    fn index_of_level(&self, level: usize) -> Result<usize, CalcError> {
+    /// The failure path of every transform: move `self` into the error and
+    /// return it as an `Err`, ready to hand straight back.
+    fn fail<T>(self, kind: ErrorKind) -> Result<T, CalcError> {
+        Err(CalcError::new(self, kind))
+    }
+
+    /// The `Vec` index for a 1-based level (level 1 == top of stack), or `None`
+    /// if the level is out of range. Callers turn `None` into a `StackUnderflow`
+    /// with a `let-else` early return.
+    fn index_of_level(&self, level: usize) -> Option<usize> {
         let len = self.stack.len();
-        if level == 0 || level > len {
-            return Err(CalcError::StackUnderflow);
-        }
-        Ok(len - level)
-    }
-
-    fn push(mut self, value: Value) -> Result<Self, CalcError> {
-        self.stack.push(value);
-        Ok(self)
+        (1..=len).contains(&level).then(|| len - level)
     }
 
     /// Two-operand arithmetic. `a` is the deeper operand, `b` the top, so
@@ -177,62 +265,70 @@ impl Engine {
     /// inputs (e.g. divide-by-zero).
     fn binary(
         mut self,
-        op: impl FnOnce(Value, Value) -> Result<Value, CalcError>,
-    ) -> Result<Self, CalcError> {
+        op: impl FnOnce(Value, Value) -> Result<Value, ErrorKind>,
+    ) -> Outcome {
         let n = self.stack.len();
-        if n < 2 {
-            return Err(CalcError::StackUnderflow);
+        let result = if n < 2 {
+            Err(ErrorKind::StackUnderflow)
+        } else {
+            op(self.stack[n - 2], self.stack[n - 1])
+        };
+        match result {
+            Ok(result) => {
+                self.stack.truncate(n - 2);
+                self.stack.push(result);
+                Ok(self)
+            }
+            Err(kind) => self.fail(kind),
         }
-        let result = op(self.stack[n - 2], self.stack[n - 1])?;
-        self.stack.truncate(n - 2);
-        self.stack.push(result);
-        Ok(self)
     }
 
     /// One-operand op applied to the top of stack.
-    fn unary(mut self, op: impl FnOnce(Value) -> Value) -> Result<Self, CalcError> {
+    fn unary(mut self, op: impl FnOnce(Value) -> Value) -> Outcome {
         let n = self.stack.len();
         if n < 1 {
-            return Err(CalcError::StackUnderflow);
+            return self.fail(ErrorKind::StackUnderflow);
         }
         self.stack[n - 1] = op(self.stack[n - 1]);
         Ok(self)
     }
 
     /// Push a copy of the value at `level`.
-    fn dup(mut self, level: usize) -> Result<Self, CalcError> {
-        let i = self.index_of_level(level)?;
+    fn dup(mut self, level: usize) -> Outcome {
+        let Some(i) = self.index_of_level(level) else {
+            return self.fail(ErrorKind::StackUnderflow);
+        };
         let v = self.stack[i];
         self.stack.push(v);
         Ok(self)
     }
 
     /// Remove the value at `level`.
-    fn drop_at(mut self, level: usize) -> Result<Self, CalcError> {
-        let i = self.index_of_level(level)?;
+    fn drop_at(mut self, level: usize) -> Outcome {
+        let Some(i) = self.index_of_level(level) else {
+            return self.fail(ErrorKind::StackUnderflow);
+        };
         self.stack.remove(i);
         Ok(self)
     }
 
     /// Exchange the value at `level` with the one just below it (`level + 1`).
-    fn swap(mut self, level: usize) -> Result<Self, CalcError> {
-        let i = self.index_of_level(level)?;
-        let j = self.index_of_level(level + 1)?;
+    fn swap(mut self, level: usize) -> Outcome {
+        let (Some(i), Some(j)) = (self.index_of_level(level), self.index_of_level(level + 1))
+        else {
+            return self.fail(ErrorKind::StackUnderflow);
+        };
         self.stack.swap(i, j);
         Ok(self)
     }
 
     /// Roll the value at `level` up to the top, shifting shallower values down.
-    fn roll(mut self, level: usize) -> Result<Self, CalcError> {
-        let i = self.index_of_level(level)?;
+    fn roll(mut self, level: usize) -> Outcome {
+        let Some(i) = self.index_of_level(level) else {
+            return self.fail(ErrorKind::StackUnderflow);
+        };
         let v = self.stack.remove(i);
         self.stack.push(v);
-        Ok(self)
-    }
-
-    /// Empty the stack.
-    fn clear(mut self) -> Result<Self, CalcError> {
-        self.stack.clear();
         Ok(self)
     }
 }
@@ -279,12 +375,28 @@ mod tests {
 
     #[test]
     fn divide_by_zero_is_an_error() {
-        assert_eq!(run("1 0").apply(Command::Div), Err(CalcError::DivideByZero));
+        assert_eq!(
+            run("1 0").apply(Command::Div).unwrap_err().kind,
+            ErrorKind::DivideByZero
+        );
     }
 
     #[test]
     fn underflow_is_an_error() {
-        assert_eq!(run("1").apply(Command::Add), Err(CalcError::StackUnderflow));
+        assert_eq!(
+            run("1").apply(Command::Add).unwrap_err().kind,
+            ErrorKind::StackUnderflow
+        );
+    }
+
+    #[test]
+    fn errors_carry_the_engine_at_the_point_of_failure() {
+        // The whole engine is attached for inspection; its stack is the state
+        // the failing command saw (operands still present, nothing partial).
+        let err = Engine::new().eval("1 0 /").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::DivideByZero);
+        assert_eq!(err.engine.stack(), &[1.0, 0.0]);
+        assert_eq!(err.at, Some((2, Command::Div)));
     }
 
     #[test]
@@ -292,8 +404,28 @@ mod tests {
         // Family-C atomicity: evaluate a *copy*; on error the original is intact
         // simply because it was never moved into `eval`.
         let original = run("1");
-        assert_eq!(original.clone().eval("+"), Err(CalcError::StackUnderflow));
+        assert_eq!(
+            original.clone().eval("+").unwrap_err().kind,
+            ErrorKind::StackUnderflow
+        );
         assert_eq!(original.stack(), &[1.0]);
+    }
+
+    #[test]
+    fn eval_error_names_the_failing_command_and_position() {
+        // `1 2 + /`: after `+` the stack is [3]; `/` underflows at position 3.
+        let err = Engine::new().eval("1 2 + /").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::StackUnderflow);
+        assert_eq!(err.at, Some((3, Command::Div)));
+        assert_eq!(err.to_string(), "too few arguments (at #4: `/`)");
+    }
+
+    #[test]
+    fn parse_errors_carry_no_position() {
+        // The offending token is already in the message, so `at` is None.
+        let err = Engine::new().eval("1 2 + oops").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::UnknownCommand("oops".to_string()));
+        assert_eq!(err.at, None);
     }
 
     #[test]
@@ -321,8 +453,8 @@ mod tests {
     #[test]
     fn unknown_command_errors() {
         assert_eq!(
-            Engine::new().eval("foo"),
-            Err(CalcError::UnknownCommand("foo".to_string()))
+            Engine::new().eval("foo").unwrap_err().kind,
+            ErrorKind::UnknownCommand("foo".to_string())
         );
     }
 
@@ -333,17 +465,7 @@ mod tests {
         assert_eq!(Command::parse("dup"), Ok(Command::Dup(1)));
         assert_eq!(
             Command::parse("nope"),
-            Err(CalcError::UnknownCommand("nope".to_string()))
-        );
-    }
-
-    #[test]
-    fn a_parse_error_reports_the_bad_token() {
-        // The whole line is parsed before any command runs, so a bad token
-        // fails the line without applying anything.
-        assert_eq!(
-            Engine::new().eval("1 2 + oops"),
-            Err(CalcError::UnknownCommand("oops".to_string()))
+            Err(ErrorKind::UnknownCommand("nope".to_string()))
         );
     }
 
@@ -384,8 +506,8 @@ mod tests {
     #[test]
     fn swap_at_the_bottom_has_nothing_below() {
         assert_eq!(
-            run("1 2 3").apply(Command::Swap(3)),
-            Err(CalcError::StackUnderflow)
+            run("1 2 3").apply(Command::Swap(3)).unwrap_err().kind,
+            ErrorKind::StackUnderflow
         );
     }
 
@@ -405,7 +527,13 @@ mod tests {
 
     #[test]
     fn level_zero_and_out_of_range_error() {
-        assert_eq!(run("1 2").apply(Command::Drop(0)), Err(CalcError::StackUnderflow));
-        assert_eq!(run("1 2").apply(Command::Roll(5)), Err(CalcError::StackUnderflow));
+        assert_eq!(
+            run("1 2").apply(Command::Drop(0)).unwrap_err().kind,
+            ErrorKind::StackUnderflow
+        );
+        assert_eq!(
+            run("1 2").apply(Command::Roll(5)).unwrap_err().kind,
+            ErrorKind::StackUnderflow
+        );
     }
 }
