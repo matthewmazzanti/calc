@@ -1,49 +1,42 @@
-//! Undo history: a non-empty list of past states. The last element is the
-//! current state; committing appends a new one, undo drops the last. It knows
-//! nothing about the engine — it just remembers states of type `T`.
+//! Undo history: a bounded stack of past states. The current state lives
+//! outside (the caller holds it), so this is the "tail" of a non-empty
+//! `(current, past…)` list — an empty history simply means there's nothing to
+//! undo.
 
 /// How many past states can be walked back through. Keeps a long editing
 /// session from growing memory without bound.
 const MAX_UNDO: usize = 256;
 
-/// A linear undo history over states of type `T`.
+/// A bounded stack of past states, most recent last.
 #[derive(Debug)]
 pub struct History<T> {
-    /// Invariant: never empty. `states.last()` is the current state.
-    states: Vec<T>,
+    past: Vec<T>,
 }
 
 impl<T> History<T> {
-    /// Start a history at `initial`, which becomes the current state.
-    pub fn new(initial: T) -> Self {
-        Self {
-            states: vec![initial],
+    pub fn new() -> Self {
+        Self { past: Vec::new() }
+    }
+
+    /// Record a state as the most recent undo point.
+    pub fn push(&mut self, state: T) {
+        self.past.push(state);
+        // Keep only the most recent MAX_UNDO states.
+        if self.past.len() > MAX_UNDO {
+            self.past.remove(0);
         }
     }
 
-    /// The current state.
-    pub fn current(&self) -> &T {
-        self.states.last().expect("history is never empty")
+    /// Take the most recent past state back off, or `None` if there's nothing
+    /// left to undo.
+    pub fn pop(&mut self) -> Option<T> {
+        self.past.pop()
     }
+}
 
-    /// Record `next` as the new current state and a fresh undo point.
-    pub fn commit(&mut self, next: T) {
-        self.states.push(next);
-        // Keep at most MAX_UNDO prior states plus the current one.
-        if self.states.len() > MAX_UNDO + 1 {
-            self.states.remove(0);
-        }
-    }
-
-    /// Revert to the previous state. Returns `false` (leaving the current state
-    /// in place) when already at the oldest remembered state.
-    pub fn undo(&mut self) -> bool {
-        if self.states.len() > 1 {
-            self.states.pop();
-            true
-        } else {
-            false
-        }
+impl<T> Default for History<T> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -52,42 +45,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn starts_at_the_initial_state() {
-        let h = History::new(vec![1, 2, 3]);
-        assert_eq!(h.current(), &vec![1, 2, 3]);
+    fn starts_empty() {
+        let mut h: History<i32> = History::new();
+        assert_eq!(h.pop(), None);
     }
 
     #[test]
-    fn commit_then_undo_walks_back() {
-        let mut h = History::new(0);
-        h.commit(1);
-        h.commit(2);
-        assert_eq!(*h.current(), 2);
-        assert!(h.undo());
-        assert_eq!(*h.current(), 1);
-        assert!(h.undo());
-        assert_eq!(*h.current(), 0);
+    fn push_then_pop_is_lifo() {
+        let mut h = History::new();
+        h.push(1);
+        h.push(2);
+        assert_eq!(h.pop(), Some(2));
+        assert_eq!(h.pop(), Some(1));
+        assert_eq!(h.pop(), None);
     }
 
     #[test]
-    fn undo_at_the_oldest_state_reports_false() {
-        let mut h = History::new(42);
-        assert!(!h.undo());
-        assert_eq!(*h.current(), 42); // unchanged
-    }
-
-    #[test]
-    fn history_is_capped_but_keeps_the_current_state() {
-        let mut h = History::new(0);
-        for i in 1..=(MAX_UNDO + 50) {
-            h.commit(i);
+    fn capped_at_max_undo() {
+        let mut h = History::new();
+        for i in 0..(MAX_UNDO + 50) {
+            h.push(i);
         }
-        // The current state survives, and we can't undo past the cap.
-        assert_eq!(*h.current(), MAX_UNDO + 50);
-        let mut steps = 0;
-        while h.undo() {
-            steps += 1;
+        // Only the most recent MAX_UNDO survive; the oldest were dropped.
+        let mut count = 0;
+        while h.pop().is_some() {
+            count += 1;
         }
-        assert_eq!(steps, MAX_UNDO);
+        assert_eq!(count, MAX_UNDO);
     }
 }

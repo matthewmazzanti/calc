@@ -11,20 +11,23 @@ use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Position};
-use ratatui::style::{Style, Stylize};
+use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 
-use crate::engine::{Command, Engine, Outcome, Value};
+use crate::engine::{CalcError, Command, Engine, Outcome, Value};
 use crate::history::History;
+
+/// The command-line prompt colour (ANSI teal, so it follows the terminal theme).
+const TEAL: Color = Color::Cyan;
 
 /// The stack is shown one value per row, up to this many rows; beyond it only
 /// the shallowest `MAX_STACK_ROWS` levels are visible.
 const MAX_STACK_ROWS: u16 = 10;
 
-/// Rows of chrome around the stack: just the command line.
-const CHROME_ROWS: u16 = 1;
+/// Rows of chrome around the stack: the command line and the info bar.
+const CHROME_ROWS: u16 = 2;
 
 /// Vim-style editing modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,9 +38,21 @@ pub enum Mode {
     Insert,
 }
 
-/// The whole UI state.
+/// A transient message for the info bar, cleared on the next keypress.
+enum Notice {
+    /// A command batch that failed — rendered with the trace, the offending
+    /// command bolded.
+    Error(CalcError),
+    /// A plain note, e.g. "nothing to undo".
+    Note(String),
+}
+
+/// The whole UI state. The live state is `engine` (the head); `history` holds
+/// the past states (the tail) — together a non-empty `(current, past…)` list.
 pub struct App {
-    /// Undo history of engine states; its current entry is the live engine.
+    /// The current calculator state, updated in place by each operation.
+    engine: Engine,
+    /// Past states, for undo. Empty when there's nothing to undo.
     history: History<Engine>,
     mode: Mode,
     /// The command-line buffer, edited in insert mode.
@@ -45,31 +60,31 @@ pub struct App {
     /// Selected stack level in normal mode, 1-based from the top (level 1 is
     /// the top of stack). Kept clamped to the stack, or 1 when empty.
     cursor: usize,
-    /// Last status/error message, shown until the next keypress.
-    status: String,
+    /// The last command run, shown in the info bar — operators leave no other
+    /// visible trace. Persists until the next successful command.
+    last: String,
+    /// Transient error/note for the current keypress, shown in the info bar.
+    notice: Option<Notice>,
     should_quit: bool,
 }
 
 impl App {
     pub fn new() -> Self {
         Self {
-            history: History::new(Engine::new()),
+            engine: Engine::new(),
+            history: History::new(),
             mode: Mode::Insert,
             input: String::new(),
             cursor: 1,
-            status: String::new(),
+            last: String::new(),
+            notice: None,
             should_quit: false,
         }
     }
 
-    /// The live engine.
-    fn engine(&self) -> &Engine {
-        self.history.current()
-    }
-
     /// The live stack.
     fn stack(&self) -> &[Value] {
-        self.engine().stack()
+        self.engine.stack()
     }
 
     fn depth(&self) -> usize {
@@ -85,7 +100,7 @@ impl App {
     /// Advance the whole UI by one keypress. This is the single entry point for
     /// input and is deliberately free of any terminal I/O so it can be tested.
     pub fn handle_key(&mut self, key: KeyEvent) {
-        self.status.clear();
+        self.notice = None;
 
         // Ctrl-C and Ctrl-D (EOF) always quit, in any mode.
         if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -104,7 +119,6 @@ impl App {
 
     fn handle_normal(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('i') => self.mode = Mode::Insert,
 
             // Move the cursor. The stack draws with level 1 (top) just under
@@ -114,29 +128,13 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.cursor = self.cursor.saturating_sub(1),
 
             // Cursor-relative stack edits, expressed as level-parameterized
-            // commands. Each `transform` is one undo unit.
-            KeyCode::Char('x') | KeyCode::Char('d') => {
-                let level = self.cursor;
-                self.transform(|e| e.apply(Command::Drop(level)));
-            }
-            KeyCode::Char('s') => {
-                let level = self.cursor;
-                self.transform(|e| e.apply(Command::Swap(level)));
-            }
-            KeyCode::Char('r') => {
-                let level = self.cursor;
-                self.transform(|e| e.apply(Command::Roll(level)));
-            }
-            KeyCode::Char('u') => {
-                if !self.history.undo() {
-                    self.status = "nothing to undo".to_string();
-                }
-            }
+            // commands that update the live engine.
+            KeyCode::Char('x') | KeyCode::Char('d') => self.run(&[Command::Drop(self.cursor)]),
+            KeyCode::Char('s') => self.run(&[Command::Swap(self.cursor)]),
+            KeyCode::Char('r') => self.run(&[Command::Roll(self.cursor)]),
+            KeyCode::Char('u') => self.undo(),
             // Duplicate the selected value to the top.
-            KeyCode::Enter => {
-                let level = self.cursor;
-                self.transform(|e| e.apply(Command::Dup(level)));
-            }
+            KeyCode::Enter => self.run(&[Command::Dup(self.cursor)]),
             _ => {}
         }
     }
@@ -151,7 +149,7 @@ impl App {
             // once). With an empty buffer it duplicates the top of stack.
             KeyCode::Enter => {
                 if self.input.trim().is_empty() {
-                    self.transform(|e| e.apply(Command::Dup(1)));
+                    self.run(&[Command::Dup(1)]);
                 } else {
                     self.commit_input();
                 }
@@ -185,7 +183,8 @@ impl App {
             return true;
         }
         let entry = self.input.clone();
-        if self.transform(|e| e.eval(&entry)) {
+        if self.update(|e| e.eval(&entry)) {
+            self.last = entry.trim().to_string();
             self.input.clear();
             true
         } else {
@@ -194,38 +193,58 @@ impl App {
     }
 
     /// Commit any pending entry, then apply an operator — as one undo unit.
-    /// On error the buffer is kept so the user can fix it.
+    /// The entry and operator are folded into a single line so the error trace
+    /// (and `last`) shows the whole thing, e.g. `10 0 /`. On error the buffer is
+    /// kept so the user can fix it.
     fn apply_operator(&mut self, op: Command) {
-        let entry = self.input.clone();
-        let ok = self.transform(|e| {
-            // Thread the engine through the entry (if any), then the operator —
-            // both yield an EvalError, so `?` composes directly.
-            let e = if entry.trim().is_empty() {
-                e
-            } else {
-                e.eval(&entry)?
-            };
-            e.apply(op)
-        });
-        if ok {
+        let line = format!("{} {op}", self.input.trim());
+        if self.update(|e| e.eval(&line)) {
+            self.last = line.trim().to_string();
             self.input.clear();
         }
     }
 
-    /// Run a transform against a copy of the current engine. On success the
-    /// returned engine is committed as one undo point; on failure the error
-    /// (which carries the engine it consumed, leaving the live engine unchanged)
-    /// is shown. Returns success.
-    fn transform(&mut self, f: impl FnOnce(Engine) -> Outcome) -> bool {
-        match f(self.engine().clone()) {
+    /// Apply a batch of commands to the live engine and, on success, record it
+    /// as the last action for the info bar.
+    fn run(&mut self, commands: &[Command]) {
+        if self.update(|e| e.apply(commands)) {
+            self.last = commands
+                .iter()
+                .map(Command::to_string)
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+    }
+
+    /// Run a transform on a copy of the current engine and adopt the result as
+    /// the new live state. On success — if the state actually changed — the
+    /// previous engine is pushed onto history as an undo point. On failure the
+    /// engine is left untouched (the copy is discarded) and the error shown, so
+    /// an operation is atomic. Returns success.
+    fn update(&mut self, f: impl FnOnce(Engine) -> Outcome) -> bool {
+        match f(self.engine.clone()) {
             Ok(next) => {
-                self.history.commit(next);
+                if next != self.engine {
+                    let previous = std::mem::replace(&mut self.engine, next);
+                    self.history.push(previous);
+                }
                 true
             }
             Err(e) => {
-                self.status = format!("error: {e}");
+                self.notice = Some(Notice::Error(e));
                 false
             }
+        }
+    }
+
+    /// Restore the previous state, moving it back into the live engine.
+    fn undo(&mut self) {
+        match self.history.pop() {
+            Some(previous) => {
+                self.engine = previous;
+                self.last = "undo".to_string();
+            }
+            None => self.notice = Some(Notice::Note("nothing to undo".to_string())),
         }
     }
 }
@@ -239,8 +258,9 @@ impl Default for App {
 // --- Rendering ---
 
 fn render(frame: &mut Frame, app: &App) {
-    // Command line on top, stack below.
-    let [input_area, stack_area] = Layout::vertical([
+    // Command line, then a one-line info bar, then the stack.
+    let [input_area, info_area, stack_area] = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(1),
     ])
@@ -268,19 +288,49 @@ fn render(frame: &mut Frame, app: &App) {
     }
     frame.render_widget(Paragraph::new(lines), stack_area);
 
-    // Command line: the prompt carries the mode — `>` for insert, `:` for
-    // normal — and any error is appended in red.
+    // Command line: the teal prompt carries the mode — `>` for insert, `:` for
+    // normal.
     let prompt = if app.mode == Mode::Insert { "> " } else { ": " };
-    let mut spans = vec![Span::raw(prompt), Span::raw(app.input.as_str())];
-    if !app.status.is_empty() {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(app.status.as_str(), Style::new().red()));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), input_area);
+    let command_line = Line::from(vec![
+        Span::styled(prompt, Style::new().fg(TEAL)),
+        Span::raw(app.input.as_str()),
+    ]);
+    frame.render_widget(Paragraph::new(command_line), input_area);
     if app.mode == Mode::Insert {
         let x = input_area.x + (prompt.chars().count() + app.input.chars().count()) as u16;
         frame.set_cursor_position(Position::new(x, input_area.y));
     }
+
+    // Info bar: the current error, a note, or the last command run. Mode is
+    // shown in the command-line prompt, not here.
+    let info = match &app.notice {
+        Some(Notice::Error(e)) => error_line(e),
+        Some(Notice::Note(note)) => Line::from(Span::styled(note.as_str(), Style::new().red())),
+        None if app.last.is_empty() => Line::default(),
+        None => Line::from(vec![
+            Span::styled("last: ", Style::new().dim()),
+            Span::raw(app.last.as_str()),
+        ]),
+    };
+    frame.render_widget(Paragraph::new(info), info_area);
+}
+
+/// Render an error as `error: <kind> in <program>`, with the offending command
+/// bolded so it stands out in the batch.
+fn error_line(e: &CalcError) -> Line<'static> {
+    let red = Style::new().red();
+    let mut spans = vec![Span::styled(format!("error: {}", e.kind), red)];
+    if let Some(trace) = &e.trace {
+        spans.push(Span::styled(" in ", red));
+        for (i, command) in trace.program.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" ", red));
+            }
+            let style = if i == trace.index { red.bold() } else { red };
+            spans.push(Span::styled(command.to_string(), style));
+        }
+    }
+    Line::from(spans)
 }
 
 // --- Terminal driver ---
@@ -460,7 +510,7 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert!(app.stack().is_empty());
         assert_eq!(app.input, "1..2");
-        assert!(app.status.contains("error"));
+        assert!(matches!(app.notice, Some(Notice::Error(_))));
     }
 
     fn stacked(values: &str) -> App {
@@ -560,5 +610,50 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL));
             assert!(app.should_quit, "ctrl-{key} should quit");
         }
+    }
+
+    #[test]
+    fn q_does_not_quit() {
+        let mut app = stacked("1");
+        ch(&mut app, 'q');
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn info_bar_records_the_last_command() {
+        let mut app = App::new();
+        typ(&mut app, "3");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.last, "3"); // the committed line
+        typ(&mut app, "4");
+        ch(&mut app, '+'); // operator with a pending entry
+        assert_eq!(app.last, "4 +");
+        assert_eq!(app.stack(), &[7.0]);
+    }
+
+    #[test]
+    fn operator_error_traces_the_whole_line() {
+        // `10 0 /`: the operator folds the pending entry in, so the trace is the
+        // full batch, not just `/`.
+        let mut app = App::new();
+        typ(&mut app, "10 0");
+        ch(&mut app, '/'); // divide by zero
+        match &app.notice {
+            Some(Notice::Error(e)) => {
+                let trace = e.trace.as_ref().unwrap();
+                assert_eq!(trace.program.len(), 3); // 10, 0, /
+                assert_eq!(trace.program[trace.index], Command::Div);
+            }
+            _ => panic!("expected an error notice"),
+        }
+    }
+
+    #[test]
+    fn info_bar_records_cursor_ops() {
+        let mut app = stacked("1 2 3");
+        ch(&mut app, 'x'); // drop at cursor (level 1)
+        assert_eq!(app.last, "drop");
+        ch(&mut app, 'u');
+        assert_eq!(app.last, "undo");
     }
 }

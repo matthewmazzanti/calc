@@ -1,9 +1,9 @@
 //! The RPN calculator engine: an [`Engine`] wrapping a stack of floating-point
 //! values (and, later, evaluation settings). No I/O and no history — its
-//! transforms *consume* `self` and return the new engine, so a sequence of
+//! transforms *consume* `self` and return the new engine, so a batch of
 //! commands folds through with no intermediate copies: the same value is moved
-//! from step to step. [`Engine::eval`] is essentially
-//! `commands.try_fold(self, Engine::apply)`.
+//! from step to step. [`Engine::apply`] takes a whole slice of commands, and
+//! [`Engine::eval`] parses a line into one.
 //!
 //! On failure a transform moves `self` *into* the error rather than dropping it:
 //! [`CalcError`] carries the engine as it stood when the command failed — its
@@ -119,8 +119,18 @@ impl std::fmt::Display for Command {
     }
 }
 
+/// The command sequence that was executing when an error struck, and the index
+/// of the command that failed — "here's what was running."
+#[derive(Debug, Clone, PartialEq)]
+pub struct Trace {
+    /// The whole batch of commands being applied.
+    pub program: Vec<Command>,
+    /// The 0-based index within `program` of the command that failed.
+    pub index: usize,
+}
+
 /// A semantic error plus the context to inspect it: the engine as it stood when
-/// evaluation failed, and where in the line it happened.
+/// evaluation failed, and the command sequence it was running.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CalcError {
     /// What went wrong.
@@ -129,10 +139,10 @@ pub struct CalcError {
     /// preconditions before mutating, its stack is exactly the state the failing
     /// command saw — nothing partially applied.
     pub engine: Engine,
-    /// The failing command and its 0-based position in the line, when the
-    /// failure was a runtime error on a specific command. `None` for parse
-    /// errors, whose offending token is already named in `kind`.
-    pub at: Option<(usize, Command)>,
+    /// The command sequence being run and which command failed, for a runtime
+    /// error. `None` for parse errors, whose offending token is already named
+    /// in `kind`.
+    pub trace: Option<Trace>,
 }
 
 impl CalcError {
@@ -140,7 +150,7 @@ impl CalcError {
         Self {
             kind,
             engine,
-            at: None,
+            trace: None,
         }
     }
 }
@@ -148,9 +158,19 @@ impl CalcError {
 impl std::fmt::Display for CalcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.kind)?;
-        if let Some((position, command)) = self.at {
-            // Positions are 0-based internally; show them 1-based.
-            write!(f, " (at #{}: `{}`)", position + 1, command)?;
+        if let Some(trace) = &self.trace {
+            // Show the batch with the failing command bracketed, e.g.
+            // `1 2 + [/]`.
+            write!(f, " in `")?;
+            for (i, command) in trace.program.iter().enumerate() {
+                match (i, i == trace.index) {
+                    (0, true) => write!(f, "[{command}]")?,
+                    (0, false) => write!(f, "{command}")?,
+                    (_, true) => write!(f, " [{command}]")?,
+                    (_, false) => write!(f, " {command}")?,
+                }
+            }
+            write!(f, "`")?;
         }
         Ok(())
     }
@@ -184,10 +204,9 @@ impl Engine {
         &self.stack
     }
 
-    /// Evaluate a whitespace-separated line, threading the engine through each
-    /// command. The line is parsed first, so a malformed token fails before
-    /// anything runs; the first runtime error short-circuits the fold. Errors
-    /// carry the engine at the point of failure and which command failed.
+    /// Evaluate a whitespace-separated line. The line is parsed first, so a
+    /// malformed token fails before anything runs; then the whole batch of
+    /// commands is applied.
     pub fn eval(self, input: &str) -> Outcome {
         let program = match input
             .split_whitespace()
@@ -198,12 +217,22 @@ impl Engine {
             // Parse failed before any command ran; attach the untouched engine.
             Err(kind) => return self.fail(kind),
         };
+        self.apply(&program)
+    }
+
+    /// Apply a batch of commands in order, threading the engine through each.
+    /// The first runtime error short-circuits the fold and carries a [`Trace`]
+    /// of the whole batch plus the index that failed — "here's what was running."
+    pub fn apply(self, program: &[Command]) -> Outcome {
         program
-            .into_iter()
+            .iter()
             .enumerate()
-            .try_fold(self, |engine, (position, command)| {
-                engine.apply(command).map_err(|mut e| {
-                    e.at = Some((position, command));
+            .try_fold(self, |engine, (index, &command)| {
+                engine.apply_one(command).map_err(|mut e| {
+                    e.trace = Some(Trace {
+                        program: program.to_vec(),
+                        index,
+                    });
                     e
                 })
             })
@@ -211,7 +240,7 @@ impl Engine {
 
     /// Apply a single command, consuming `self` and returning the new engine.
     /// A total match, so a new command variant is a compile error until handled.
-    pub fn apply(mut self, cmd: Command) -> Outcome {
+    fn apply_one(mut self, cmd: Command) -> Outcome {
         match cmd {
             Command::Push(n) => {
                 self.stack.push(n);
@@ -314,7 +343,10 @@ impl Engine {
 
     /// Exchange the value at `level` with the one just below it (`level + 1`).
     fn swap(mut self, level: usize) -> Outcome {
-        let (Some(i), Some(j)) = (self.index_of_level(level), self.index_of_level(level + 1))
+        let (Some(i), Some(j)) = (
+            self.index_of_level(level),
+            self.index_of_level(level + 1),
+        )
         else {
             return self.fail(ErrorKind::StackUnderflow);
         };
@@ -376,7 +408,7 @@ mod tests {
     #[test]
     fn divide_by_zero_is_an_error() {
         assert_eq!(
-            run("1 0").apply(Command::Div).unwrap_err().kind,
+            run("1 0").apply(&[Command::Div]).unwrap_err().kind,
             ErrorKind::DivideByZero
         );
     }
@@ -384,7 +416,7 @@ mod tests {
     #[test]
     fn underflow_is_an_error() {
         assert_eq!(
-            run("1").apply(Command::Add).unwrap_err().kind,
+            run("1").apply(&[Command::Add]).unwrap_err().kind,
             ErrorKind::StackUnderflow
         );
     }
@@ -396,7 +428,9 @@ mod tests {
         let err = Engine::new().eval("1 0 /").unwrap_err();
         assert_eq!(err.kind, ErrorKind::DivideByZero);
         assert_eq!(err.engine.stack(), &[1.0, 0.0]);
-        assert_eq!(err.at, Some((2, Command::Div)));
+        let trace = err.trace.unwrap();
+        assert_eq!(trace.index, 2);
+        assert_eq!(trace.program[trace.index], Command::Div);
     }
 
     #[test]
@@ -412,20 +446,31 @@ mod tests {
     }
 
     #[test]
-    fn eval_error_names_the_failing_command_and_position() {
-        // `1 2 + /`: after `+` the stack is [3]; `/` underflows at position 3.
+    fn eval_error_traces_the_program_and_the_failing_command() {
+        // `1 2 + /`: after `+` the stack is [3]; `/` underflows at index 3.
         let err = Engine::new().eval("1 2 + /").unwrap_err();
         assert_eq!(err.kind, ErrorKind::StackUnderflow);
-        assert_eq!(err.at, Some((3, Command::Div)));
-        assert_eq!(err.to_string(), "too few arguments (at #4: `/`)");
+        let trace = err.trace.clone().unwrap();
+        assert_eq!(trace.index, 3);
+        assert_eq!(
+            trace.program,
+            vec![
+                Command::Push(1.0),
+                Command::Push(2.0),
+                Command::Add,
+                Command::Div
+            ]
+        );
+        // The message shows the whole batch with the failing command bracketed.
+        assert_eq!(err.to_string(), "too few arguments in `1 2 + [/]`");
     }
 
     #[test]
-    fn parse_errors_carry_no_position() {
-        // The offending token is already in the message, so `at` is None.
+    fn parse_errors_carry_no_trace() {
+        // The offending token is already in the message, so there's no trace.
         let err = Engine::new().eval("1 2 + oops").unwrap_err();
         assert_eq!(err.kind, ErrorKind::UnknownCommand("oops".to_string()));
-        assert_eq!(err.at, None);
+        assert_eq!(err.trace, None);
     }
 
     #[test]
@@ -470,12 +515,10 @@ mod tests {
     }
 
     #[test]
-    fn commands_fold_through_apply() {
+    fn apply_runs_a_batch_of_commands() {
         // The TUI path: hand the engine Commands without going through text.
-        // This is the same fold `eval` uses, spelled out.
-        let engine = [Command::Push(2.0), Command::Push(3.0), Command::Mul]
-            .into_iter()
-            .try_fold(Engine::new(), Engine::apply)
+        let engine = Engine::new()
+            .apply(&[Command::Push(2.0), Command::Push(3.0), Command::Mul])
             .unwrap();
         assert_eq!(engine.stack(), &[6.0]);
     }
@@ -484,7 +527,7 @@ mod tests {
     fn dup_copies_a_level_to_the_top() {
         // copy level 3 (=1) to the top
         assert_eq!(
-            run("1 2 3").apply(Command::Dup(3)).unwrap().stack(),
+            run("1 2 3").apply(&[Command::Dup(3)]).unwrap().stack(),
             &[1.0, 2.0, 3.0, 1.0]
         );
     }
@@ -492,21 +535,21 @@ mod tests {
     #[test]
     fn drop_at_a_level_removes_it() {
         // remove the `2`
-        assert_eq!(run("1 2 3").apply(Command::Drop(2)).unwrap().stack(), &[1.0, 3.0]);
+        assert_eq!(run("1 2 3").apply(&[Command::Drop(2)]).unwrap().stack(), &[1.0, 3.0]);
     }
 
     #[test]
     fn swap_exchanges_with_the_level_below() {
         // top two: same as plain swap
-        assert_eq!(run("1 2 3").apply(Command::Swap(1)).unwrap().stack(), &[1.0, 3.0, 2.0]);
+        assert_eq!(run("1 2 3").apply(&[Command::Swap(1)]).unwrap().stack(), &[1.0, 3.0, 2.0]);
         // level 2 (=2) with level 3 (=1)
-        assert_eq!(run("1 2 3").apply(Command::Swap(2)).unwrap().stack(), &[2.0, 1.0, 3.0]);
+        assert_eq!(run("1 2 3").apply(&[Command::Swap(2)]).unwrap().stack(), &[2.0, 1.0, 3.0]);
     }
 
     #[test]
     fn swap_at_the_bottom_has_nothing_below() {
         assert_eq!(
-            run("1 2 3").apply(Command::Swap(3)).unwrap_err().kind,
+            run("1 2 3").apply(&[Command::Swap(3)]).unwrap_err().kind,
             ErrorKind::StackUnderflow
         );
     }
@@ -515,24 +558,24 @@ mod tests {
     fn roll_brings_a_level_to_the_top() {
         // bring level 3 (=2) to the top
         assert_eq!(
-            run("1 2 3 4").apply(Command::Roll(3)).unwrap().stack(),
+            run("1 2 3 4").apply(&[Command::Roll(3)]).unwrap().stack(),
             &[1.0, 3.0, 4.0, 2.0]
         );
         // Roll(3) is exactly what the text `rot` parses to.
         assert_eq!(
             run("1 2 3 rot").stack(),
-            run("1 2 3").apply(Command::Roll(3)).unwrap().stack()
+            run("1 2 3").apply(&[Command::Roll(3)]).unwrap().stack()
         );
     }
 
     #[test]
     fn level_zero_and_out_of_range_error() {
         assert_eq!(
-            run("1 2").apply(Command::Drop(0)).unwrap_err().kind,
+            run("1 2").apply(&[Command::Drop(0)]).unwrap_err().kind,
             ErrorKind::StackUnderflow
         );
         assert_eq!(
-            run("1 2").apply(Command::Roll(5)).unwrap_err().kind,
+            run("1 2").apply(&[Command::Roll(5)]).unwrap_err().kind,
             ErrorKind::StackUnderflow
         );
     }
