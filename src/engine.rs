@@ -127,100 +127,114 @@ impl Engine {
         program.into_iter().try_fold(self, Engine::apply)
     }
 
-    /// Apply a single command, consuming `self` and returning the new engine. A
-    /// total match, so a new command variant is a compile error until handled.
-    /// Every arm checks its preconditions before mutating, so on error the
-    /// caller's copy is untouched (the partial engine here is just dropped).
-    pub fn apply(mut self, cmd: Command) -> Result<Self, CalcError> {
+    /// Apply a single command by dispatching to a stack transform. A total
+    /// match, so a new command variant is a compile error until handled.
+    pub fn apply(self, cmd: Command) -> Result<Self, CalcError> {
         match cmd {
-            Command::Push(n) => self.stack.push(n),
-            Command::Add => binary(&mut self.stack, |a, b| Ok(a + b))?,
-            Command::Sub => binary(&mut self.stack, |a, b| Ok(a - b))?,
-            Command::Mul => binary(&mut self.stack, |a, b| Ok(a * b))?,
-            Command::Div => binary(&mut self.stack, |a, b| {
+            Command::Push(n) => self.push(n),
+            Command::Add => self.binary(|a, b| Ok(a + b)),
+            Command::Sub => self.binary(|a, b| Ok(a - b)),
+            Command::Mul => self.binary(|a, b| Ok(a * b)),
+            Command::Div => self.binary(|a, b| {
                 if b == 0.0 {
                     Err(CalcError::DivideByZero)
                 } else {
                     Ok(a / b)
                 }
-            })?,
-            Command::Neg => unary(&mut self.stack, |x| -x)?,
-            Command::Dup(level) => {
-                let i = level_index(self.stack.len(), level)?;
-                let v = self.stack[i];
-                self.stack.push(v);
-            }
-            Command::Drop(level) => {
-                let i = level_index(self.stack.len(), level)?;
-                self.stack.remove(i);
-            }
-            Command::Swap(level) => {
-                let n = self.stack.len();
-                let i = level_index(n, level)?;
-                let j = level_index(n, level + 1)?;
-                self.stack.swap(i, j);
-            }
-            Command::Over => stack_op(&mut self.stack, 2, |s| s.push(s[s.len() - 2]))?,
-            // ( a b c ) -> ( b c a ): rolling the third value to the top.
-            Command::Roll(level) => {
-                let i = level_index(self.stack.len(), level)?;
-                let v = self.stack.remove(i);
-                self.stack.push(v);
-            }
-            Command::Clear => stack_op(&mut self.stack, 0, |s| s.clear())?,
+            }),
+            Command::Neg => self.unary(|x| -x),
+            Command::Dup(level) => self.dup(level),
+            Command::Drop(level) => self.drop_at(level),
+            Command::Swap(level) => self.swap(level),
+            // `over` copies the second-from-top value to the top.
+            Command::Over => self.dup(2),
+            Command::Roll(level) => self.roll(level),
+            Command::Clear => self.clear(),
         }
+    }
+
+    // Stack transforms. Each consumes `self`, mutates the stack, and returns the
+    // new engine — so a command is just `self.<op>(…)`, other engine state rides
+    // along untouched, and errors flow out through `?`.
+
+    /// The `Vec` index for a 1-based level (level 1 == top of stack). Errors if
+    /// the level doesn't exist.
+    fn index_of_level(&self, level: usize) -> Result<usize, CalcError> {
+        let len = self.stack.len();
+        if level == 0 || level > len {
+            return Err(CalcError::StackUnderflow);
+        }
+        Ok(len - level)
+    }
+
+    fn push(mut self, value: Value) -> Result<Self, CalcError> {
+        self.stack.push(value);
         Ok(self)
     }
-}
 
-/// Convert a 1-based level (level 1 == top of stack) into a `Stack` index.
-/// Errors if the level doesn't exist on a stack of `len` values.
-fn level_index(len: usize, level: usize) -> Result<usize, CalcError> {
-    if level == 0 || level > len {
-        return Err(CalcError::StackUnderflow);
+    /// Two-operand arithmetic. `a` is the deeper operand, `b` the top, so
+    /// `a b <op>` reads left-to-right as `a <op> b`. The op may reject its
+    /// inputs (e.g. divide-by-zero).
+    fn binary(
+        mut self,
+        op: impl FnOnce(Value, Value) -> Result<Value, CalcError>,
+    ) -> Result<Self, CalcError> {
+        let n = self.stack.len();
+        if n < 2 {
+            return Err(CalcError::StackUnderflow);
+        }
+        let result = op(self.stack[n - 2], self.stack[n - 1])?;
+        self.stack.truncate(n - 2);
+        self.stack.push(result);
+        Ok(self)
     }
-    Ok(len - level)
-}
 
-/// Apply a two-operand arithmetic op. `a` is the deeper operand, `b` the top,
-/// so `a b <op>` reads left-to-right as `a <op> b`. The op returns a `Result`
-/// so it can reject its inputs (e.g. divide-by-zero).
-fn binary(
-    stack: &mut Stack,
-    op: impl FnOnce(Value, Value) -> Result<Value, CalcError>,
-) -> Result<(), CalcError> {
-    let len = stack.len();
-    if len < 2 {
-        return Err(CalcError::StackUnderflow);
+    /// One-operand op applied to the top of stack.
+    fn unary(mut self, op: impl FnOnce(Value) -> Value) -> Result<Self, CalcError> {
+        let n = self.stack.len();
+        if n < 1 {
+            return Err(CalcError::StackUnderflow);
+        }
+        self.stack[n - 1] = op(self.stack[n - 1]);
+        Ok(self)
     }
-    let result = op(stack[len - 2], stack[len - 1])?;
-    stack.truncate(len - 2);
-    stack.push(result);
-    Ok(())
-}
 
-/// Apply a one-operand op to the top of the stack in place.
-fn unary(stack: &mut [Value], op: impl FnOnce(Value) -> Value) -> Result<(), CalcError> {
-    let len = stack.len();
-    if len < 1 {
-        return Err(CalcError::StackUnderflow);
+    /// Push a copy of the value at `level`.
+    fn dup(mut self, level: usize) -> Result<Self, CalcError> {
+        let i = self.index_of_level(level)?;
+        let v = self.stack[i];
+        self.stack.push(v);
+        Ok(self)
     }
-    stack[len - 1] = op(stack[len - 1]);
-    Ok(())
-}
 
-/// Run a pure stack manipulation after checking it has at least `need` values.
-/// The closure may assume that precondition holds.
-fn stack_op(
-    stack: &mut Stack,
-    need: usize,
-    op: impl FnOnce(&mut Stack),
-) -> Result<(), CalcError> {
-    if stack.len() < need {
-        return Err(CalcError::StackUnderflow);
+    /// Remove the value at `level`.
+    fn drop_at(mut self, level: usize) -> Result<Self, CalcError> {
+        let i = self.index_of_level(level)?;
+        self.stack.remove(i);
+        Ok(self)
     }
-    op(stack);
-    Ok(())
+
+    /// Exchange the value at `level` with the one just below it (`level + 1`).
+    fn swap(mut self, level: usize) -> Result<Self, CalcError> {
+        let i = self.index_of_level(level)?;
+        let j = self.index_of_level(level + 1)?;
+        self.stack.swap(i, j);
+        Ok(self)
+    }
+
+    /// Roll the value at `level` up to the top, shifting shallower values down.
+    fn roll(mut self, level: usize) -> Result<Self, CalcError> {
+        let i = self.index_of_level(level)?;
+        let v = self.stack.remove(i);
+        self.stack.push(v);
+        Ok(self)
+    }
+
+    /// Empty the stack.
+    fn clear(mut self) -> Result<Self, CalcError> {
+        self.stack.clear();
+        Ok(self)
+    }
 }
 
 #[cfg(test)]
