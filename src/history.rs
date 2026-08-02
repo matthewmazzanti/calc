@@ -35,8 +35,8 @@ impl<T> History<T> {
     }
 
     /// Undo: replace `current` with the previous state, stashing the old
-    /// `current` for redo. Returns `false` (leaving `current` alone) when
-    /// there's nothing to undo.
+    /// `current` for redo. A no-op returning `false` (leaving `current` alone)
+    /// when there's nothing to undo — so no clone is needed for that case.
     pub fn undo(&mut self, current: &mut T) -> bool {
         match self.past.pop() {
             Some(previous) => {
@@ -48,7 +48,8 @@ impl<T> History<T> {
     }
 
     /// Redo: replace `current` with the next state, pushing the old `current`
-    /// back onto the undo stack. Returns `false` when there's nothing to redo.
+    /// back onto the undo stack. Returns `false` (a no-op) when there's nothing
+    /// to redo — the common case, so it must not disturb or copy `current`.
     pub fn redo(&mut self, current: &mut T) -> bool {
         match self.future.pop() {
             Some(next) => {
