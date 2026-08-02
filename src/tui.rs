@@ -62,7 +62,7 @@ pub struct App {
     cursor: usize,
     /// The last command run, shown in the info bar — operators leave no other
     /// visible trace. Persists until the next successful command.
-    last: String,
+    cmd: String,
     /// Transient error/note for the current keypress, shown in the info bar.
     notice: Option<Notice>,
     should_quit: bool,
@@ -76,7 +76,7 @@ impl App {
             mode: Mode::Insert,
             input: String::new(),
             cursor: 1,
-            last: String::new(),
+            cmd: String::new(),
             notice: None,
             should_quit: false,
         }
@@ -184,7 +184,7 @@ impl App {
         }
         let entry = self.input.clone();
         if self.update(|e| e.eval(&entry)) {
-            self.last = entry.trim().to_string();
+            self.cmd = entry.trim().to_string();
             self.input.clear();
             true
         } else {
@@ -194,12 +194,12 @@ impl App {
 
     /// Commit any pending entry, then apply an operator — as one undo unit.
     /// The entry and operator are folded into a single line so the error trace
-    /// (and `last`) shows the whole thing, e.g. `10 0 /`. On error the buffer is
+    /// (and `cmd`) shows the whole thing, e.g. `10 0 /`. On error the buffer is
     /// kept so the user can fix it.
     fn apply_operator(&mut self, op: Command) {
         let line = format!("{} {op}", self.input.trim());
         if self.update(|e| e.eval(&line)) {
-            self.last = line.trim().to_string();
+            self.cmd = line.trim().to_string();
             self.input.clear();
         }
     }
@@ -208,7 +208,7 @@ impl App {
     /// as the last action for the info bar.
     fn run(&mut self, commands: &[Command]) {
         if self.update(|e| e.apply(commands)) {
-            self.last = commands
+            self.cmd = commands
                 .iter()
                 .map(Command::to_string)
                 .collect::<Vec<_>>()
@@ -242,7 +242,7 @@ impl App {
         match self.history.pop() {
             Some(previous) => {
                 self.engine = previous;
-                self.last = "undo".to_string();
+                self.cmd = "undo".to_string();
             }
             None => self.notice = Some(Notice::Note("nothing to undo".to_string())),
         }
@@ -306,27 +306,31 @@ fn render(frame: &mut Frame, app: &App) {
     let info = match &app.notice {
         Some(Notice::Error(e)) => error_line(e),
         Some(Notice::Note(note)) => Line::from(Span::styled(note.as_str(), Style::new().red())),
-        None if app.last.is_empty() => Line::default(),
+        None if app.cmd.is_empty() => Line::default(),
         None => Line::from(vec![
-            Span::styled("last: ", Style::new().dim()),
-            Span::raw(app.last.as_str()),
+            Span::styled("cmd: ", Style::new().dim()),
+            Span::raw(app.cmd.as_str()),
         ]),
     };
     frame.render_widget(Paragraph::new(info), info_area);
 }
 
-/// Render an error as `error: <kind> in <program>`, with the offending command
-/// bolded so it stands out in the batch.
+/// Render an error as `error: <kind> in <program>`. The program is dimmed for
+/// context, with the offending command bold and red — a source indicator
+/// pointing at what failed.
 fn error_line(e: &CalcError) -> Line<'static> {
-    let red = Style::new().red();
-    let mut spans = vec![Span::styled(format!("error: {}", e.kind), red)];
+    let mut spans = vec![Span::styled(format!("error: {}", e.kind), Style::new().red())];
     if let Some(trace) = &e.trace {
-        spans.push(Span::styled(" in ", red));
+        spans.push(Span::styled(" in ", Style::new().dim()));
         for (i, command) in trace.program.iter().enumerate() {
             if i > 0 {
-                spans.push(Span::styled(" ", red));
+                spans.push(Span::raw(" "));
             }
-            let style = if i == trace.index { red.bold() } else { red };
+            let style = if i == trace.index {
+                Style::new().red().bold()
+            } else {
+                Style::new().dim()
+            };
             spans.push(Span::styled(command.to_string(), style));
         }
     }
@@ -624,10 +628,10 @@ mod tests {
         let mut app = App::new();
         typ(&mut app, "3");
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.last, "3"); // the committed line
+        assert_eq!(app.cmd, "3"); // the committed line
         typ(&mut app, "4");
         ch(&mut app, '+'); // operator with a pending entry
-        assert_eq!(app.last, "4 +");
+        assert_eq!(app.cmd, "4 +");
         assert_eq!(app.stack(), &[7.0]);
     }
 
@@ -652,8 +656,8 @@ mod tests {
     fn info_bar_records_cursor_ops() {
         let mut app = stacked("1 2 3");
         ch(&mut app, 'x'); // drop at cursor (level 1)
-        assert_eq!(app.last, "drop");
+        assert_eq!(app.cmd, "drop");
         ch(&mut app, 'u');
-        assert_eq!(app.last, "undo");
+        assert_eq!(app.cmd, "undo");
     }
 }
