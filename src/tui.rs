@@ -51,10 +51,9 @@ struct Snapshot {
     cmd: String,
 }
 
-/// The whole UI state. `current` is the live snapshot (the head); `history`
-/// holds the surrounding states — a non-empty `(past…, current, future…)` list.
+/// The whole UI state. `history` owns the live snapshot and the surrounding
+/// undo/redo states — the non-empty `(past…, current, future…)` list.
 pub struct App {
-    current: Snapshot,
     history: History<Snapshot>,
     mode: Mode,
     /// The command-line buffer, edited in insert mode.
@@ -70,11 +69,10 @@ pub struct App {
 impl App {
     pub fn new() -> Self {
         Self {
-            current: Snapshot {
+            history: History::new(Snapshot {
                 engine: Engine::new(),
                 cmd: String::new(),
-            },
-            history: History::new(),
+            }),
             mode: Mode::Insert,
             input: String::new(),
             cursor: 1,
@@ -85,7 +83,7 @@ impl App {
 
     /// The live stack.
     fn stack(&self) -> &[Value] {
-        self.current.engine.stack()
+        self.history.current().engine.stack()
     }
 
     fn depth(&self) -> usize {
@@ -95,7 +93,7 @@ impl App {
     /// Whether the info line has anything to show — an error/note, or a last
     /// command. When it doesn't, its row is given back to the stack.
     fn has_info(&self) -> bool {
-        self.notice.is_some() || !self.current.cmd.is_empty()
+        self.notice.is_some() || !self.history.current().cmd.is_empty()
     }
 
     /// Keep the cursor on a real level (or 1 when the stack is empty).
@@ -200,7 +198,7 @@ impl App {
             }
         };
         if self.update(|e| e.apply(&program)) {
-            self.current.cmd = describe(&program);
+            self.history.current_mut().cmd = describe(&program);
             self.input.clear();
             true
         } else {
@@ -222,7 +220,7 @@ impl App {
         };
         program.push(op);
         if self.update(|e| e.apply(&program)) {
-            self.current.cmd = describe(&program);
+            self.history.current_mut().cmd = describe(&program);
             self.input.clear();
         }
     }
@@ -231,7 +229,7 @@ impl App {
     /// as the last action for the info bar.
     fn run(&mut self, commands: &[Command]) {
         if self.update(|e| e.apply(commands)) {
-            self.current.cmd = describe(commands);
+            self.history.current_mut().cmd = describe(commands);
         }
     }
 
@@ -242,11 +240,14 @@ impl App {
     /// is discarded) and the error shown, so an operation is atomic. Returns
     /// success.
     fn update(&mut self, f: impl FnOnce(Engine) -> Outcome) -> bool {
-        match f(self.current.engine.clone()) {
+        match f(self.history.current().engine.clone()) {
             Ok(next) => {
-                if next != self.current.engine {
-                    self.history.record(self.current.clone());
-                    self.current.engine = next;
+                if next != self.history.current().engine {
+                    // Commit a new snapshot; the caller fills in its `cmd`.
+                    self.history.commit(Snapshot {
+                        engine: next,
+                        cmd: String::new(),
+                    });
                 }
                 true
             }
@@ -259,14 +260,14 @@ impl App {
 
     /// Restore the previous snapshot (engine and its `cmd`) as the live state.
     fn undo(&mut self) {
-        if !self.history.undo(&mut self.current) {
+        if !self.history.undo() {
             self.notice = Some(Notice::Note("nothing to undo".to_string()));
         }
     }
 
     /// Re-apply the most recently undone snapshot.
     fn redo(&mut self) {
-        if !self.history.redo(&mut self.current) {
+        if !self.history.redo() {
             self.notice = Some(Notice::Note("nothing to redo".to_string()));
         }
     }
@@ -330,10 +331,10 @@ fn render(frame: &mut Frame, app: &App) {
     let info = match &app.notice {
         Some(Notice::Error(e)) => error_line(e),
         Some(Notice::Note(note)) => Line::from(Span::styled(note.as_str(), Style::new().red())),
-        None if app.current.cmd.is_empty() => Line::default(),
+        None if app.history.current().cmd.is_empty() => Line::default(),
         None => Line::from(vec![
             Span::styled("cmd: ", Style::new().dim()),
-            Span::raw(app.current.cmd.as_str()),
+            Span::raw(app.history.current().cmd.as_str()),
         ]),
     };
     frame.render_widget(Paragraph::new(info), info_area);
@@ -623,7 +624,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
         assert_eq!(app.stack(), &[1.0, 2.0]); // redone
         // The restored snapshot carries the command that produced it.
-        assert_eq!(app.current.cmd, "drop");
+        assert_eq!(app.history.current().cmd, "drop");
     }
 
     #[test]
@@ -683,10 +684,10 @@ mod tests {
         let mut app = App::new();
         typ(&mut app, "3");
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.current.cmd, "3"); // the committed line
+        assert_eq!(app.history.current().cmd, "3"); // the committed line
         typ(&mut app, "4");
         ch(&mut app, '+'); // operator with a pending entry
-        assert_eq!(app.current.cmd, "4 +");
+        assert_eq!(app.history.current().cmd, "4 +");
         assert_eq!(app.stack(), &[7.0]);
     }
 
@@ -711,7 +712,7 @@ mod tests {
     fn info_bar_records_cursor_ops() {
         let mut app = stacked("1 2 3");
         ch(&mut app, 'x'); // drop at cursor (level 1)
-        assert_eq!(app.current.cmd, "drop");
+        assert_eq!(app.history.current().cmd, "drop");
     }
 
     #[test]
@@ -722,6 +723,6 @@ mod tests {
         ch(&mut app, 'x'); // drop -> cmd "drop"
         ch(&mut app, 'u'); // undo -> [1,2,3], whose origin was "3"
         assert_eq!(app.stack(), &[1.0, 2.0, 3.0]);
-        assert_eq!(app.current.cmd, "3");
+        assert_eq!(app.history.current().cmd, "3");
     }
 }
