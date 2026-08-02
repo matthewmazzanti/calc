@@ -44,7 +44,7 @@ enum Notice {
 /// A calculator state paired with the command that produced it. This is the
 /// unit of history, so undo/redo restore the engine *and* the info-bar label
 /// together — each state remembers how it was reached.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Snapshot {
     engine: Engine,
     /// The command that produced `engine` (empty for the initial state).
@@ -81,9 +81,14 @@ impl App {
         }
     }
 
+    /// The live engine (history's current snapshot).
+    fn engine(&self) -> &Engine {
+        &self.history.current().engine
+    }
+
     /// The live stack.
     fn stack(&self) -> &[Value] {
-        self.history.current().engine.stack()
+        self.engine().stack()
     }
 
     fn depth(&self) -> usize {
@@ -197,8 +202,7 @@ impl App {
                 return false;
             }
         };
-        if self.update(|e| e.apply(&program)) {
-            self.history.current_mut().cmd = describe(&program);
+        if self.update(describe(&program), |e| e.apply(&program)) {
             self.input.clear();
             true
         } else {
@@ -219,18 +223,15 @@ impl App {
             }
         };
         program.push(op);
-        if self.update(|e| e.apply(&program)) {
-            self.history.current_mut().cmd = describe(&program);
+        if self.update(describe(&program), |e| e.apply(&program)) {
             self.input.clear();
         }
     }
 
-    /// Apply a batch of commands to the live engine and, on success, record it
-    /// as the last action for the info bar.
+    /// Apply a batch of commands to the live engine, labelling the resulting
+    /// state with the command for the info bar.
     fn run(&mut self, commands: &[Command]) {
-        if self.update(|e| e.apply(commands)) {
-            self.history.current_mut().cmd = describe(commands);
-        }
+        self.update(describe(commands), |e| e.apply(commands));
     }
 
     /// Run a transform on a copy of the current engine and adopt the result as
@@ -239,15 +240,14 @@ impl App {
     /// new snapshot's `cmd`. On failure the engine is left untouched (the copy
     /// is discarded) and the error shown, so an operation is atomic. Returns
     /// success.
-    fn update(&mut self, f: impl FnOnce(Engine) -> Outcome) -> bool {
-        match f(self.history.current().engine.clone()) {
+    fn update(&mut self, cmd: String, f: impl FnOnce(Engine) -> Outcome) -> bool {
+        match f(self.engine().clone()) {
             Ok(next) => {
-                if next != self.history.current().engine {
-                    // Commit a new snapshot; the caller fills in its `cmd`.
-                    self.history.commit(Snapshot {
-                        engine: next,
-                        cmd: String::new(),
-                    });
+                // Commit only if the state actually changed — a no-op command
+                // is not a new state, so it neither records history nor relabels
+                // the current one.
+                if &next != self.engine() {
+                    self.history.commit(Snapshot { engine: next, cmd });
                 }
                 true
             }

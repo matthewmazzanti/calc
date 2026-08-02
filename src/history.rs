@@ -34,12 +34,6 @@ impl<T> History<T> {
         &self.current
     }
 
-    /// The live state, mutably — for tweaks that aren't their own undo point
-    /// (e.g. relabelling the state just committed).
-    pub fn current_mut(&mut self) -> &mut T {
-        &mut self.current
-    }
-
     /// Advance to `next` as the new current, recording the old current as an
     /// undo point and discarding any redo future (a new action starts a fresh
     /// branch).
