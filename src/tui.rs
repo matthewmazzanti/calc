@@ -134,6 +134,8 @@ impl App {
             // commands that update the live engine.
             KeyCode::Char('x') | KeyCode::Char('d') => self.run(&[Command::Drop(self.cursor)]),
             KeyCode::Char('s') => self.run(&[Command::Swap(self.cursor)]),
+            // Ctrl-R redoes (vim-style); a bare `r` rotates at the cursor.
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => self.redo(),
             KeyCode::Char('r') => self.run(&[Command::Roll(self.cursor)]),
             KeyCode::Char('u') => self.undo(),
             // Duplicate the selected value to the top.
@@ -239,7 +241,7 @@ impl App {
             Ok(next) => {
                 if next != self.engine {
                     let previous = std::mem::replace(&mut self.engine, next);
-                    self.history.push(previous);
+                    self.history.record(previous);
                 }
                 true
             }
@@ -250,14 +252,21 @@ impl App {
         }
     }
 
-    /// Restore the previous state, moving it back into the live engine.
+    /// Restore the previous state into the live engine.
     fn undo(&mut self) {
-        match self.history.pop() {
-            Some(previous) => {
-                self.engine = previous;
-                self.cmd = "undo".to_string();
-            }
-            None => self.notice = Some(Notice::Note("nothing to undo".to_string())),
+        if self.history.undo(&mut self.engine) {
+            self.cmd = "undo".to_string();
+        } else {
+            self.notice = Some(Notice::Note("nothing to undo".to_string()));
+        }
+    }
+
+    /// Re-apply the most recently undone state.
+    fn redo(&mut self) {
+        if self.history.redo(&mut self.engine) {
+            self.cmd = "redo".to_string();
+        } else {
+            self.notice = Some(Notice::Note("nothing to redo".to_string()));
         }
     }
 }
@@ -602,6 +611,28 @@ mod tests {
         assert_eq!(app.stack(), &[1.0, 2.0]);
         ch(&mut app, 'u');
         assert_eq!(app.stack(), &[1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn ctrl_r_redoes_an_undone_action() {
+        let mut app = stacked("1 2 3");
+        ch(&mut app, 'x'); // drop -> [1, 2]
+        ch(&mut app, 'u'); // undo -> [1, 2, 3]
+        assert_eq!(app.stack(), &[1.0, 2.0, 3.0]);
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert_eq!(app.stack(), &[1.0, 2.0]); // redone
+        assert_eq!(app.cmd, "redo");
+    }
+
+    #[test]
+    fn a_new_action_after_undo_clears_redo() {
+        let mut app = stacked("1 2 3");
+        ch(&mut app, 'x'); // [1, 2]
+        ch(&mut app, 'u'); // undo -> [1, 2, 3], redo available
+        ch(&mut app, 'x'); // new action -> [1, 2], discards redo
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert_eq!(app.stack(), &[1.0, 2.0]); // nothing to redo
+        assert!(matches!(app.notice, Some(Notice::Note(_))));
     }
 
     #[test]

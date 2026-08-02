@@ -1,9 +1,9 @@
 # TODO
 
 ## Undo/redo
-- [ ] **Redo** — the history is currently undo-only (pop past → current). Add a
-  forward stack: on `update`, clear it; on undo, push the current onto it; redo
-  pops it back. (Turns the non-empty list into `(past…, current, future…)`.)
+- [x] **Redo** — `History` now holds `past` + `future`; `record` clears the
+  future, `undo` moves current → future, `redo` moves current → past. Bound to
+  Ctrl-R (vim-style). Turns it into `(past…, current, future…)`.
   - Future extension: a **vim-style undo tree** — instead of discarding the
     forward stack on a new edit after an undo, branch it, so no state is ever
     lost. Needs a tree of states with per-node children + navigation
