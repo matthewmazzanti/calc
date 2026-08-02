@@ -1,31 +1,16 @@
-//! The inline, modal TUI. `App` holds all state and `handle_key` is a pure
-//! state transition over it — so the interaction logic is unit-testable without
-//! a terminal. Rendering and terminal setup live below and are the only parts
-//! that touch a real tty.
+//! The UI state and its modal keypress logic. `App` is a pure state machine —
+//! `handle_key` is the single entry point and touches no terminal, so all of
+//! the interaction logic is unit-testable here. Rendering (`view`) and terminal
+//! I/O (`terminal`) live in sibling modules.
 
-use std::io::{self, Stdout};
-
-use crossterm::cursor::{MoveTo, SetCursorStyle};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
-use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout, Position};
-use ratatui::style::{Color, Style, Stylize};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
-use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::engine::{self, CalcError, Command, Engine, Outcome, Value};
 use crate::history::History;
 
-/// The stack is shown one value per row, up to this many rows; beyond it only
-/// the shallowest `MAX_STACK_ROWS` levels are visible.
-const MAX_STACK_ROWS: u16 = 10;
-
 /// Vim-style editing modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
+pub(super) enum Mode {
     /// Navigate and manipulate the stack with single keys.
     Normal,
     /// Edit the command line.
@@ -33,9 +18,9 @@ pub enum Mode {
 }
 
 /// A transient message for the info bar, cleared on the next keypress.
-enum Notice {
+pub(super) enum Notice {
     /// A command batch that failed — rendered with the trace, the offending
-    /// command bolded.
+    /// command underlined.
     Error(CalcError),
     /// A plain note, e.g. "nothing to undo".
     Note(String),
@@ -53,7 +38,7 @@ struct Snapshot {
 
 /// The whole UI state. `history` owns the live snapshot and the surrounding
 /// undo/redo states — the non-empty `(past…, current, future…)` list.
-pub struct App {
+pub(super) struct App {
     history: History<Snapshot>,
     mode: Mode,
     /// The command-line buffer, edited in insert mode.
@@ -67,7 +52,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             history: History::new(Snapshot {
                 engine: Engine::new(),
@@ -81,35 +66,51 @@ impl App {
         }
     }
 
-    /// The live engine (history's current snapshot).
-    fn engine(&self) -> &Engine {
-        &self.history.current().engine
+    // --- Read access for `view` and `terminal` (sibling modules). ---
+
+    pub(super) fn should_quit(&self) -> bool {
+        self.should_quit
+    }
+
+    pub(super) fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    pub(super) fn input(&self) -> &str {
+        &self.input
+    }
+
+    pub(super) fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    pub(super) fn notice(&self) -> Option<&Notice> {
+        self.notice.as_ref()
+    }
+
+    /// The command that produced the current state, for the info bar.
+    pub(super) fn cmd(&self) -> &str {
+        &self.history.current().cmd
     }
 
     /// The live stack.
-    fn stack(&self) -> &[Value] {
+    pub(super) fn stack(&self) -> &[Value] {
         self.engine().stack()
     }
 
-    fn depth(&self) -> usize {
+    pub(super) fn depth(&self) -> usize {
         self.stack().len()
     }
 
     /// Whether the info line has anything to show — an error/note, or a last
     /// command. When it doesn't, its row is given back to the stack.
-    fn has_info(&self) -> bool {
-        self.notice.is_some() || !self.history.current().cmd.is_empty()
-    }
-
-    /// Keep the cursor on a real level (or 1 when the stack is empty).
-    fn clamp_cursor(&mut self) {
-        let d = self.depth();
-        self.cursor = if d == 0 { 1 } else { self.cursor.clamp(1, d) };
+    pub(super) fn has_info(&self) -> bool {
+        self.notice.is_some() || !self.cmd().is_empty()
     }
 
     /// Advance the whole UI by one keypress. This is the single entry point for
     /// input and is deliberately free of any terminal I/O so it can be tested.
-    pub fn handle_key(&mut self, key: KeyEvent) {
+    pub(super) fn handle_key(&mut self, key: KeyEvent) {
         self.notice = None;
 
         // Ctrl-C and Ctrl-D (EOF) always quit, in any mode.
@@ -125,6 +126,19 @@ impl App {
             Mode::Insert => self.handle_insert(key),
         }
         self.clamp_cursor();
+    }
+
+    // --- Internals. ---
+
+    /// The live engine (history's current snapshot).
+    fn engine(&self) -> &Engine {
+        &self.history.current().engine
+    }
+
+    /// Keep the cursor on a real level (or 1 when the stack is empty).
+    fn clamp_cursor(&mut self) {
+        let d = self.depth();
+        self.cursor = if d == 0 { 1 } else { self.cursor.clamp(1, d) };
     }
 
     fn handle_normal(&mut self, key: KeyEvent) {
@@ -235,11 +249,10 @@ impl App {
     }
 
     /// Run a transform on a copy of the current engine and adopt the result as
-    /// the new live state. On success — if the state actually changed — the
-    /// outgoing snapshot is recorded as an undo point; the caller then sets the
-    /// new snapshot's `cmd`. On failure the engine is left untouched (the copy
-    /// is discarded) and the error shown, so an operation is atomic. Returns
-    /// success.
+    /// the new live state. On success — if the state actually changed — the full
+    /// snapshot (engine + `cmd`) is committed as an undo point. On failure the
+    /// engine is left untouched (the copy is discarded) and the error shown, so
+    /// an operation is atomic. Returns success.
     fn update(&mut self, cmd: String, f: impl FnOnce(Engine) -> Outcome) -> bool {
         match f(self.engine().clone()) {
             Ok(next) => {
@@ -279,78 +292,6 @@ impl Default for App {
     }
 }
 
-// --- Rendering ---
-
-fn render(frame: &mut Frame, app: &App) {
-    // Command line, then the stack, then the info line (0 rows when empty —
-    // reclaimed by the stack; a zero-height area just draws nothing).
-    let [input_area, stack_area, info_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(u16::from(app.has_info())),
-    ])
-    .areas(frame.area());
-
-    frame.render_widget(Paragraph::new(command_line(app)), input_area);
-    if app.mode == Mode::Insert {
-        // Place the terminal cursor at the end of the edited input.
-        let col = prompt(app.mode).chars().count() + app.input.chars().count();
-        frame.set_cursor_position(Position::new(input_area.x + col as u16, input_area.y));
-    }
-    frame.render_widget(Paragraph::new(stack_lines(app)), stack_area);
-    frame.render_widget(Paragraph::new(info_line(app)), info_area);
-}
-
-/// The command-line prompt for a mode: `>` for insert, `:` for normal.
-fn prompt(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Insert => "> ",
-        Mode::Normal => ": ",
-    }
-}
-
-/// The command line: the teal mode prompt followed by the input buffer.
-fn command_line(app: &App) -> Line<'_> {
-    Line::from(vec![
-        Span::styled(prompt(app.mode), Style::new().fg(Color::Cyan)),
-        Span::raw(app.input.as_str()),
-    ])
-}
-
-/// The stack, top-aligned: level 1 (top of stack) first, deeper levels below,
-/// the selected level highlighted and labels dimmed. Capped at the visible rows.
-fn stack_lines(app: &App) -> Vec<Line<'static>> {
-    let depth = app.depth();
-    if depth == 0 {
-        return vec![Line::from("(empty)").dim()];
-    }
-    (1..=depth.min(MAX_STACK_ROWS as usize))
-        .map(|level| {
-            let value = app.stack()[depth - level];
-            let label = format!("{level:>3}: ");
-            if app.mode == Mode::Normal && level == app.cursor {
-                Line::from(format!("{label}{value}")).reversed()
-            } else {
-                Line::from(vec![Span::raw(label).dim(), Span::raw(value.to_string())])
-            }
-        })
-        .collect()
-}
-
-/// The info line: the current error, a note, or the last command run. Mode is
-/// shown in the command-line prompt, not here.
-fn info_line(app: &App) -> Line<'_> {
-    match &app.notice {
-        Some(Notice::Error(e)) => error_line(e),
-        Some(Notice::Note(note)) => Line::from(Span::styled(note.as_str(), Style::new().red())),
-        None if app.history.current().cmd.is_empty() => Line::default(),
-        None => Line::from(vec![
-            Span::styled("cmd: ", Style::new().dim()),
-            Span::raw(app.history.current().cmd.as_str()),
-        ]),
-    }
-}
-
 /// Join a program into its canonical text (`10 0 /`), for the info bar's `cmd`.
 fn describe(program: &[Command]) -> String {
     program
@@ -358,108 +299,6 @@ fn describe(program: &[Command]) -> String {
         .map(Command::to_string)
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-/// Render an error as `error: <kind> in '<program>'`, all in red, with the
-/// offending command underlined — a source indicator pointing at what failed.
-fn error_line(e: &CalcError) -> Line<'static> {
-    let red = Style::new().red();
-    let mut spans = vec![Span::styled(format!("error: {}", e.kind), red)];
-    if let Some(trace) = &e.trace {
-        spans.push(Span::styled(" in '", red));
-        for (i, command) in trace.program.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::styled(" ", red));
-            }
-            let style = if i == trace.index { red.underlined() } else { red };
-            spans.push(Span::styled(command.to_string(), style));
-        }
-        spans.push(Span::styled("'", red));
-    }
-    Line::from(spans)
-}
-
-// --- Terminal driver ---
-
-/// Height the inline viewport should have: the command line, the info line (only
-/// when it has something to show), and one row per stack value (1..MAX).
-fn desired_height(app: &App) -> u16 {
-    let stack_rows = app.depth().clamp(1, MAX_STACK_ROWS as usize) as u16;
-    let chrome = 1 + u16::from(app.has_info());
-    chrome + stack_rows
-}
-
-fn new_terminal(height: u16) -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
-    Terminal::with_options(
-        CrosstermBackend::new(io::stdout()),
-        TerminalOptions {
-            viewport: Viewport::Inline(height),
-        },
-    )
-}
-
-/// Grow or shrink the inline viewport to `height`. An inline viewport's height
-/// is fixed at creation, so we clear the current region and re-anchor a fresh
-/// viewport of the new height at the same top row.
-fn resize_terminal(
-    mut terminal: Terminal<CrosstermBackend<Stdout>>,
-    height: u16,
-) -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
-    let top = terminal.get_frame().area().y;
-    execute!(io::stdout(), MoveTo(0, top), Clear(ClearType::FromCursorDown))?;
-    drop(terminal);
-    new_terminal(height)
-}
-
-/// Set up the inline viewport, run the event loop, and restore the terminal.
-pub fn run() -> io::Result<()> {
-    enable_raw_mode()?;
-    // Restore the terminal even if we panic mid-draw.
-    let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), SetCursorStyle::DefaultUserShape);
-        original_hook(info);
-    }));
-
-    let mut app = App::new();
-    let terminal = new_terminal(desired_height(&app))?;
-    let result = event_loop(terminal, &mut app);
-
-    let _ = execute!(io::stdout(), SetCursorStyle::DefaultUserShape);
-    disable_raw_mode()?;
-    // Leave the shell prompt on a fresh line below the final frame.
-    println!();
-    result
-}
-
-fn event_loop(mut terminal: Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::Result<()> {
-    let mut height = desired_height(app);
-    loop {
-        let wanted = desired_height(app);
-        if wanted != height {
-            terminal = resize_terminal(terminal, wanted)?;
-            height = wanted;
-        }
-
-        // A beam cursor while editing the command line, a block otherwise.
-        let cursor_style = match app.mode {
-            Mode::Insert => SetCursorStyle::SteadyBar,
-            Mode::Normal => SetCursorStyle::DefaultUserShape,
-        };
-        execute!(io::stdout(), cursor_style)?;
-
-        terminal.draw(|frame| render(frame, app))?;
-        if let Event::Key(key) = event::read()? {
-            // Ignore key-release events (Windows sends them).
-            if key.kind == KeyEventKind::Press {
-                app.handle_key(key);
-            }
-        }
-        if app.should_quit {
-            return Ok(());
-        }
-    }
 }
 
 #[cfg(test)]
@@ -635,7 +474,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
         assert_eq!(app.stack(), &[1.0, 2.0]); // redone
         // The restored snapshot carries the command that produced it.
-        assert_eq!(app.history.current().cmd, "drop");
+        assert_eq!(app.cmd(), "drop");
     }
 
     #[test]
@@ -695,10 +534,10 @@ mod tests {
         let mut app = App::new();
         typ(&mut app, "3");
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.history.current().cmd, "3"); // the committed line
+        assert_eq!(app.cmd(), "3"); // the committed line
         typ(&mut app, "4");
         ch(&mut app, '+'); // operator with a pending entry
-        assert_eq!(app.history.current().cmd, "4 +");
+        assert_eq!(app.cmd(), "4 +");
         assert_eq!(app.stack(), &[7.0]);
     }
 
@@ -723,7 +562,7 @@ mod tests {
     fn info_bar_records_cursor_ops() {
         let mut app = stacked("1 2 3");
         ch(&mut app, 'x'); // drop at cursor (level 1)
-        assert_eq!(app.history.current().cmd, "drop");
+        assert_eq!(app.cmd(), "drop");
     }
 
     #[test]
@@ -734,6 +573,6 @@ mod tests {
         ch(&mut app, 'x'); // drop -> cmd "drop"
         ch(&mut app, 'u'); // undo -> [1,2,3], whose origin was "3"
         assert_eq!(app.stack(), &[1.0, 2.0, 3.0]);
-        assert_eq!(app.history.current().cmd, "3");
+        assert_eq!(app.cmd(), "3");
     }
 }
