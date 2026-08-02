@@ -2,8 +2,8 @@
 //! values (and, later, evaluation settings). No I/O and no history — its
 //! transforms *consume* `self` and return the new engine, so a batch of
 //! commands folds through with no intermediate copies: the same value is moved
-//! from step to step. [`Engine::apply`] takes a whole slice of commands, and
-//! [`Engine::eval`] parses a line into one.
+//! from step to step. [`Engine::apply`] runs a whole slice of commands; turning
+//! a line of text into one is a frontend concern, handled by [`parse`].
 //!
 //! On failure a transform moves `self` *into* the error rather than dropping it:
 //! [`CalcError`] carries the engine as it stood when the command failed — its
@@ -119,6 +119,14 @@ impl std::fmt::Display for Command {
     }
 }
 
+/// Parse a whitespace-separated line into a program, failing on the first
+/// unknown token (its text is carried in the [`ErrorKind`]). Parsing is a
+/// frontend concern — the engine itself only runs programs, via
+/// [`Engine::apply`].
+pub fn parse(input: &str) -> Result<Vec<Command>, ErrorKind> {
+    input.split_whitespace().map(Command::parse).collect()
+}
+
 /// The command sequence that was executing when an error struck, and the index
 /// of the command that failed — "here's what was running."
 #[derive(Debug, Clone, PartialEq)]
@@ -202,22 +210,6 @@ impl Engine {
     /// The current stack, bottom-to-top (top of stack is the last element).
     pub fn stack(&self) -> &[Value] {
         &self.stack
-    }
-
-    /// Evaluate a whitespace-separated line. The line is parsed first, so a
-    /// malformed token fails before anything runs; then the whole batch of
-    /// commands is applied.
-    pub fn eval(self, input: &str) -> Outcome {
-        let program = match input
-            .split_whitespace()
-            .map(Command::parse)
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(program) => program,
-            // Parse failed before any command ran; attach the untouched engine.
-            Err(kind) => return self.fail(kind),
-        };
-        self.apply(&program)
     }
 
     /// Apply a batch of commands in order, threading the engine through each.
@@ -369,9 +361,9 @@ impl Engine {
 mod tests {
     use super::*;
 
-    /// Evaluate `input` from a fresh engine and return the result.
+    /// Parse and run `input` from a fresh engine and return the result.
     fn run(input: &str) -> Engine {
-        Engine::new().eval(input).unwrap()
+        Engine::new().apply(&parse(input).unwrap()).unwrap()
     }
 
     #[test]
@@ -425,7 +417,7 @@ mod tests {
     fn errors_carry_the_engine_at_the_point_of_failure() {
         // The whole engine is attached for inspection; its stack is the state
         // the failing command saw (operands still present, nothing partial).
-        let err = Engine::new().eval("1 0 /").unwrap_err();
+        let err = Engine::new().apply(&parse("1 0 /").unwrap()).unwrap_err();
         assert_eq!(err.kind, ErrorKind::DivideByZero);
         assert_eq!(err.engine.stack(), &[1.0, 0.0]);
         let trace = err.trace.unwrap();
@@ -435,20 +427,20 @@ mod tests {
 
     #[test]
     fn an_error_leaves_the_callers_engine_untouched() {
-        // Family-C atomicity: evaluate a *copy*; on error the original is intact
-        // simply because it was never moved into `eval`.
+        // Family-C atomicity: run against a *copy*; on error the original is
+        // intact simply because it was never moved into `apply`.
         let original = run("1");
         assert_eq!(
-            original.clone().eval("+").unwrap_err().kind,
+            original.clone().apply(&parse("+").unwrap()).unwrap_err().kind,
             ErrorKind::StackUnderflow
         );
         assert_eq!(original.stack(), &[1.0]);
     }
 
     #[test]
-    fn eval_error_traces_the_program_and_the_failing_command() {
+    fn apply_error_traces_the_program_and_the_failing_command() {
         // `1 2 + /`: after `+` the stack is [3]; `/` underflows at index 3.
-        let err = Engine::new().eval("1 2 + /").unwrap_err();
+        let err = Engine::new().apply(&parse("1 2 + /").unwrap()).unwrap_err();
         assert_eq!(err.kind, ErrorKind::StackUnderflow);
         let trace = err.trace.clone().unwrap();
         assert_eq!(trace.index, 3);
@@ -466,11 +458,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_errors_carry_no_trace() {
-        // The offending token is already in the message, so there's no trace.
-        let err = Engine::new().eval("1 2 + oops").unwrap_err();
-        assert_eq!(err.kind, ErrorKind::UnknownCommand("oops".to_string()));
-        assert_eq!(err.trace, None);
+    fn parse_fails_on_the_bad_token() {
+        // Parsing is separate from running: a bad token is an `ErrorKind`, with
+        // no engine or trace (nothing ran).
+        assert_eq!(
+            parse("1 2 + oops"),
+            Err(ErrorKind::UnknownCommand("oops".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_produces_a_program() {
+        assert_eq!(
+            parse("1 2 +"),
+            Ok(vec![Command::Push(1.0), Command::Push(2.0), Command::Add])
+        );
     }
 
     #[test]
@@ -493,14 +495,6 @@ mod tests {
     #[test]
     fn clear_empties_the_stack() {
         assert!(run("1 2 3 clear").stack().is_empty());
-    }
-
-    #[test]
-    fn unknown_command_errors() {
-        assert_eq!(
-            Engine::new().eval("foo").unwrap_err().kind,
-            ErrorKind::UnknownCommand("foo".to_string())
-        );
     }
 
     #[test]

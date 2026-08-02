@@ -16,7 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 
-use crate::engine::{CalcError, Command, Engine, Outcome, Value};
+use crate::engine::{self, CalcError, Command, Engine, Outcome, Value};
 use crate::history::History;
 
 /// The command-line prompt colour (ANSI teal, so it follows the terminal theme).
@@ -25,9 +25,6 @@ const TEAL: Color = Color::Cyan;
 /// The stack is shown one value per row, up to this many rows; beyond it only
 /// the shallowest `MAX_STACK_ROWS` levels are visible.
 const MAX_STACK_ROWS: u16 = 10;
-
-/// Rows of chrome around the stack: the command line and the info bar.
-const CHROME_ROWS: u16 = 2;
 
 /// Vim-style editing modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +86,12 @@ impl App {
 
     fn depth(&self) -> usize {
         self.stack().len()
+    }
+
+    /// Whether the info line has anything to show — an error/note, or a last
+    /// command. When it doesn't, its row is given back to the stack.
+    fn has_info(&self) -> bool {
+        self.notice.is_some() || !self.cmd.is_empty()
     }
 
     /// Keep the cursor on a real level (or 1 when the stack is empty).
@@ -175,16 +178,23 @@ impl App {
         }
     }
 
-    /// Evaluate the command-line buffer. On success it clears; on error the
-    /// buffer is kept so the user can fix it. Returns whether it succeeded.
+    /// Parse and run the command-line buffer. On success it clears; on error
+    /// (parse or runtime) the buffer is kept so the user can fix it. Returns
+    /// whether it succeeded.
     fn commit_input(&mut self) -> bool {
         if self.input.trim().is_empty() {
             self.input.clear();
             return true;
         }
-        let entry = self.input.clone();
-        if self.update(|e| e.eval(&entry)) {
-            self.cmd = entry.trim().to_string();
+        let program = match engine::parse(&self.input) {
+            Ok(program) => program,
+            Err(kind) => {
+                self.notice = Some(Notice::Note(format!("error: {kind}")));
+                return false;
+            }
+        };
+        if self.update(|e| e.apply(&program)) {
+            self.cmd = describe(&program);
             self.input.clear();
             true
         } else {
@@ -193,13 +203,20 @@ impl App {
     }
 
     /// Commit any pending entry, then apply an operator — as one undo unit.
-    /// The entry and operator are folded into a single line so the error trace
+    /// The entry and operator are folded into one program so the error trace
     /// (and `cmd`) shows the whole thing, e.g. `10 0 /`. On error the buffer is
     /// kept so the user can fix it.
     fn apply_operator(&mut self, op: Command) {
-        let line = format!("{} {op}", self.input.trim());
-        if self.update(|e| e.eval(&line)) {
-            self.cmd = line.trim().to_string();
+        let mut program = match engine::parse(self.input.trim()) {
+            Ok(program) => program,
+            Err(kind) => {
+                self.notice = Some(Notice::Note(format!("error: {kind}")));
+                return;
+            }
+        };
+        program.push(op);
+        if self.update(|e| e.apply(&program)) {
+            self.cmd = describe(&program);
             self.input.clear();
         }
     }
@@ -208,11 +225,7 @@ impl App {
     /// as the last action for the info bar.
     fn run(&mut self, commands: &[Command]) {
         if self.update(|e| e.apply(commands)) {
-            self.cmd = commands
-                .iter()
-                .map(Command::to_string)
-                .collect::<Vec<_>>()
-                .join(" ");
+            self.cmd = describe(commands);
         }
     }
 
@@ -258,10 +271,11 @@ impl Default for App {
 // --- Rendering ---
 
 fn render(frame: &mut Frame, app: &App) {
-    // Command line, then a one-line info bar, then the stack.
+    // Command line, then the info line (0 rows when empty — reclaimed by the
+    // stack), then the stack. A zero-height info area simply draws nothing.
     let [input_area, info_area, stack_area] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(u16::from(app.has_info())),
         Constraint::Min(1),
     ])
     .areas(frame.area());
@@ -315,35 +329,42 @@ fn render(frame: &mut Frame, app: &App) {
     frame.render_widget(Paragraph::new(info), info_area);
 }
 
-/// Render an error as `error: <kind> in <program>`. The program is dimmed for
-/// context, with the offending command bold and red — a source indicator
-/// pointing at what failed.
+/// Join a program into its canonical text (`10 0 /`), for the info bar's `cmd`.
+fn describe(program: &[Command]) -> String {
+    program
+        .iter()
+        .map(Command::to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Render an error as `error: <kind> in '<program>'`, all in red, with the
+/// offending command underlined — a source indicator pointing at what failed.
 fn error_line(e: &CalcError) -> Line<'static> {
-    let mut spans = vec![Span::styled(format!("error: {}", e.kind), Style::new().red())];
+    let red = Style::new().red();
+    let mut spans = vec![Span::styled(format!("error: {}", e.kind), red)];
     if let Some(trace) = &e.trace {
-        spans.push(Span::styled(" in ", Style::new().dim()));
+        spans.push(Span::styled(" in '", red));
         for (i, command) in trace.program.iter().enumerate() {
             if i > 0 {
-                spans.push(Span::raw(" "));
+                spans.push(Span::styled(" ", red));
             }
-            let style = if i == trace.index {
-                Style::new().red().bold()
-            } else {
-                Style::new().dim()
-            };
+            let style = if i == trace.index { red.underlined() } else { red };
             spans.push(Span::styled(command.to_string(), style));
         }
+        spans.push(Span::styled("'", red));
     }
     Line::from(spans)
 }
 
 // --- Terminal driver ---
 
-/// Height the inline viewport should have for the current stack: the chrome
-/// plus one row per value, at least one row and at most `MAX_STACK_ROWS`.
+/// Height the inline viewport should have: the command line, the info line (only
+/// when it has something to show), and one row per stack value (1..MAX).
 fn desired_height(app: &App) -> u16 {
     let stack_rows = app.depth().clamp(1, MAX_STACK_ROWS as usize) as u16;
-    CHROME_ROWS + stack_rows
+    let chrome = 1 + u16::from(app.has_info());
+    chrome + stack_rows
 }
 
 fn new_terminal(height: u16) -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
@@ -510,11 +531,12 @@ mod tests {
     #[test]
     fn a_failed_entry_keeps_the_buffer_for_editing() {
         let mut app = App::new();
-        typ(&mut app, "1..2"); // not a number
+        typ(&mut app, "1..2"); // neither a number nor a command
         press(&mut app, KeyCode::Enter);
         assert!(app.stack().is_empty());
         assert_eq!(app.input, "1..2");
-        assert!(matches!(app.notice, Some(Notice::Error(_))));
+        // A parse error is reported as a note (no engine/trace to show).
+        assert!(matches!(app.notice, Some(Notice::Note(_))));
     }
 
     fn stacked(values: &str) -> App {

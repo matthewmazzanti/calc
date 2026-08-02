@@ -10,11 +10,19 @@
     (`g-`/`g+`-style time travel, not just linear undo/redo).
 
 ## Engine / evaluation
-- [ ] **TUI passes programs, not strings** — parse at the TUI boundary
-  (`Command::parse` per token) and hand the evaluator a `&[Command]`, rather than
-  calling `eval(&str)`. Keeps the engine free of text; the command line becomes
-  "tokenize → program → apply". (Parse errors would surface without an engine to
-  attach — decide how they're reported.)
+- [ ] **Fix parameterized commands — read the level from the stack.**
+  `Dup/Drop/Swap/Roll(usize)` bake a level into the variant, which only exists to
+  serve the cursor UI; the text language can only reach the fixed cases
+  (`dup`=1, `swap`=1, `rot`=3). Make them RPN-idiomatic instead: un-parameterized
+  commands that pop their level argument off the stack (HP48-style `n ROLL`,
+  `n PICK`, `n ROLLD`). Open question: how the cursor ops map — push the cursor
+  level then run, or keep a separate UI path that pokes the stack directly.
+- [x] **TUI passes programs, not strings** — `eval(&str)` is off the engine;
+  parsing is now a free `engine::parse(&str) -> Result<Vec<Command>, ErrorKind>`
+  the TUI calls before `apply(&[Command])`. Parse errors (no engine/trace to
+  show) surface as a plain note; runtime errors keep the full trace. `apply`
+  borrows the program (see the reasoning: callers need it after, single-command
+  ops stay alloc-free, the trace clone is cold-path only).
 - [ ] **Variables / let bindings** — survey Forth (and RPL/HP48 local vars,
   `LSTO`/`→`) for approaches before committing to a model. Question: named
   registers vs. a proper binding scope; how they interact with undo.
@@ -26,7 +34,17 @@
   the kind of state the `Engine` struct was set up to hold.
 
 ## TUI
-- [ ] **Reclaim the info line** — only reserve its row when there's something to
+- [ ] **Basic readline editing** — `^A`/`^E` (line start/end), `^W` (delete word),
+  `^U`/`^K` (kill to start/end), `^B`/`^F` + arrows (move). Needs a cursor
+  *position* within the command line — today it's append-only. Full readline
+  (kill ring, incremental history search) later. Note: `^D` currently quits, so
+  it conflicts with readline's delete-forward / EOF-on-empty.
+- [ ] **Command-line history** — recall previous committed entries (up/down),
+  shell- / HP48-`LAST CMD`-style. Distinct from undo (that reverts *stack state*;
+  this recalls *text you typed*). Pairs with readline: recall → edit → re-run.
+  A `LASTARG`-style recall of the args the last command consumed is a related
+  variant.
+- [x] **Reclaim the info line** — only reserve its row when there's something to
   show (an error, or a `cmd`); otherwise give the row back to the stack. Ties
   into the dynamic viewport height (`CHROME_ROWS` would become conditional).
 - [ ] **SIGWINCH / resize** — confirm terminal resize is handled. ratatui
