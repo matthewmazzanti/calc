@@ -282,8 +282,8 @@ impl Default for App {
 // --- Rendering ---
 
 fn render(frame: &mut Frame, app: &App) {
-    // Command line, then the info line (0 rows when empty — reclaimed by the
-    // stack), then the stack. A zero-height info area simply draws nothing.
+    // Command line, then the stack, then the info line (0 rows when empty —
+    // reclaimed by the stack; a zero-height area just draws nothing).
     let [input_area, stack_area, info_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -291,44 +291,56 @@ fn render(frame: &mut Frame, app: &App) {
     ])
     .areas(frame.area());
 
-    // Stack: top-aligned, level 1 (the top of stack) just under the command
-    // line, deeper levels below. The level label is dimmed.
-    let height = stack_area.height as usize;
+    frame.render_widget(Paragraph::new(command_line(app)), input_area);
+    if app.mode == Mode::Insert {
+        // Place the terminal cursor at the end of the edited input.
+        let col = prompt(app.mode).chars().count() + app.input.chars().count();
+        frame.set_cursor_position(Position::new(input_area.x + col as u16, input_area.y));
+    }
+    frame.render_widget(Paragraph::new(stack_lines(app)), stack_area);
+    frame.render_widget(Paragraph::new(info_line(app)), info_area);
+}
+
+/// The command-line prompt for a mode: `>` for insert, `:` for normal.
+fn prompt(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Insert => "> ",
+        Mode::Normal => ": ",
+    }
+}
+
+/// The command line: the teal mode prompt followed by the input buffer.
+fn command_line(app: &App) -> Line<'_> {
+    Line::from(vec![
+        Span::styled(prompt(app.mode), Style::new().fg(Color::Cyan)),
+        Span::raw(app.input.as_str()),
+    ])
+}
+
+/// The stack, top-aligned: level 1 (top of stack) first, deeper levels below,
+/// the selected level highlighted and labels dimmed. Capped at the visible rows.
+fn stack_lines(app: &App) -> Vec<Line<'static>> {
     let depth = app.depth();
-    let mut lines: Vec<Line> = Vec::with_capacity(height);
     if depth == 0 {
-        lines.push(Line::from("(empty)").dim());
-    } else {
-        let shown = depth.min(height);
-        for level in 1..=shown {
+        return vec![Line::from("(empty)").dim()];
+    }
+    (1..=depth.min(MAX_STACK_ROWS as usize))
+        .map(|level| {
             let value = app.stack()[depth - level];
             let label = format!("{level:>3}: ");
-            let selected = app.mode == Mode::Normal && level == app.cursor;
-            lines.push(if selected {
+            if app.mode == Mode::Normal && level == app.cursor {
                 Line::from(format!("{label}{value}")).reversed()
             } else {
                 Line::from(vec![Span::raw(label).dim(), Span::raw(value.to_string())])
-            });
-        }
-    }
-    frame.render_widget(Paragraph::new(lines), stack_area);
+            }
+        })
+        .collect()
+}
 
-    // Command line: the teal prompt carries the mode — `>` for insert, `:` for
-    // normal.
-    let prompt = if app.mode == Mode::Insert { "> " } else { ": " };
-    let command_line = Line::from(vec![
-        Span::styled(prompt, Style::new().fg(Color::Cyan)),
-        Span::raw(app.input.as_str()),
-    ]);
-    frame.render_widget(Paragraph::new(command_line), input_area);
-    if app.mode == Mode::Insert {
-        let x = input_area.x + (prompt.chars().count() + app.input.chars().count()) as u16;
-        frame.set_cursor_position(Position::new(x, input_area.y));
-    }
-
-    // Info bar: the current error, a note, or the last command run. Mode is
-    // shown in the command-line prompt, not here.
-    let info = match &app.notice {
+/// The info line: the current error, a note, or the last command run. Mode is
+/// shown in the command-line prompt, not here.
+fn info_line(app: &App) -> Line<'_> {
+    match &app.notice {
         Some(Notice::Error(e)) => error_line(e),
         Some(Notice::Note(note)) => Line::from(Span::styled(note.as_str(), Style::new().red())),
         None if app.history.current().cmd.is_empty() => Line::default(),
@@ -336,8 +348,7 @@ fn render(frame: &mut Frame, app: &App) {
             Span::styled("cmd: ", Style::new().dim()),
             Span::raw(app.history.current().cmd.as_str()),
         ]),
-    };
-    frame.render_widget(Paragraph::new(info), info_area);
+    }
 }
 
 /// Join a program into its canonical text (`10 0 /`), for the info bar's `cmd`.
