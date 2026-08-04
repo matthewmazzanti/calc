@@ -24,20 +24,22 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
     .areas(frame.area());
 
     frame.render_widget(Paragraph::new(command_line(app)), input_area);
-    if app.mode() == Mode::Insert {
-        // Place the terminal cursor at the end of the edited input.
-        let col = prompt(app.mode()).chars().count() + app.input().chars().count();
+    if app.mode() != Mode::Normal {
+        // Place the terminal cursor at the caret within the edited input.
+        let col = prompt(app.mode()).chars().count() + app.caret_col();
         frame.set_cursor_position(Position::new(input_area.x + col as u16, input_area.y));
     }
     frame.render_widget(Paragraph::new(stack_lines(app)), stack_area);
     frame.render_widget(Paragraph::new(info_line(app)), info_area);
 }
 
-/// The command-line prompt for a mode: `>` for insert, `:` for normal.
+/// The command-line prompt for a mode: `>` for insert, `:` for normal, `'` for
+/// quote (literal entry).
 fn prompt(mode: Mode) -> &'static str {
     match mode {
         Mode::Insert => "> ",
         Mode::Normal => ": ",
+        Mode::Quote => "' ",
     }
 }
 

@@ -10,6 +10,23 @@
     (`g-`/`g+`-style time travel, not just linear undo/redo).
 
 ## Engine / evaluation
+- [ ] **Exact real arithmetic** — replace `f64` with an exact/constructive real
+  representation so results don't accumulate float error. Prior art: the Android
+  (AOSP) calculator, which uses Hans Boehm's constructive reals (`CR`) — lazily
+  evaluated to whatever precision the display needs, with rationals as a fast
+  path. Big change to `Value`; touches parsing, display (need a target
+  precision), and equality (constructive reals can't decide `==` in general).
+- [ ] **Value provenance** — each stack value records the program that derived
+  it (the trace of ops that produced it), so you can inspect *why* a value is
+  what it is. Unsure if sane: interacts with `Value` being a bare `f64`, grows
+  every value, and needs a UI to surface it. Related to the error `Trace` we
+  already build. Park until there's a concrete use (audit trail? re-derivation?).
+- [ ] **Expand `Value` beyond scalars — complex and matrix.** Today `Value =
+  f64`; grow it to a sum type (`Real`, `Complex`, `Matrix`/`Vector`) so the
+  stack can hold structured values. Touches every op (dispatch per type, define
+  which ops are legal on which), parsing/entry (literal syntax — complex
+  `(re, im)`, matrix `[[…]]`; pairs with quote mode above), and display. HP48
+  precedent: complex and vector/matrix objects are first-class stack values.
 - [ ] **Fix parameterized commands — read the level from the stack.**
   `Dup/Drop/Swap/Roll(usize)` bake a level into the variant, which only exists to
   serve the cursor UI; the text language can only reach the fixed cases
@@ -34,11 +51,21 @@
   the kind of state the `Engine` struct was set up to hold.
 
 ## TUI
-- [ ] **Basic readline editing** — `^A`/`^E` (line start/end), `^W` (delete word),
-  `^U`/`^K` (kill to start/end), `^B`/`^F` + arrows (move). Needs a cursor
-  *position* within the command line — today it's append-only. Full readline
-  (kill ring, incremental history search) later. Note: `^D` currently quits, so
-  it conflicts with readline's delete-forward / EOF-on-empty.
+- [x] **Basic readline editing** — a `LineEditor` (text + a caret byte-offset)
+  replaces the append-only buffer, shared by insert and quote modes via a
+  `handle_edit` helper. Bindings: `^A`/`^E`/Home/End (line start/end), `^B`/`^F` +
+  arrows (move char), `^W` (kill word back), `^U`/`^K` (kill to start/end),
+  Alt-`b`/`f` + `^`/Alt-arrows (move word), Delete (delete-forward). `^D` still
+  quits (kept as-is), so it is *not* wired to readline's delete-forward/EOF.
+  Full readline (kill ring, incremental history search) later.
+- [x] **Quote mode** — a third `Mode::Quote`, opened from insert on an empty
+  buffer with `'` (mid-entry `'` stays a literal char). Every key — operators and
+  space included — is typed verbatim with no auto-push and no mid-entry parsing;
+  Enter evaluates the whole line at once via `commit_input` and drops back to
+  insert (staying in quote if the line fails to parse). Esc bails to insert,
+  keeping the buffer. Prompt is `'`, beam cursor like insert. Still a natural
+  home for the structured literals below (complex `(re, im)`, matrix `[…]`) and
+  future HP48-style `'…'` symbolic/name entry.
 - [ ] **Command-line history** — recall previous committed entries (up/down),
   shell- / HP48-`LAST CMD`-style. Distinct from undo (that reverts *stack state*;
   this recalls *text you typed*). Pairs with readline: recall → edit → re-run.
@@ -50,6 +77,12 @@
 - [ ] **SIGWINCH / resize** — confirm terminal resize is handled. ratatui
   autoresizes on `draw`, but our inline viewport is recreated on stack-height
   changes only; a width/height change from the WM may need explicit handling.
+
+## Project / packaging
+- [ ] **README, license, publish to GitHub** — write a README (what it is, the
+  RPN/modal model, build via `nix develop` + `cargo run`, the instruction set),
+  pick a license (MIT or Apache-2.0, or dual like most Rust crates), and push to
+  a public GitHub repo.
 
 ## Deferred (from earlier)
 - [ ] Negative-literal entry — a change-sign key (leading `-` is subtraction).

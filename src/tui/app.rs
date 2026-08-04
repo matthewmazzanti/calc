@@ -15,6 +15,11 @@ pub(super) enum Mode {
     Normal,
     /// Edit the command line.
     Insert,
+    /// Literal command-line entry: every key (operators and space included) is
+    /// typed verbatim, with no auto-push and no mid-entry parsing. The whole
+    /// buffer is evaluated only on Enter. Entered from insert on an empty buffer
+    /// with `'`; exits back to insert once the buffer is accepted.
+    Quote,
 }
 
 /// A transient message for the info bar, cleared on the next keypress.
@@ -24,6 +29,121 @@ pub(super) enum Notice {
     Error(CalcError),
     /// A plain note, e.g. "nothing to undo".
     Note(String),
+}
+
+/// The command-line editor: the text buffer plus a caret within it. The caret
+/// is a byte offset into `text`, always kept on a char boundary (`text.len()`
+/// is end-of-line). This is what makes the readline-style moves and kills
+/// possible — before it, entry was append-only. Shared by insert and quote mode.
+#[derive(Default)]
+pub(super) struct LineEditor {
+    text: String,
+    caret: usize,
+}
+
+impl LineEditor {
+    pub(super) fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The caret as a column (char count from the start), for placing the
+    /// terminal cursor. Bytes would be wrong under multi-byte input.
+    pub(super) fn caret_col(&self) -> usize {
+        self.text[..self.caret].chars().count()
+    }
+
+    fn clear(&mut self) {
+        self.text.clear();
+        self.caret = 0;
+    }
+
+    /// Insert a char at the caret and step past it.
+    fn insert(&mut self, c: char) {
+        self.text.insert(self.caret, c);
+        self.caret += c.len_utf8();
+    }
+
+    /// Delete the char before the caret (Backspace / `^H`).
+    fn backspace(&mut self) {
+        if let Some(c) = self.text[..self.caret].chars().next_back() {
+            self.caret -= c.len_utf8();
+            self.text.remove(self.caret);
+        }
+    }
+
+    /// Delete the char under the caret (Delete).
+    fn delete(&mut self) {
+        if self.caret < self.text.len() {
+            self.text.remove(self.caret);
+        }
+    }
+
+    fn move_home(&mut self) {
+        self.caret = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.caret = self.text.len();
+    }
+
+    fn move_left(&mut self) {
+        if let Some(c) = self.text[..self.caret].chars().next_back() {
+            self.caret -= c.len_utf8();
+        }
+    }
+
+    fn move_right(&mut self) {
+        if let Some(c) = self.text[self.caret..].chars().next() {
+            self.caret += c.len_utf8();
+        }
+    }
+
+    fn move_word_left(&mut self) {
+        self.caret = self.prev_word();
+    }
+
+    fn move_word_right(&mut self) {
+        self.caret = self.next_word();
+    }
+
+    /// Kill from the caret back to the line start (`^U`).
+    fn kill_to_start(&mut self) {
+        self.text.replace_range(..self.caret, "");
+        self.caret = 0;
+    }
+
+    /// Kill from the caret to the line end (`^K`).
+    fn kill_to_end(&mut self) {
+        self.text.truncate(self.caret);
+    }
+
+    /// Kill the word before the caret (`^W`).
+    fn kill_word_left(&mut self) {
+        let start = self.prev_word();
+        self.text.replace_range(start..self.caret, "");
+        self.caret = start;
+    }
+
+    /// Byte offset of the start of the word at or before the caret: skip
+    /// whitespace left, then the run of non-whitespace. `trim_end_matches`
+    /// returns a prefix, so its length *is* the offset into `text`.
+    fn prev_word(&self) -> usize {
+        self.text[..self.caret]
+            .trim_end_matches(char::is_whitespace)
+            .trim_end_matches(|c: char| !c.is_whitespace())
+            .len()
+    }
+
+    /// Byte offset past the word at or after the caret: skip whitespace right,
+    /// then the run of non-whitespace. The consumed span is what the leading
+    /// trims removed from the tail.
+    fn next_word(&self) -> usize {
+        let tail = &self.text[self.caret..];
+        let rest = tail
+            .trim_start_matches(char::is_whitespace)
+            .trim_start_matches(|c: char| !c.is_whitespace());
+        self.caret + (tail.len() - rest.len())
+    }
 }
 
 /// A calculator state paired with the command that produced it. This is the
@@ -41,8 +161,8 @@ struct Snapshot {
 pub(super) struct App {
     history: History<Snapshot>,
     mode: Mode,
-    /// The command-line buffer, edited in insert mode.
-    input: String,
+    /// The command-line buffer and caret, edited in insert and quote modes.
+    input: LineEditor,
     /// Selected stack level in normal mode, 1-based from the top (level 1 is
     /// the top of stack). Kept clamped to the stack, or 1 when empty.
     cursor: usize,
@@ -59,7 +179,7 @@ impl App {
                 cmd: String::new(),
             }),
             mode: Mode::Insert,
-            input: String::new(),
+            input: LineEditor::default(),
             cursor: 1,
             notice: None,
             should_quit: false,
@@ -77,7 +197,12 @@ impl App {
     }
 
     pub(super) fn input(&self) -> &str {
-        &self.input
+        self.input.text()
+    }
+
+    /// The caret column within the command line, for the terminal cursor.
+    pub(super) fn caret_col(&self) -> usize {
+        self.input.caret_col()
     }
 
     pub(super) fn cursor(&self) -> usize {
@@ -124,6 +249,7 @@ impl App {
         match self.mode {
             Mode::Normal => self.handle_normal(key),
             Mode::Insert => self.handle_insert(key),
+            Mode::Quote => self.handle_quote(key),
         }
         self.clamp_cursor();
     }
@@ -166,6 +292,9 @@ impl App {
     }
 
     fn handle_insert(&mut self, key: KeyEvent) {
+        if self.handle_edit(key) {
+            return;
+        }
         match key.code {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
@@ -174,14 +303,11 @@ impl App {
             // ordinary character, so multi-token lines like `3 4 +` commit at
             // once). With an empty buffer it duplicates the top of stack.
             KeyCode::Enter => {
-                if self.input.trim().is_empty() {
+                if self.input.text().trim().is_empty() {
                     self.run(&[Command::Dup(1)]);
                 } else {
                     self.commit_input();
                 }
-            }
-            KeyCode::Backspace => {
-                self.input.pop();
             }
             // Operators auto-push: commit the pending number, then apply.
             KeyCode::Char('+') => self.apply_operator(Command::Add),
@@ -190,26 +316,80 @@ impl App {
             KeyCode::Char('-') => {
                 // A `-` right after an exponent marker is part of the number
                 // (e.g. `1e-3`), not the subtract operator.
-                if self.input.ends_with('e') || self.input.ends_with('E') {
-                    self.input.push('-');
+                let text = self.input.text();
+                if text.ends_with('e') || text.ends_with('E') {
+                    self.input.insert('-');
                 } else {
                     self.apply_operator(Command::Sub);
                 }
             }
-            KeyCode::Char(c) => self.input.push(c),
+            // A leading `'` opens quote mode for literal entry; mid-entry it is
+            // just an ordinary character.
+            KeyCode::Char('\'') if self.input.text().is_empty() => self.mode = Mode::Quote,
+            KeyCode::Char(c) => self.input.insert(c),
             _ => {}
         }
+    }
+
+    /// Literal entry: keys go straight into the buffer (operators and space
+    /// included), and the whole line is evaluated only on Enter — accepting it
+    /// drops back to insert. Esc bails out to insert, keeping the buffer.
+    fn handle_quote(&mut self, key: KeyEvent) {
+        if self.handle_edit(key) {
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::Insert,
+            KeyCode::Enter => {
+                if self.commit_input() {
+                    self.mode = Mode::Insert;
+                }
+            }
+            KeyCode::Char(c) => self.input.insert(c),
+            _ => {}
+        }
+    }
+
+    /// Readline-style command-line editing — caret moves and kills — shared by
+    /// insert and quote modes. Returns whether the key was consumed; if not, the
+    /// caller applies its own mode-specific handling (operators, Enter, Esc,
+    /// literal char entry). `^C`/`^D` are handled earlier (they quit), and
+    /// `^A`/`^E`/`^B`/`^F`/`^U`/`^K`/`^W` mirror the usual readline bindings.
+    fn handle_edit(&mut self, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Backspace => self.input.backspace(),
+            KeyCode::Delete => self.input.delete(),
+            KeyCode::Home => self.input.move_home(),
+            KeyCode::End => self.input.move_end(),
+            KeyCode::Left if ctrl || alt => self.input.move_word_left(),
+            KeyCode::Right if ctrl || alt => self.input.move_word_right(),
+            KeyCode::Left => self.input.move_left(),
+            KeyCode::Right => self.input.move_right(),
+            KeyCode::Char('a') if ctrl => self.input.move_home(),
+            KeyCode::Char('e') if ctrl => self.input.move_end(),
+            KeyCode::Char('b') if ctrl => self.input.move_left(),
+            KeyCode::Char('f') if ctrl => self.input.move_right(),
+            KeyCode::Char('b') if alt => self.input.move_word_left(),
+            KeyCode::Char('f') if alt => self.input.move_word_right(),
+            KeyCode::Char('u') if ctrl => self.input.kill_to_start(),
+            KeyCode::Char('k') if ctrl => self.input.kill_to_end(),
+            KeyCode::Char('w') if ctrl => self.input.kill_word_left(),
+            _ => return false,
+        }
+        true
     }
 
     /// Parse and run the command-line buffer. On success it clears; on error
     /// (parse or runtime) the buffer is kept so the user can fix it. Returns
     /// whether it succeeded.
     fn commit_input(&mut self) -> bool {
-        if self.input.trim().is_empty() {
+        if self.input.text().trim().is_empty() {
             self.input.clear();
             return true;
         }
-        let program = match engine::parse(&self.input) {
+        let program = match engine::parse(self.input.text()) {
             Ok(program) => program,
             Err(kind) => {
                 self.notice = Some(Notice::Note(format!("error: {kind}")));
@@ -229,7 +409,7 @@ impl App {
     /// (and `cmd`) shows the whole thing, e.g. `10 0 /`. On error the buffer is
     /// kept so the user can fix it.
     fn apply_operator(&mut self, op: Command) {
-        let mut program = match engine::parse(self.input.trim()) {
+        let mut program = match engine::parse(self.input.text().trim()) {
             Ok(program) => program,
             Err(kind) => {
                 self.notice = Some(Notice::Note(format!("error: {kind}")));
@@ -313,6 +493,23 @@ mod tests {
         press(app, KeyCode::Char(c));
     }
 
+    fn ctrl(app: &mut App, c: char) {
+        app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    }
+
+    fn alt(app: &mut App, c: char) {
+        app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT));
+    }
+
+    /// The command line rendered as `text|caret`, so a test asserts the buffer
+    /// and the caret position together.
+    fn line(app: &App) -> String {
+        let col = app.input.caret_col();
+        let text = app.input.text();
+        let at = text.char_indices().nth(col).map_or(text.len(), |(i, _)| i);
+        format!("{}|{}", &text[..at], &text[at..])
+    }
+
     /// Type a run of characters in the current mode.
     fn typ(app: &mut App, s: &str) {
         for c in s.chars() {
@@ -327,7 +524,7 @@ mod tests {
         typ(&mut app, "42");
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.stack(), &[42.0]);
-        assert_eq!(app.input, "");
+        assert_eq!(app.input.text(), "");
     }
 
     #[test]
@@ -338,7 +535,7 @@ mod tests {
         typ(&mut app, "4"); // pending entry, not yet pushed
         ch(&mut app, '+'); // commits 4, then adds
         assert_eq!(app.stack(), &[7.0]);
-        assert_eq!(app.input, "");
+        assert_eq!(app.input.text(), "");
     }
 
     #[test]
@@ -357,7 +554,7 @@ mod tests {
         typ(&mut app, "1e");
         ch(&mut app, '-'); // exponent sign, not subtraction
         typ(&mut app, "3");
-        assert_eq!(app.input, "1e-3");
+        assert_eq!(app.input.text(), "1e-3");
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.stack(), &[0.001]);
     }
@@ -366,7 +563,7 @@ mod tests {
     fn space_is_a_character_not_a_commit() {
         let mut app = App::new();
         typ(&mut app, "3 4"); // includes a space
-        assert_eq!(app.input, "3 4");
+        assert_eq!(app.input.text(), "3 4");
         assert!(app.stack().is_empty()); // space did not push
         press(&mut app, KeyCode::Enter); // now commit the whole line
         assert_eq!(app.stack(), &[3.0, 4.0]);
@@ -395,8 +592,59 @@ mod tests {
         typ(&mut app, "1..2"); // neither a number nor a command
         press(&mut app, KeyCode::Enter);
         assert!(app.stack().is_empty());
-        assert_eq!(app.input, "1..2");
+        assert_eq!(app.input.text(), "1..2");
         // A parse error is reported as a note (no engine/trace to show).
+        assert!(matches!(app.notice, Some(Notice::Note(_))));
+    }
+
+    #[test]
+    fn quote_opens_only_on_an_empty_buffer() {
+        let mut app = App::new();
+        ch(&mut app, '\''); // empty buffer -> opens quote
+        assert_eq!(app.mode, Mode::Quote);
+        assert_eq!(app.input.text(), ""); // the `'` itself is not typed
+    }
+
+    #[test]
+    fn quote_mid_entry_is_a_literal_character() {
+        let mut app = App::new();
+        typ(&mut app, "ab");
+        ch(&mut app, '\''); // non-empty buffer -> ordinary character
+        assert_eq!(app.mode, Mode::Insert);
+        assert_eq!(app.input.text(), "ab'");
+    }
+
+    #[test]
+    fn quote_types_operators_literally_and_evaluates_on_enter() {
+        let mut app = App::new();
+        ch(&mut app, '\''); // enter quote
+        typ(&mut app, "3 4 +"); // operator does not auto-push here
+        assert_eq!(app.input.text(), "3 4 +");
+        assert!(app.stack().is_empty());
+        press(&mut app, KeyCode::Enter); // accept the whole line at once
+        assert_eq!(app.stack(), &[7.0]);
+        assert_eq!(app.input.text(), "");
+        assert_eq!(app.mode, Mode::Insert); // quote exits after accept
+    }
+
+    #[test]
+    fn quote_esc_returns_to_insert_keeping_the_buffer() {
+        let mut app = App::new();
+        ch(&mut app, '\'');
+        typ(&mut app, "1 2");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Insert);
+        assert_eq!(app.input.text(), "1 2"); // buffer preserved for editing
+    }
+
+    #[test]
+    fn quote_stays_open_when_the_line_fails_to_parse() {
+        let mut app = App::new();
+        ch(&mut app, '\'');
+        typ(&mut app, "1..2"); // not a number or command
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Quote); // stay in quote to fix it
+        assert_eq!(app.input.text(), "1..2");
         assert!(matches!(app.notice, Some(Notice::Note(_))));
     }
 
@@ -574,5 +822,135 @@ mod tests {
         ch(&mut app, 'u'); // undo -> [1,2,3], whose origin was "3"
         assert_eq!(app.stack(), &[1.0, 2.0, 3.0]);
         assert_eq!(app.cmd(), "3");
+    }
+
+    // --- Readline-style command-line editing (insert/quote modes). ---
+
+    #[test]
+    fn typing_inserts_at_the_caret() {
+        let mut app = App::new();
+        typ(&mut app, "13");
+        press(&mut app, KeyCode::Left); // caret between 1 and 3
+        assert_eq!(line(&app), "1|3");
+        ch(&mut app, '2'); // inserts at the caret, not the end
+        assert_eq!(line(&app), "12|3");
+    }
+
+    #[test]
+    fn ctrl_a_and_ctrl_e_jump_to_the_ends() {
+        let mut app = App::new();
+        typ(&mut app, "123");
+        ctrl(&mut app, 'a');
+        assert_eq!(line(&app), "|123");
+        ctrl(&mut app, 'e');
+        assert_eq!(line(&app), "123|");
+    }
+
+    #[test]
+    fn ctrl_b_and_ctrl_f_move_by_char() {
+        let mut app = App::new();
+        typ(&mut app, "12");
+        ctrl(&mut app, 'b');
+        assert_eq!(line(&app), "1|2");
+        ctrl(&mut app, 'f');
+        assert_eq!(line(&app), "12|");
+        ctrl(&mut app, 'f'); // clamped at the end
+        assert_eq!(line(&app), "12|");
+    }
+
+    #[test]
+    fn backspace_deletes_before_the_caret() {
+        let mut app = App::new();
+        typ(&mut app, "123");
+        press(&mut app, KeyCode::Left); // "12|3"
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(line(&app), "1|3");
+    }
+
+    #[test]
+    fn delete_removes_under_the_caret() {
+        let mut app = App::new();
+        typ(&mut app, "123");
+        ctrl(&mut app, 'a'); // "|123"
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(line(&app), "|23");
+        ctrl(&mut app, 'e'); // "23|"
+        press(&mut app, KeyCode::Delete); // nothing under the caret
+        assert_eq!(line(&app), "23|");
+    }
+
+    #[test]
+    fn ctrl_u_kills_to_the_line_start() {
+        let mut app = App::new();
+        typ(&mut app, "12 34");
+        press(&mut app, KeyCode::Left); // "12 3|4"
+        ctrl(&mut app, 'u');
+        assert_eq!(line(&app), "|4");
+    }
+
+    #[test]
+    fn ctrl_k_kills_to_the_line_end() {
+        let mut app = App::new();
+        typ(&mut app, "12 34");
+        ctrl(&mut app, 'a');
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right); // "12| 34"
+        ctrl(&mut app, 'k');
+        assert_eq!(line(&app), "12|");
+    }
+
+    #[test]
+    fn ctrl_w_kills_the_word_before_the_caret() {
+        let mut app = App::new();
+        typ(&mut app, "12 34 56");
+        ctrl(&mut app, 'w'); // kills "56"
+        assert_eq!(line(&app), "12 34 |");
+        ctrl(&mut app, 'w'); // kills "34 "
+        assert_eq!(line(&app), "12 |");
+    }
+
+    #[test]
+    fn alt_b_and_alt_f_move_by_word() {
+        let mut app = App::new();
+        typ(&mut app, "12 34 56");
+        alt(&mut app, 'b'); // to the start of "56"
+        assert_eq!(line(&app), "12 34 |56");
+        alt(&mut app, 'b'); // to the start of "34"
+        assert_eq!(line(&app), "12 |34 56");
+        alt(&mut app, 'f'); // past "34"
+        assert_eq!(line(&app), "12 34| 56");
+    }
+
+    #[test]
+    fn word_moves_land_on_boundaries_across_runs_of_spaces() {
+        let mut app = App::new();
+        typ(&mut app, "1   2");
+        ctrl(&mut app, 'a');
+        alt(&mut app, 'f'); // past "1", skipping the run of spaces stays put
+        assert_eq!(line(&app), "1|   2");
+        alt(&mut app, 'f'); // skip the spaces, past "2"
+        assert_eq!(line(&app), "1   2|");
+    }
+
+    #[test]
+    fn editing_binds_work_in_quote_mode_too() {
+        let mut app = App::new();
+        ch(&mut app, '\''); // enter quote
+        typ(&mut app, "3 4 +");
+        ctrl(&mut app, 'a');
+        assert_eq!(line(&app), "|3 4 +");
+        ctrl(&mut app, 'k'); // kill the whole line
+        assert_eq!(line(&app), "|");
+        assert_eq!(app.mode, Mode::Quote); // still in quote
+    }
+
+    #[test]
+    fn commit_resets_the_caret() {
+        let mut app = App::new();
+        typ(&mut app, "12");
+        ctrl(&mut app, 'a'); // caret at the start
+        press(&mut app, KeyCode::Enter); // commits the whole line regardless
+        assert_eq!(app.stack(), &[12.0]);
+        assert_eq!(line(&app), "|"); // buffer and caret cleared
     }
 }
