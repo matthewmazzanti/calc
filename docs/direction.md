@@ -44,7 +44,7 @@ machinery, then behavior:
 | **M1** | Round out the stack vocabulary (§9.1); `as_index` for level-from-stack | **done** |
 | **M2** | Lists: `[ ]` **mark discipline** — first consumer of marks | **done** |
 | **M3a** | Immutable values via `Rc` + copy-on-write | **done** |
-| **M3b** | A flat environment: `'x` quoted names, `set`/`get` | **done** |
+| **M3b** | A flat environment: `'x` names, `set`/`get`, bare-word lookup, builtins as a prelude | **done** |
 | **M3c** | Functions, frame chain, closures, `call`, `&`, bare-word application | after M3b |
 | **M4+** | Vocabulary: combinators, `if`/`each`/`map`, unquote — mostly in-language | todo |
 
@@ -74,8 +74,13 @@ namespace**, which does grow — `set` adds bindings and closures observe them
 frame ever becomes a first-class value (§9.5 objects), decide whether it's the
 mutable exception or also persistent.
 
-Deferred within M3: bare-word application (a bare `foo` *applying* its binding
-needs `parse` to resolve unknown words at runtime — M3c) and a persistent-map
-(HAMT) environment for cheap snapshots (§8). `Rc` refcounts leak cycles, which
-closures-over-frames can form — the GC problem §10 already earmarks, separate
-from value COW.
+Bare-word resolution landed in M3b: every non-number, non-`'name` token parses
+to a `Command::Word`, resolved at runtime — a user binding (which shadows),
+else a builtin from the prelude (`Command::builtin`), else `UnboundName`. So
+`parse` no longer fails on unknown words (a typo is a runtime unbound name),
+and the builtin vocabulary is one definition reached uniformly through lookup.
+For a value binding, "applying" the word is a push; **function** bindings that
+*run* on lookup wait for M3c. Still deferred: the frame chain / closures, `&`,
+and a persistent-map (HAMT) environment for cheap snapshots (§8). `Rc`
+refcounts leak cycles, which closures-over-frames can form — the GC problem
+§10 already earmarks, separate from value COW.

@@ -625,12 +625,13 @@ mod tests {
     #[test]
     fn a_failed_entry_keeps_the_buffer_for_editing() {
         let mut app = App::new();
-        typ(&mut app, "1..2"); // neither a number nor a command
+        typ(&mut app, "1..2"); // neither a number nor a bound word
         press(&mut app, KeyCode::Enter);
         assert!(app.stack().is_empty());
         assert_eq!(app.input.text(), "1..2");
-        // A parse error is reported as a note (no engine/trace to show).
-        assert!(matches!(app.notice, Some(Notice::Note(_))));
+        // Now a runtime error (the word `1..2` is unbound), reported as such;
+        // the buffer is kept so it can be fixed.
+        assert!(matches!(app.notice, Some(Notice::Error(_))));
     }
 
     #[test]
@@ -674,14 +675,14 @@ mod tests {
     }
 
     #[test]
-    fn quote_stays_open_when_the_line_fails_to_parse() {
+    fn quote_stays_open_when_the_line_fails() {
         let mut app = App::new();
         ch(&mut app, '\'');
-        typ(&mut app, "1..2"); // not a number or command
+        typ(&mut app, "1..2"); // not a number or a bound word
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.mode, Mode::Quote); // stay in quote to fix it
         assert_eq!(app.input.text(), "1..2");
-        assert!(matches!(app.notice, Some(Notice::Note(_))));
+        assert!(matches!(app.notice, Some(Notice::Error(_))));
     }
 
     fn stacked(values: &str) -> App {

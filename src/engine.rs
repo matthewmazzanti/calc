@@ -225,8 +225,6 @@ pub enum ErrorKind {
     StackUnderflow,
     /// Division with a zero divisor.
     DivideByZero,
-    /// A token that was neither a number nor a known command.
-    UnknownCommand(String),
     /// A `"` string literal ran to end-of-input without a closing `"`.
     UnterminatedString,
     /// A `]` with no open collection to close (or, later, one whose open mark is
@@ -250,7 +248,6 @@ impl std::fmt::Display for ErrorKind {
         match self {
             ErrorKind::StackUnderflow => write!(f, "too few arguments"),
             ErrorKind::DivideByZero => write!(f, "divide by zero"),
-            ErrorKind::UnknownCommand(c) => write!(f, "unknown command: {c}"),
             ErrorKind::UnterminatedString => write!(f, "unterminated string"),
             ErrorKind::UnmatchedClose => write!(f, "unmatched ]"),
             ErrorKind::IndexOutOfRange => write!(f, "index out of range"),
@@ -268,6 +265,9 @@ impl std::fmt::Display for ErrorKind {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Push(Value),
+    /// A bare word, resolved against the environment at runtime: a user binding
+    /// (which shadows), else a builtin from the prelude, else `UnboundName`.
+    Word(Rc<str>),
     Add,
     Sub,
     Mul,
@@ -339,25 +339,33 @@ pub enum Command {
 }
 
 impl Command {
-    /// Parse one whitespace-delimited token into a `Command`.
-    ///
-    /// A token that parses as a number becomes `Push`; otherwise it must be a
-    /// known command word. This is the only place text becomes a `Command`.
-    pub fn parse(token: &str) -> Result<Command, ErrorKind> {
+    /// Parse one whitespace-delimited token into a `Command`. A number or a
+    /// `'x` name becomes a `Push`; every other token is a [`Command::Word`],
+    /// resolved against the environment at runtime. So parsing never fails on an
+    /// unknown word — that's a runtime `UnboundName` — and this never errors.
+    pub fn parse(token: &str) -> Command {
         // The `'` sigil: `'x` pushes the name `x` (§3). Owned here rather than
         // as a builtin word so it can't be shadowed.
         if let Some(name) = token.strip_prefix('\'') {
-            return Ok(Command::Push(Value::Name(Rc::from(name))));
+            return Command::Push(Value::Name(Rc::from(name)));
         }
         // Integer first, then float: `3` is an `Int`, but `3.0`/`2e3`/`1e-2`
         // (anything with a `.`, exponent, or out of i64 range) is a `Num`.
         if let Ok(i) = token.parse::<i64>() {
-            return Ok(Command::Push(Value::Int(i)));
+            return Command::Push(Value::Int(i));
         }
         if let Ok(n) = token.parse::<f64>() {
-            return Ok(Command::Push(Value::Num(n)));
+            return Command::Push(Value::Num(n));
         }
-        Ok(match token {
+        Command::Word(Rc::from(token))
+    }
+
+    /// The core-op prelude: the fixed words of the global scope. Resolving a
+    /// bare word falls here when it isn't a user binding, yielding the op the
+    /// word names. This is where the builtin vocabulary lives — one definition,
+    /// reached uniformly through word lookup.
+    fn builtin(name: &str) -> Option<Command> {
+        Some(match name {
             "true" => Command::Push(Value::Bool(true)),
             "false" => Command::Push(Value::Bool(false)),
             "+" => Command::Add,
@@ -404,7 +412,7 @@ impl Command {
             "set" => Command::Set,
             "get" => Command::Get,
             "clear" => Command::Clear,
-            other => return Err(ErrorKind::UnknownCommand(other.to_string())),
+            _ => return None,
         })
     }
 }
@@ -414,6 +422,7 @@ impl std::fmt::Display for Command {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Command::Push(n) => write!(f, "{n}"),
+            Command::Word(name) => write!(f, "{name}"),
             Command::Add => write!(f, "+"),
             Command::Sub => write!(f, "-"),
             Command::Mul => write!(f, "*"),
@@ -486,7 +495,7 @@ pub fn parse(input: &str) -> Result<Vec<Command>, ErrorKind> {
                 word.push(c);
                 chars.next();
             }
-            commands.push(Command::parse(&word)?);
+            commands.push(Command::parse(&word));
         }
     }
     Ok(commands)
@@ -629,6 +638,7 @@ impl Engine {
                 self.stack.push(value.clone());
                 Ok(())
             }
+            Command::Word(name) => self.resolve_word(name),
             // `+` concatenates two strings, else adds numbers.
             Command::Add => self.add(),
             Command::Sub => self.arith(i64::checked_sub, |a, b| a - b),
@@ -1071,6 +1081,21 @@ impl Engine {
         Ok(())
     }
 
+    /// Resolve a bare word: a user binding (which shadows) pushes its value;
+    /// otherwise a builtin from the prelude is applied; otherwise `UnboundName`.
+    /// For a plain value this "application" is just a push — a value is a
+    /// nullary function (§1); once functions land, a function binding runs.
+    fn resolve_word(&mut self, name: &Rc<str>) -> Result<(), ErrorKind> {
+        if let Some(value) = self.env.get(name).cloned() {
+            self.stack.push(value);
+            Ok(())
+        } else if let Some(command) = Command::builtin(name) {
+            self.apply_one(&command)
+        } else {
+            Err(ErrorKind::UnboundName(name.to_string()))
+        }
+    }
+
     /// `set` ( value name -- ): bind `name` to `value` in the environment,
     /// shadowing any prior binding. The name is on top (`3 'x set`).
     fn set(&mut self) -> Result<(), ErrorKind> {
@@ -1210,7 +1235,7 @@ mod tests {
             }
         );
         let trace = err.trace.unwrap();
-        assert_eq!(trace.program[trace.index], Command::Add);
+        assert_eq!(trace.program[trace.index], Command::Word(Rc::from("+")));
     }
 
     #[test]
@@ -1374,7 +1399,7 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::DivideByZero);
         let trace = err.trace.unwrap();
         assert_eq!(trace.index, 2);
-        assert_eq!(trace.program[trace.index], Command::Div);
+        assert_eq!(trace.program[trace.index], Command::Word(Rc::from("/")));
     }
 
     #[test]
@@ -1401,8 +1426,8 @@ mod tests {
             vec![
                 Command::Push(Value::Int(1)),
                 Command::Push(Value::Int(2)),
-                Command::Add,
-                Command::Div
+                Command::Word(Rc::from("+")),
+                Command::Word(Rc::from("/")),
             ]
         );
         // The message shows the whole batch with the failing command bracketed.
@@ -1410,13 +1435,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_fails_on_the_bad_token() {
-        // Parsing is separate from running: a bad token is an `ErrorKind`, with
-        // no engine or trace (nothing ran).
+    fn an_unknown_word_is_a_runtime_unbound_error() {
+        // Parsing no longer fails on an unknown word — it becomes a `Word`; the
+        // failure surfaces at runtime when it can't be resolved.
         assert_eq!(
             parse("1 2 + oops"),
-            Err(ErrorKind::UnknownCommand("oops".to_string()))
+            Ok(vec![
+                Command::Push(Value::Int(1)),
+                Command::Push(Value::Int(2)),
+                Command::Word(Rc::from("+")),
+                Command::Word(Rc::from("oops")),
+            ])
         );
+        assert_eq!(run_err("oops"), ErrorKind::UnboundName("oops".to_string()));
     }
 
     #[test]
@@ -1426,7 +1457,7 @@ mod tests {
             Ok(vec![
                 Command::Push(Value::Int(1)),
                 Command::Push(Value::Int(2)),
-                Command::Add
+                Command::Word(Rc::from("+")),
             ])
         );
     }
@@ -1455,13 +1486,12 @@ mod tests {
 
     #[test]
     fn parse_maps_tokens_to_commands() {
-        assert_eq!(Command::parse("3.5"), Ok(Command::Push(Value::Num(3.5))));
-        assert_eq!(Command::parse("+"), Ok(Command::Add));
-        assert_eq!(Command::parse("dup"), Ok(Command::Dup));
-        assert_eq!(
-            Command::parse("nope"),
-            Err(ErrorKind::UnknownCommand("nope".to_string()))
-        );
+        // Numbers and `'x` names become `Push`; every other token is a `Word`,
+        // resolved at runtime (so `+`/`dup` and an unknown `nope` are alike).
+        assert_eq!(Command::parse("3.5"), Command::Push(Value::Num(3.5)));
+        assert_eq!(Command::parse("+"), Command::Word(Rc::from("+")));
+        assert_eq!(Command::parse("dup"), Command::Word(Rc::from("dup")));
+        assert_eq!(Command::parse("nope"), Command::Word(Rc::from("nope")));
     }
 
     #[test]
@@ -1872,5 +1902,28 @@ mod tests {
                 list(&[Value::Int(1), Value::Int(2), Value::Int(3)]),
             ]
         );
+    }
+
+    // --- bare-word lookup ---
+
+    #[test]
+    fn a_bare_word_pushes_its_binding() {
+        assert_eq!(run("3 'x set x").stack(), &[Value::Int(3)]);
+        // A bare word and `get` retrieve the same value.
+        assert_eq!(run("3 'x set x").stack(), run("3 'x set 'x get").stack());
+    }
+
+    #[test]
+    fn a_user_binding_shadows_a_builtin() {
+        // Rebinding `dup` makes the bare word push the binding, not duplicate —
+        // user bindings sit "before" the builtin prelude in resolution.
+        assert_eq!(run("5 'dup set 1 2 dup").stack(), &[1.0, 2.0, 5.0]);
+    }
+
+    #[test]
+    fn builtins_are_reached_by_the_same_lookup() {
+        // `+` is just a word resolved to its prelude op — no special parse case.
+        assert_eq!(Command::builtin("+"), Some(Command::Add));
+        assert_eq!(Command::builtin("nope"), None);
     }
 }
