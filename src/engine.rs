@@ -13,6 +13,8 @@
 //! module) — a failed batch's damage is confined to a discarded clone, and the
 //! caller's own engine is untouched. This is the standard transactional model.
 
+use std::rc::Rc;
+
 /// The kind of an open collection, carried by its [`Value::Mark`]. Only lists
 /// for now; `{` will add a function mark (carrying the captured environment) in
 /// the next milestone. Typed so a `]` closing a `{` can be caught as a mismatch.
@@ -35,13 +37,14 @@ pub enum Value {
     /// A boolean — a genuine type, not Forth's 0/-1. Produced by comparisons
     /// and the boolean words, and (later) consumed by `if`.
     Bool(bool),
-    /// A string. Owns its bytes, so `Value` is no longer `Copy` — the stack ops
-    /// clone or move rather than copy. Built by the tokenizer's `"…"` literals
-    /// and by `to_str`; concatenated with `+`.
-    Str(String),
-    /// A list — a growable, heterogeneous, ordinary sequence. Built by the
-    /// `[ … ]` words via the mark discipline, never a `Push` literal.
-    List(Vec<Value>),
+    /// A string. Heap-shared via `Rc`, so a clone (a `dup`, a lookup) is a
+    /// refcount bump; concatenation copies-on-write via `Rc::make_mut`. Built by
+    /// the tokenizer's `"…"` literals and by `to_str`; concatenated with `+`.
+    Str(Rc<String>),
+    /// A list — a growable, heterogeneous sequence, `Rc`-shared like `Str`.
+    /// Built by the `[ … ]` words via the mark discipline, never a `Push`
+    /// literal; the list ops copy-on-write.
+    List(Rc<Vec<Value>>),
     /// A collection mark: a typed stack sentinel, *not* a first-class value.
     /// `[` pushes one and `]` collects the values above it into a [`Value::List`].
     /// The value words reject it with a type error (so `[ 1 +` is a type error),
@@ -117,7 +120,7 @@ impl Value {
     /// form, so `3 to_str` is `"3"` and `true to_str` is `"true"`.
     fn content_string(&self) -> String {
         match self {
-            Value::Str(s) => s.clone(),
+            Value::Str(s) => s.as_ref().clone(),
             other => other.to_string(),
         }
     }
@@ -137,7 +140,7 @@ impl std::fmt::Display for Value {
             // matching how a list is typed. Empty renders `[ ]`.
             Value::List(items) => {
                 write!(f, "[")?;
-                for item in items {
+                for item in items.iter() {
                     write!(f, " {item}")?;
                 }
                 write!(f, " ]")
@@ -163,13 +166,13 @@ impl From<f64> for Value {
 
 impl From<String> for Value {
     fn from(s: String) -> Self {
-        Value::Str(s)
+        Value::Str(Rc::new(s))
     }
 }
 
 impl From<&str> for Value {
     fn from(s: &str) -> Self {
-        Value::Str(s.to_string())
+        Value::Str(Rc::new(s.to_string()))
     }
 }
 
@@ -446,7 +449,7 @@ pub fn parse(input: &str) -> Result<Vec<Command>, ErrorKind> {
         if c.is_whitespace() {
             chars.next();
         } else if c == '"' {
-            commands.push(Command::Push(Value::Str(read_string(&mut chars)?)));
+            commands.push(Command::Push(Value::Str(Rc::new(read_string(&mut chars)?))));
         } else {
             // A plain word: everything up to the next whitespace.
             let mut word = String::new();
@@ -675,8 +678,9 @@ impl Engine {
         self.pop()?.as_bool()
     }
 
-    /// Pop a list's elements, or underflow / type error.
-    fn pop_list(&mut self) -> Result<Vec<Value>, ErrorKind> {
+    /// Pop a list (the shared `Rc` handle), or underflow / type error. Callers
+    /// that mutate use `Rc::make_mut` for copy-on-write.
+    fn pop_list(&mut self) -> Result<Rc<Vec<Value>>, ErrorKind> {
         match self.pop()? {
             Value::List(items) => Ok(items),
             other => Err(ErrorKind::TypeError {
@@ -806,7 +810,7 @@ impl Engine {
         let a = self.pop()?;
         let v = match (a, b) {
             (Value::Str(mut a), Value::Str(b)) => {
-                a.push_str(&b);
+                Rc::make_mut(&mut a).push_str(&b);
                 Value::Str(a)
             }
             (a, b) => Self::arith_values(a, b, i64::checked_add, |a, b| a + b)?,
@@ -836,7 +840,7 @@ impl Engine {
     /// to avoid the `to_*`-should-borrow lint.)
     fn stringify(&mut self) -> Result<(), ErrorKind> {
         let s = self.pop()?.content_string();
-        self.stack.push(Value::Str(s));
+        self.stack.push(Value::Str(Rc::new(s)));
         Ok(())
     }
 
@@ -951,7 +955,7 @@ impl Engine {
             .ok_or(ErrorKind::UnmatchedClose)?;
         let items: Vec<Value> = self.stack.drain(mark + 1..).collect();
         self.stack.pop(); // the mark, now on top
-        self.stack.push(Value::List(items));
+        self.stack.push(Value::List(Rc::new(items)));
         Ok(())
     }
 
@@ -959,8 +963,8 @@ impl Engine {
     fn first(&mut self) -> Result<(), ErrorKind> {
         let head = self
             .pop_list()?
-            .into_iter()
-            .next()
+            .first()
+            .cloned()
             .ok_or(ErrorKind::IndexOutOfRange)?;
         self.stack.push(head);
         Ok(())
@@ -973,7 +977,7 @@ impl Engine {
         if items.is_empty() {
             return Err(ErrorKind::IndexOutOfRange);
         }
-        items.remove(0);
+        Rc::make_mut(&mut items).remove(0);
         self.stack.push(Value::List(items));
         Ok(())
     }
@@ -982,7 +986,7 @@ impl Engine {
     fn cons(&mut self) -> Result<(), ErrorKind> {
         let mut items = self.pop_list()?;
         let x = self.pop()?;
-        items.insert(0, x);
+        Rc::make_mut(&mut items).insert(0, x);
         self.stack.push(Value::List(items));
         Ok(())
     }
@@ -991,7 +995,7 @@ impl Engine {
     fn append(&mut self) -> Result<(), ErrorKind> {
         let b = self.pop_list()?;
         let mut a = self.pop_list()?;
-        a.extend(b);
+        Rc::make_mut(&mut a).extend(b.iter().cloned());
         self.stack.push(Value::List(a));
         Ok(())
     }
@@ -1017,8 +1021,8 @@ impl Engine {
         };
         let item = self
             .pop_list()?
-            .into_iter()
-            .nth(idx)
+            .get(idx)
+            .cloned()
             .ok_or(ErrorKind::IndexOutOfRange)?;
         self.stack.push(item);
         Ok(())
@@ -1480,7 +1484,7 @@ mod tests {
 
     /// Shorthand for a list value from a slice of values.
     fn list(items: &[Value]) -> Value {
-        Value::List(items.to_vec())
+        Value::List(Rc::new(items.to_vec()))
     }
 
     #[test]
@@ -1692,6 +1696,36 @@ mod tests {
         assert_eq!(
             run("[ 1 ] [ 2 3 ] append 1 nth").stack(),
             &[Value::Int(2)]
+        );
+    }
+
+    #[test]
+    fn mutating_a_shared_value_copies_on_write() {
+        // `dup` shares the underlying `Rc`; a mutating op (`make_mut`) must copy
+        // so the other holder is untouched — the immutability guarantee.
+        let one_two_three =
+            list(&[Value::Int(1), Value::Int(2), Value::Int(3)]);
+
+        // List `rest` on the shared top leaves the bottom copy intact.
+        assert_eq!(
+            run("[ 1 2 3 ] dup rest").stack(),
+            &[
+                one_two_three.clone(),
+                list(&[Value::Int(2), Value::Int(3)])
+            ]
+        );
+        // List `append` onto the shared top.
+        assert_eq!(
+            run("[ 1 2 3 ] dup [ 4 ] append").stack(),
+            &[
+                one_two_three,
+                list(&[Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)])
+            ]
+        );
+        // String concat onto the shared top.
+        assert_eq!(
+            run(r#""ab" dup "c" +"#).stack(),
+            &[Value::from("ab"), Value::from("abc")]
         );
     }
 }

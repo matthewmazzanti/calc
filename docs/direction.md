@@ -43,9 +43,39 @@ machinery, then behavior:
 | **M0** | Value enum + scalar atoms: `Bool`, `Int`/`Num`, `Str`; their ops | **done** |
 | **M1** | Round out the stack vocabulary (§9.1); `as_index` for level-from-stack | **done** |
 | **M2** | Lists: `[ ]` **mark discipline** — first consumer of marks | **done** |
-| **M3** | Functions, environments, frames, sigils, `call`, `set` | next |
+| **M3a** | Immutable values via `Rc` + copy-on-write | next |
+| **M3b** | A flat environment: `'x` quoted names, `set`/`get` | after M3a |
+| **M3c** | Functions, frame chain, closures, `call`, `&`, bare-word application | after M3b |
 | **M4+** | Vocabulary: combinators, `if`/`each`/`map`, unquote — mostly in-language | todo |
 
 Ints landed early (numeric-tower-lite: int/float literals, promotion,
 float division, overflow-promotes-to-float) rather than being deferred;
 unbounded/bignum ints are a later item in `todo.md`.
+
+## Immutability & sharing
+
+**Values are immutable.** No operation mutates a value another holder can see;
+"modifying" a list/string produces a new value. This is what makes the shared
+environment and (later) closures safe: aliasing is only dangerous with mutation.
+
+Implemented as **`Rc` + copy-on-write**. The heap variants (`Str`, `List`,
+later function bodies) are `Rc<…>`, so `dup`/lookup/`set` share by bumping a
+refcount (O(1), no deep copy); the mutating ops (`cons`/`rest`/`append`, string
+concat) use `Rc::make_mut`, which mutates in place iff the refcount is 1 and
+clones first otherwise. So a copy happens exactly when a shared value is
+mutated — which is when a copy is semantically required.
+
+`set` is the inflection point: it's the first construct that parks a value in a
+longer-lived scope, so the alias outlives the expression and the old
+"pop ⇒ sole ownership" shortcut no longer holds. Hence M3a (Rc) lands before
+M3b (env). Distinguish **values** (immutable) from the **environment's
+namespace**, which does grow — `set` adds bindings and closures observe them
+(late binding). That's namespace evolution, not value mutation. Open: if a
+frame ever becomes a first-class value (§9.5 objects), decide whether it's the
+mutable exception or also persistent.
+
+Deferred within M3: bare-word application (a bare `foo` *applying* its binding
+needs `parse` to resolve unknown words at runtime — M3c) and a persistent-map
+(HAMT) environment for cheap snapshots (§8). `Rc` refcounts leak cycles, which
+closures-over-frames can form — the GC problem §10 already earmarks, separate
+from value COW.
