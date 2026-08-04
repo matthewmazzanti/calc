@@ -11,9 +11,107 @@
 //! so callers can inspect it. The caller keeps its own copy for undo (see the
 //! `history` module) and commits the returned engine only on `Ok`.
 
-/// The value type held on the stack. Aliased so it can grow later (complex,
-/// rationals, …) without touching every call site.
-pub type Value = f64;
+/// A value on the stack. Started as a bare `f64`; now a small sum type so the
+/// stack can hold more than numbers. Grows further later (strings, lists,
+/// functions). Kept `Copy` while every variant is — strings will end that.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Value {
+    /// An integer. Preserved through `+ - *` and `neg` when both operands are
+    /// integers; any float operand (or overflow) promotes to [`Value::Num`].
+    Int(i64),
+    /// A float. `/` always yields one, and mixed int/float arithmetic promotes
+    /// to it. A real numeric tower (rationals, complex) comes later.
+    Num(f64),
+    /// A boolean — a genuine type, not Forth's 0/-1. Produced by comparisons
+    /// and the boolean words, and (later) consumed by `if`.
+    Bool(bool),
+}
+
+impl Value {
+    /// The type's name, for error messages ("expected number, found bool").
+    /// `Int` and `Num` are both "number" — the split is invisible to the type
+    /// errors, since the arithmetic words accept either.
+    fn type_name(&self) -> &'static str {
+        match self {
+            Value::Int(_) | Value::Num(_) => "number",
+            Value::Bool(_) => "bool",
+        }
+    }
+
+    /// Widen to `f64`, or a [`ErrorKind::TypeError`] naming what was found.
+    /// Comparisons, division, and mixed arithmetic funnel operands through this,
+    /// so an `Int` is accepted wherever a number is wanted.
+    fn as_num(self) -> Result<f64, ErrorKind> {
+        match self {
+            Value::Int(i) => Ok(i as f64),
+            Value::Num(n) => Ok(n),
+            other => Err(ErrorKind::TypeError {
+                expected: "number",
+                found: other.type_name(),
+            }),
+        }
+    }
+
+    /// Extract a boolean, or a [`ErrorKind::TypeError`]. The boolean words
+    /// (`not`/`and`/`or`) funnel their operands through this.
+    fn as_bool(self) -> Result<bool, ErrorKind> {
+        match self {
+            Value::Bool(b) => Ok(b),
+            other => Err(ErrorKind::TypeError {
+                expected: "bool",
+                found: other.type_name(),
+            }),
+        }
+    }
+}
+
+impl std::fmt::Display for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::Int(i) => write!(f, "{i}"),
+            Value::Num(n) => write!(f, "{n}"),
+            Value::Bool(b) => write!(f, "{b}"),
+        }
+    }
+}
+
+impl From<i64> for Value {
+    fn from(i: i64) -> Self {
+        Value::Int(i)
+    }
+}
+
+impl From<f64> for Value {
+    fn from(n: f64) -> Self {
+        Value::Num(n)
+    }
+}
+
+impl From<bool> for Value {
+    fn from(b: bool) -> Self {
+        Value::Bool(b)
+    }
+}
+
+/// Ergonomic equality against a bare number, so callers and tests can write
+/// `stack == &[1.0, 2.0]` without wrapping every literal. Matches by numeric
+/// value, so an `Int(2)` equals `2.0`; a `Bool` never does.
+impl PartialEq<f64> for Value {
+    fn eq(&self, other: &f64) -> bool {
+        match self {
+            Value::Int(i) => (*i as f64) == *other,
+            Value::Num(n) => n == other,
+            Value::Bool(_) => false,
+        }
+    }
+}
+
+/// Likewise against a bare bool: `stack == &[true]`.
+impl PartialEq<bool> for Value {
+    fn eq(&self, other: &bool) -> bool {
+        matches!(self, Value::Bool(b) if b == other)
+    }
+}
 
 /// The stack of values, bottom-to-top: the top of stack is the last element.
 /// Internal — the public handle is [`Engine`].
@@ -30,6 +128,13 @@ pub enum ErrorKind {
     DivideByZero,
     /// A token that was neither a number nor a known command.
     UnknownCommand(String),
+    /// An operation got a value of the wrong type — e.g. `+` on a bool. The
+    /// failing word is named by the surrounding [`Trace`], so this only records
+    /// the type mismatch itself.
+    TypeError {
+        expected: &'static str,
+        found: &'static str,
+    },
 }
 
 impl std::fmt::Display for ErrorKind {
@@ -38,6 +143,9 @@ impl std::fmt::Display for ErrorKind {
             ErrorKind::StackUnderflow => write!(f, "too few arguments"),
             ErrorKind::DivideByZero => write!(f, "divide by zero"),
             ErrorKind::UnknownCommand(c) => write!(f, "unknown command: {c}"),
+            ErrorKind::TypeError { expected, found } => {
+                write!(f, "expected {expected}, found {found}")
+            }
         }
     }
 }
@@ -53,6 +161,18 @@ pub enum Command {
     Mul,
     Div,
     Neg,
+    /// Equality — pops two values, pushes a `Bool`. Works across types (a
+    /// number never equals a bool); inequality is `=` then `not`.
+    Eq,
+    /// Ordering comparisons — pop two numbers, push a `Bool`.
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    /// Boolean words — operate on `Bool`s only (no truthiness rule).
+    Not,
+    And,
+    Or,
     /// Push a copy of the value at the given 1-based level (level 1 == top of
     /// stack) onto the top.
     Dup(usize),
@@ -73,15 +193,30 @@ impl Command {
     /// A token that parses as a number becomes `Push`; otherwise it must be a
     /// known command word. This is the only place text becomes a `Command`.
     pub fn parse(token: &str) -> Result<Command, ErrorKind> {
-        if let Ok(n) = token.parse::<Value>() {
-            return Ok(Command::Push(n));
+        // Integer first, then float: `3` is an `Int`, but `3.0`/`2e3`/`1e-2`
+        // (anything with a `.`, exponent, or out of i64 range) is a `Num`.
+        if let Ok(i) = token.parse::<i64>() {
+            return Ok(Command::Push(Value::Int(i)));
+        }
+        if let Ok(n) = token.parse::<f64>() {
+            return Ok(Command::Push(Value::Num(n)));
         }
         Ok(match token {
+            "true" => Command::Push(Value::Bool(true)),
+            "false" => Command::Push(Value::Bool(false)),
             "+" => Command::Add,
             "-" => Command::Sub,
             "*" => Command::Mul,
             "/" => Command::Div,
             "neg" => Command::Neg,
+            "=" => Command::Eq,
+            "<" => Command::Lt,
+            ">" => Command::Gt,
+            "<=" => Command::Le,
+            ">=" => Command::Ge,
+            "not" => Command::Not,
+            "and" => Command::And,
+            "or" => Command::Or,
             "dup" => Command::Dup(1),
             // The text commands are the fixed-level cases of the parameterized
             // stack ops: drop the top, swap the top two, roll the top three.
@@ -105,6 +240,14 @@ impl std::fmt::Display for Command {
             Command::Mul => write!(f, "*"),
             Command::Div => write!(f, "/"),
             Command::Neg => write!(f, "neg"),
+            Command::Eq => write!(f, "="),
+            Command::Lt => write!(f, "<"),
+            Command::Gt => write!(f, ">"),
+            Command::Le => write!(f, "<="),
+            Command::Ge => write!(f, ">="),
+            Command::Not => write!(f, "not"),
+            Command::And => write!(f, "and"),
+            Command::Or => write!(f, "or"),
             Command::Dup(1) => write!(f, "dup"),
             Command::Dup(l) => write!(f, "dup {l}"),
             Command::Drop(1) => write!(f, "drop"),
@@ -238,17 +381,26 @@ impl Engine {
                 self.stack.push(n);
                 Ok(self)
             }
-            Command::Add => self.binary(|a, b| Ok(a + b)),
-            Command::Sub => self.binary(|a, b| Ok(a - b)),
-            Command::Mul => self.binary(|a, b| Ok(a * b)),
-            Command::Div => self.binary(|a, b| {
+            Command::Add => self.arith(i64::checked_add, |a, b| a + b),
+            Command::Sub => self.arith(i64::checked_sub, |a, b| a - b),
+            Command::Mul => self.arith(i64::checked_mul, |a, b| a * b),
+            // Division always yields a float — `1 2 /` is `0.5`, not `0`.
+            Command::Div => self.num_binary(|a, b| {
                 if b == 0.0 {
                     Err(ErrorKind::DivideByZero)
                 } else {
                     Ok(a / b)
                 }
             }),
-            Command::Neg => self.unary(|x| -x),
+            Command::Neg => self.negate(),
+            Command::Eq => self.equality(),
+            Command::Lt => self.num_compare(|a, b| a < b),
+            Command::Gt => self.num_compare(|a, b| a > b),
+            Command::Le => self.num_compare(|a, b| a <= b),
+            Command::Ge => self.num_compare(|a, b| a >= b),
+            Command::Not => self.bool_unary(|a| !a),
+            Command::And => self.bool_binary(|a, b| a && b),
+            Command::Or => self.bool_binary(|a, b| a || b),
             Command::Dup(level) => self.dup(level),
             Command::Drop(level) => self.drop_at(level),
             Command::Swap(level) => self.swap(level),
@@ -281,37 +433,170 @@ impl Engine {
         (1..=len).contains(&level).then(|| len - level)
     }
 
-    /// Two-operand arithmetic. `a` is the deeper operand, `b` the top, so
-    /// `a b <op>` reads left-to-right as `a <op> b`. The op may reject its
-    /// inputs (e.g. divide-by-zero).
-    fn binary(
+    /// Two-operand op whose result is always a float. `a` is the deeper
+    /// operand, `b` the top, so `a b <op>` reads left-to-right as `a <op> b`.
+    /// Both operands are widened via [`Value::as_num`] (so `Int`s are accepted);
+    /// the op may still reject them (e.g. divide-by-zero). This is the path for
+    /// `/`; the integer-preserving ops use [`Engine::arith`]. The type/arity
+    /// check runs before any mutation, so a failure leaves the stack untouched.
+    fn num_binary(
         mut self,
-        op: impl FnOnce(Value, Value) -> Result<Value, ErrorKind>,
+        op: impl FnOnce(f64, f64) -> Result<f64, ErrorKind>,
     ) -> Outcome {
         let n = self.stack.len();
         let result = if n < 2 {
             Err(ErrorKind::StackUnderflow)
         } else {
-            op(self.stack[n - 2], self.stack[n - 1])
+            self.stack[n - 2]
+                .as_num()
+                .and_then(|a| self.stack[n - 1].as_num().map(|b| (a, b)))
+                .and_then(|(a, b)| op(a, b))
         };
         match result {
-            Ok(result) => {
+            Ok(value) => {
                 self.stack.truncate(n - 2);
-                self.stack.push(result);
+                self.stack.push(Value::Num(value));
                 Ok(self)
             }
             Err(kind) => self.fail(kind),
         }
     }
 
-    /// One-operand op applied to the top of stack.
-    fn unary(mut self, op: impl FnOnce(Value) -> Value) -> Outcome {
+    /// Integer-preserving binary arithmetic (`+ - *`). Two `Int`s stay an `Int`
+    /// via `checked`; if that overflows, or either operand is a float, the op
+    /// promotes to `f64` and uses `float`. A bool operand is a `TypeError`.
+    fn arith(
+        mut self,
+        checked: impl FnOnce(i64, i64) -> Option<i64>,
+        float: impl FnOnce(f64, f64) -> f64,
+    ) -> Outcome {
         let n = self.stack.len();
-        if n < 1 {
+        let result = if n < 2 {
+            Err(ErrorKind::StackUnderflow)
+        } else {
+            match (self.stack[n - 2], self.stack[n - 1]) {
+                (Value::Int(a), Value::Int(b)) => Ok(checked(a, b)
+                    .map(Value::Int)
+                    .unwrap_or_else(|| Value::Num(float(a as f64, b as f64)))),
+                (a, b) => a
+                    .as_num()
+                    .and_then(|a| b.as_num().map(|b| Value::Num(float(a, b)))),
+            }
+        };
+        match result {
+            Ok(value) => {
+                self.stack.truncate(n - 2);
+                self.stack.push(value);
+                Ok(self)
+            }
+            Err(kind) => self.fail(kind),
+        }
+    }
+
+    /// Negate the top of stack, preserving `Int` (falling back to a float only
+    /// on the `i64::MIN` overflow).
+    fn negate(mut self) -> Outcome {
+        let n = self.stack.len();
+        let result = if n < 1 {
+            Err(ErrorKind::StackUnderflow)
+        } else {
+            match self.stack[n - 1] {
+                Value::Int(i) => Ok(i
+                    .checked_neg()
+                    .map(Value::Int)
+                    .unwrap_or_else(|| Value::Num(-(i as f64)))),
+                Value::Num(x) => Ok(Value::Num(-x)),
+                other => Err(ErrorKind::TypeError {
+                    expected: "number",
+                    found: other.type_name(),
+                }),
+            }
+        };
+        match result {
+            Ok(value) => {
+                self.stack[n - 1] = value;
+                Ok(self)
+            }
+            Err(kind) => self.fail(kind),
+        }
+    }
+
+    /// Two-operand numeric comparison, pushing a `Bool` (`< > <= >=`).
+    fn num_compare(mut self, op: impl FnOnce(f64, f64) -> bool) -> Outcome {
+        let n = self.stack.len();
+        let result = if n < 2 {
+            Err(ErrorKind::StackUnderflow)
+        } else {
+            self.stack[n - 2]
+                .as_num()
+                .and_then(|a| self.stack[n - 1].as_num().map(|b| op(a, b)))
+        };
+        match result {
+            Ok(b) => {
+                self.stack.truncate(n - 2);
+                self.stack.push(Value::Bool(b));
+                Ok(self)
+            }
+            Err(kind) => self.fail(kind),
+        }
+    }
+
+    /// Equality of the top two values, pushing a `Bool`. Takes any two values —
+    /// no type check. Numbers compare by value across the int/float split, so
+    /// `2 2.0 =` is true; a number and a bool simply compare unequal.
+    fn equality(mut self) -> Outcome {
+        let n = self.stack.len();
+        if n < 2 {
             return self.fail(ErrorKind::StackUnderflow);
         }
-        self.stack[n - 1] = op(self.stack[n - 1]);
+        let (a, b) = (self.stack[n - 2], self.stack[n - 1]);
+        // Widen numerics so `Int(2)` equals `Num(2.0)`; anything else (bools,
+        // cross-type) falls back to structural equality.
+        let eq = match (a.as_num(), b.as_num()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => a == b,
+        };
+        self.stack.truncate(n - 2);
+        self.stack.push(Value::Bool(eq));
         Ok(self)
+    }
+
+    /// Two-operand boolean op (`and`/`or`). Both operands must be `Bool` —
+    /// there is no truthiness rule, so a number is a `TypeError`.
+    fn bool_binary(mut self, op: impl FnOnce(bool, bool) -> bool) -> Outcome {
+        let n = self.stack.len();
+        let result = if n < 2 {
+            Err(ErrorKind::StackUnderflow)
+        } else {
+            self.stack[n - 2]
+                .as_bool()
+                .and_then(|a| self.stack[n - 1].as_bool().map(|b| op(a, b)))
+        };
+        match result {
+            Ok(b) => {
+                self.stack.truncate(n - 2);
+                self.stack.push(Value::Bool(b));
+                Ok(self)
+            }
+            Err(kind) => self.fail(kind),
+        }
+    }
+
+    /// One-operand boolean op (`not`), applied to the top of stack.
+    fn bool_unary(mut self, op: impl FnOnce(bool) -> bool) -> Outcome {
+        let n = self.stack.len();
+        let result = if n < 1 {
+            Err(ErrorKind::StackUnderflow)
+        } else {
+            self.stack[n - 1].as_bool().map(op)
+        };
+        match result {
+            Ok(b) => {
+                self.stack[n - 1] = Value::Bool(b);
+                Ok(self)
+            }
+            Err(kind) => self.fail(kind),
+        }
     }
 
     /// Push a copy of the value at `level`.
@@ -391,6 +676,133 @@ mod tests {
         assert_eq!(run("8 2 /").stack(), &[4.0]);
     }
 
+    /// The `ErrorKind` from running `input` against a fresh engine.
+    fn run_err(input: &str) -> ErrorKind {
+        Engine::new().apply(&parse(input).unwrap()).unwrap_err().kind
+    }
+
+    #[test]
+    fn true_and_false_are_literals() {
+        assert_eq!(run("true false").stack(), &[true, false]);
+    }
+
+    #[test]
+    fn comparisons_push_a_bool() {
+        assert_eq!(run("1 2 <").stack(), &[true]);
+        assert_eq!(run("1 2 >").stack(), &[false]);
+        assert_eq!(run("2 2 <=").stack(), &[true]);
+        assert_eq!(run("2 2 >=").stack(), &[true]);
+        assert_eq!(run("3 2 >=").stack(), &[true]);
+    }
+
+    #[test]
+    fn equality_works_across_types() {
+        assert_eq!(run("2 2 =").stack(), &[true]);
+        assert_eq!(run("2 3 =").stack(), &[false]);
+        assert_eq!(run("true true =").stack(), &[true]);
+        // A number never equals a bool — but it's not an error, just false.
+        assert_eq!(run("1 true =").stack(), &[false]);
+    }
+
+    #[test]
+    fn boolean_words_operate_on_bools() {
+        assert_eq!(run("true not").stack(), &[false]);
+        assert_eq!(run("true false and").stack(), &[false]);
+        assert_eq!(run("true false or").stack(), &[true]);
+        // Inequality is `=` then `not`.
+        assert_eq!(run("2 3 = not").stack(), &[true]);
+    }
+
+    #[test]
+    fn arithmetic_on_a_bool_is_a_type_error() {
+        assert_eq!(
+            run_err("true 1 +"),
+            ErrorKind::TypeError {
+                expected: "number",
+                found: "bool"
+            }
+        );
+    }
+
+    #[test]
+    fn boolean_words_reject_numbers() {
+        // No truthiness rule: `and`/`or`/`not` are bool-only.
+        assert_eq!(
+            run_err("1 not"),
+            ErrorKind::TypeError {
+                expected: "bool",
+                found: "number"
+            }
+        );
+        assert_eq!(
+            run_err("1 2 and"),
+            ErrorKind::TypeError {
+                expected: "bool",
+                found: "number"
+            }
+        );
+    }
+
+    #[test]
+    fn a_type_error_leaves_the_stack_untouched() {
+        // The check runs before any mutation, so the operands are still there.
+        let err = Engine::new().apply(&parse("true 1 +").unwrap()).unwrap_err();
+        assert_eq!(err.engine.stack(), &[Value::Bool(true), Value::Int(1)]);
+    }
+
+    #[test]
+    fn values_display_without_type_noise() {
+        assert_eq!(Value::Int(3).to_string(), "3");
+        assert_eq!(Value::Num(3.5).to_string(), "3.5");
+        assert_eq!(Value::Bool(true).to_string(), "true");
+        assert_eq!(Value::Bool(false).to_string(), "false");
+    }
+
+    #[test]
+    fn bare_numbers_are_ints_dotted_ones_are_floats() {
+        assert_eq!(run("3").stack(), &[Value::Int(3)]);
+        assert_eq!(run("-5").stack(), &[Value::Int(-5)]);
+        // A `.` or exponent forces a float.
+        assert_eq!(run("3.0").stack(), &[Value::Num(3.0)]);
+        assert_eq!(run("2e3").stack(), &[Value::Num(2000.0)]);
+    }
+
+    #[test]
+    fn integer_arithmetic_stays_integer() {
+        assert_eq!(run("2 3 +").stack(), &[Value::Int(5)]);
+        assert_eq!(run("2 3 -").stack(), &[Value::Int(-1)]);
+        assert_eq!(run("4 5 *").stack(), &[Value::Int(20)]);
+        assert_eq!(run("5 neg").stack(), &[Value::Int(-5)]);
+    }
+
+    #[test]
+    fn division_always_yields_a_float() {
+        // Even when it divides evenly: `4 2 /` is `Num(2.0)`, not `Int(2)`.
+        assert_eq!(run("4 2 /").stack(), &[Value::Num(2.0)]);
+        assert_eq!(run("1 2 /").stack(), &[Value::Num(0.5)]);
+    }
+
+    #[test]
+    fn a_float_operand_promotes_the_whole_expression() {
+        assert_eq!(run("2 3.0 +").stack(), &[Value::Num(5.0)]);
+        assert_eq!(run("2.0 3 *").stack(), &[Value::Num(6.0)]);
+    }
+
+    #[test]
+    fn integer_overflow_promotes_to_float() {
+        // i64::MAX * 2 can't be an Int, so it becomes a float rather than wrap.
+        assert_eq!(
+            run("9223372036854775807 2 *").stack(),
+            &[Value::Num(9223372036854775807.0 * 2.0)]
+        );
+    }
+
+    #[test]
+    fn equality_spans_the_int_float_split() {
+        assert_eq!(run("2 2.0 =").stack(), &[true]);
+        assert_eq!(run("2 3.0 =").stack(), &[false]);
+    }
+
     #[test]
     fn neg_flips_top() {
         assert_eq!(run("5 neg").stack(), &[-5.0]);
@@ -447,8 +859,8 @@ mod tests {
         assert_eq!(
             trace.program,
             vec![
-                Command::Push(1.0),
-                Command::Push(2.0),
+                Command::Push(Value::Int(1)),
+                Command::Push(Value::Int(2)),
                 Command::Add,
                 Command::Div
             ]
@@ -471,7 +883,11 @@ mod tests {
     fn parse_produces_a_program() {
         assert_eq!(
             parse("1 2 +"),
-            Ok(vec![Command::Push(1.0), Command::Push(2.0), Command::Add])
+            Ok(vec![
+                Command::Push(Value::Int(1)),
+                Command::Push(Value::Int(2)),
+                Command::Add
+            ])
         );
     }
 
@@ -499,7 +915,7 @@ mod tests {
 
     #[test]
     fn parse_maps_tokens_to_commands() {
-        assert_eq!(Command::parse("3.5"), Ok(Command::Push(3.5)));
+        assert_eq!(Command::parse("3.5"), Ok(Command::Push(Value::Num(3.5))));
         assert_eq!(Command::parse("+"), Ok(Command::Add));
         assert_eq!(Command::parse("dup"), Ok(Command::Dup(1)));
         assert_eq!(
@@ -512,7 +928,11 @@ mod tests {
     fn apply_runs_a_batch_of_commands() {
         // The TUI path: hand the engine Commands without going through text.
         let engine = Engine::new()
-            .apply(&[Command::Push(2.0), Command::Push(3.0), Command::Mul])
+            .apply(&[
+                Command::Push(Value::Num(2.0)),
+                Command::Push(Value::Num(3.0)),
+                Command::Mul,
+            ])
             .unwrap();
         assert_eq!(engine.stack(), &[6.0]);
     }

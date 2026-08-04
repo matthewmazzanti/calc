@@ -10,6 +10,15 @@
     (`g-`/`g+`-style time travel, not just linear undo/redo).
 
 ## Engine / evaluation
+- [ ] **Unbounded ints** — `Value::Int` is `i64`, so `+ - *` promote to `f64`
+  on overflow (see `arith`/`negate`), silently losing exactness for large
+  results. Replace with arbitrary-precision integers (Python-style bignum) so
+  integer arithmetic is always exact and the overflow-promotion fallback goes
+  away. Options: `num-bigint`, or an `i64` fast-path with bignum spillover
+  (small-int optimization) to keep the common case cheap. Note the asymmetry —
+  like Python, only *ints* go unbounded here; `Num(f64)` stays a bounded IEEE
+  double (overflows to `inf`). Exact non-integers are the separate, harder
+  problem tracked under **Exact real arithmetic** below.
 - [ ] **Exact real arithmetic** — replace `f64` with an exact/constructive real
   representation so results don't accumulate float error. Prior art: the Android
   (AOSP) calculator, which uses Hans Boehm's constructive reals (`CR`) — lazily
