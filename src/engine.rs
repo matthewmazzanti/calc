@@ -11,9 +11,17 @@
 //! so callers can inspect it. The caller keeps its own copy for undo (see the
 //! `history` module) and commits the returned engine only on `Ok`.
 
+/// The kind of an open collection, carried by its [`Value::Mark`]. Only lists
+/// for now; `{` will add a function mark (carrying the captured environment) in
+/// the next milestone. Typed so a `]` closing a `{` can be caught as a mismatch.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MarkKind {
+    List,
+}
+
 /// A value on the stack. Started as a bare `f64`; now a small sum type so the
-/// stack can hold more than numbers. Grows further later (strings, lists,
-/// functions). Kept `Copy` while every variant is — strings will end that.
+/// stack can hold more than numbers. Grows further later (functions). No longer
+/// `Copy` — `Str`/`List` own heap data.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     /// An integer. Preserved through `+ - *` and `neg` when both operands are
@@ -29,6 +37,15 @@ pub enum Value {
     /// clone or move rather than copy. Built by the tokenizer's `"…"` literals
     /// and by `to_str`; concatenated with `+`.
     Str(String),
+    /// A list — a growable, heterogeneous, ordinary sequence. Built by the
+    /// `[ … ]` words via the mark discipline, never a `Push` literal.
+    List(Vec<Value>),
+    /// A collection mark: a typed stack sentinel, *not* a first-class value.
+    /// `[` pushes one and `]` collects the values above it into a [`Value::List`].
+    /// The value words reject it with a type error (so `[ 1 +` is a type error),
+    /// but the shuffles move and copy it like any other stack item — a collection
+    /// is a manipulable region, not a sealed scope (see `language.md` §13).
+    Mark(MarkKind),
 }
 
 impl Value {
@@ -40,12 +57,17 @@ impl Value {
             Value::Int(_) | Value::Num(_) => "number",
             Value::Bool(_) => "bool",
             Value::Str(_) => "string",
+            Value::List(_) => "list",
+            // The open-collection sentinel isn't a first-class value: the value
+            // words reject it, naming it as an "open list" in the error.
+            Value::Mark(MarkKind::List) => "open list",
         }
     }
 
     /// Widen to `f64`, or a [`ErrorKind::TypeError`] naming what was found.
     /// Comparisons, division, and mixed arithmetic funnel operands through this,
-    /// so an `Int` is accepted wherever a number is wanted.
+    /// so an `Int` is accepted wherever a number is wanted. A `Mark` is not a
+    /// value — it falls through to the type error, so `[ 1 +` is a type error.
     fn as_num(&self) -> Result<f64, ErrorKind> {
         match self {
             Value::Int(i) => Ok(*i as f64),
@@ -64,18 +86,6 @@ impl Value {
             Value::Bool(b) => Ok(*b),
             other => Err(ErrorKind::TypeError {
                 expected: "bool",
-                found: other.type_name(),
-            }),
-        }
-    }
-
-    /// Borrow the string content, or a [`ErrorKind::TypeError`]. `length` funnels
-    /// its operand through this.
-    fn as_str(&self) -> Result<&str, ErrorKind> {
-        match self {
-            Value::Str(s) => Ok(s),
-            other => Err(ErrorKind::TypeError {
-                expected: "string",
                 found: other.type_name(),
             }),
         }
@@ -121,6 +131,18 @@ impl std::fmt::Display for Value {
             // number on the stack, and so a `Push` renders re-parseably in a
             // trace. `to_str` uses `content_string` for the unquoted form.
             Value::Str(s) => write!(f, "{s:?}"),
+            // Space-padded so the brackets are their own tokens (`[ 1 2 ]`),
+            // matching how a list is typed. Empty renders `[ ]`.
+            Value::List(items) => {
+                write!(f, "[")?;
+                for item in items {
+                    write!(f, " {item}")?;
+                }
+                write!(f, " ]")
+            }
+            // A lone, still-open mark — shown so an unclosed `[` is visible on
+            // the stack. Distinct from the empty list's `[ ]`.
+            Value::Mark(MarkKind::List) => write!(f, "["),
         }
     }
 }
@@ -163,7 +185,7 @@ impl PartialEq<f64> for Value {
         match self {
             Value::Int(i) => (*i as f64) == *other,
             Value::Num(n) => n == other,
-            Value::Bool(_) | Value::Str(_) => false,
+            _ => false,
         }
     }
 }
@@ -192,6 +214,9 @@ pub enum ErrorKind {
     UnknownCommand(String),
     /// A `"` string literal ran to end-of-input without a closing `"`.
     UnterminatedString,
+    /// A `]` with no open collection to close (or, later, one whose open mark is
+    /// the wrong kind — a `]` closing a `{`).
+    UnmatchedClose,
     /// An operation got a value of the wrong type — e.g. `+` on a bool. The
     /// failing word is named by the surrounding [`Trace`], so this only records
     /// the type mismatch itself.
@@ -208,6 +233,7 @@ impl std::fmt::Display for ErrorKind {
             ErrorKind::DivideByZero => write!(f, "divide by zero"),
             ErrorKind::UnknownCommand(c) => write!(f, "unknown command: {c}"),
             ErrorKind::UnterminatedString => write!(f, "unterminated string"),
+            ErrorKind::UnmatchedClose => write!(f, "unmatched ]"),
             ErrorKind::TypeError { expected, found } => {
                 write!(f, "expected {expected}, found {found}")
             }
@@ -279,6 +305,11 @@ pub enum Command {
     DropAt(usize),
     SwapAt(usize),
 
+    /// `[` — push a list mark, opening a collection.
+    OpenList,
+    /// `]` — collect the values above the topmost mark into a `List`.
+    CloseList,
+
     Clear,
 }
 
@@ -332,6 +363,9 @@ impl Command {
             "rolld" => Command::Rolld,
             "dropn" => Command::DropN,
             "swapn" => Command::SwapN,
+            // Lists — `[` and `]` are ordinary words (spaces required).
+            "[" => Command::OpenList,
+            "]" => Command::CloseList,
             "clear" => Command::Clear,
             other => return Err(ErrorKind::UnknownCommand(other.to_string())),
         })
@@ -385,6 +419,8 @@ impl std::fmt::Display for Command {
             Command::DropAt(l) => write!(f, "dropn {l}"),
             Command::SwapAt(1) => write!(f, "swap"),
             Command::SwapAt(l) => write!(f, "swapn {l}"),
+            Command::OpenList => write!(f, "["),
+            Command::CloseList => write!(f, "]"),
             Command::Clear => write!(f, "clear"),
         }
     }
@@ -610,6 +646,11 @@ impl Engine {
             Command::RollAt(level) => self.roll_at(*level),
             Command::DropAt(level) => self.drop_at(*level),
             Command::SwapAt(level) => self.swap_at(*level),
+            Command::OpenList => {
+                self.stack.push(Value::Mark(MarkKind::List));
+                Ok(self)
+            }
+            Command::CloseList => self.close_list(),
             Command::Clear => {
                 self.stack.clear();
                 Ok(self)
@@ -630,7 +671,9 @@ impl Engine {
 
     /// The `Vec` index for a 1-based level (level 1 == top of stack), or `None`
     /// if the level is out of range. Callers turn `None` into a `StackUnderflow`
-    /// with a `let-else` early return.
+    /// with a `let-else` early return. A mark counts as an ordinary level — the
+    /// shuffles move and copy marks like any other value, so a collection is not
+    /// a sealed scope.
     fn index_of_level(&self, level: usize) -> Option<usize> {
         let len = self.stack.len();
         (1..=len).contains(&level).then(|| len - level)
@@ -826,13 +869,21 @@ impl Engine {
         }
     }
 
-    /// `length`: the character count of the top string, pushed as an `Int`.
+    /// `length`: the element count of the top string (characters) or list,
+    /// pushed as an `Int`.
     fn length(mut self) -> Outcome {
         let n = self.stack.len();
         let result = if n < 1 {
             Err(ErrorKind::StackUnderflow)
         } else {
-            self.stack[n - 1].as_str().map(|s| s.chars().count() as i64)
+            match &self.stack[n - 1] {
+                Value::Str(s) => Ok(s.chars().count() as i64),
+                Value::List(items) => Ok(items.len() as i64),
+                other => Err(ErrorKind::TypeError {
+                    expected: "string or list",
+                    found: other.type_name(),
+                }),
+            }
         };
         match result {
             Ok(len) => {
@@ -972,6 +1023,25 @@ impl Engine {
             return self.fail(ErrorKind::StackUnderflow);
         }
         self.stack.truncate(n - 2);
+        Ok(self)
+    }
+
+    /// `]`: collect the values above the topmost mark into a `List`, consuming
+    /// the mark. Fails with `UnmatchedClose` when no collection is open. The
+    /// collected values are, by the region discipline, all non-marks — so the
+    /// list never contains a mark. (When `{` arrives, this will also reject a
+    /// mark of the wrong kind.)
+    fn close_list(mut self) -> Outcome {
+        let Some(mark) = self
+            .stack
+            .iter()
+            .rposition(|v| matches!(v, Value::Mark(_)))
+        else {
+            return self.fail(ErrorKind::UnmatchedClose);
+        };
+        let items: Vec<Value> = self.stack.drain(mark + 1..).collect();
+        self.stack.pop(); // the mark, now on top
+        self.stack.push(Value::List(items));
         Ok(self)
     }
 }
@@ -1183,7 +1253,7 @@ mod tests {
         assert_eq!(
             run_err("1 length"),
             ErrorKind::TypeError {
-                expected: "string",
+                expected: "string or list",
                 found: "number"
             }
         );
@@ -1482,5 +1552,145 @@ mod tests {
         assert_eq!(Command::DropAt(1).to_string(), "drop");
         assert_eq!(Command::SwapAt(1).to_string(), "swap");
         assert_eq!(Command::RollAt(3).to_string(), "rot");
+    }
+
+    // --- M2: lists and the mark discipline ---
+
+    /// Shorthand for a list value from a slice of values.
+    fn list(items: &[Value]) -> Value {
+        Value::List(items.to_vec())
+    }
+
+    #[test]
+    fn brackets_collect_a_list() {
+        assert_eq!(run("[ ]").stack(), &[list(&[])]);
+        assert_eq!(
+            run("[ 1 2 3 ]").stack(),
+            &[list(&[Value::Int(1), Value::Int(2), Value::Int(3)])]
+        );
+    }
+
+    #[test]
+    fn lists_are_heterogeneous() {
+        assert_eq!(
+            run(r#"[ 1 true "x" ]"#).stack(),
+            &[list(&[Value::Int(1), Value::Bool(true), Value::from("x")])]
+        );
+    }
+
+    #[test]
+    fn lists_nest() {
+        assert_eq!(
+            run("[ 1 [ 2 3 ] 4 ]").stack(),
+            &[list(&[
+                Value::Int(1),
+                list(&[Value::Int(2), Value::Int(3)]),
+                Value::Int(4),
+            ])]
+        );
+    }
+
+    #[test]
+    fn words_run_while_collecting() {
+        // The `+` fires inside the collection, so its result is an element.
+        assert_eq!(
+            run("[ 1 2 + 3 ]").stack(),
+            &[list(&[Value::Int(3), Value::Int(3)])]
+        );
+        // Shuffles, too — they operate within the region.
+        assert_eq!(
+            run("[ 1 2 swap ]").stack(),
+            &[list(&[Value::Int(2), Value::Int(1)])]
+        );
+    }
+
+    #[test]
+    fn a_mark_is_a_typed_literal_not_a_floor() {
+        // A value word rejects the mark as an operand — `[ 1 +` is a type error.
+        assert_eq!(
+            run_err("[ 1 +"),
+            ErrorKind::TypeError {
+                expected: "number",
+                found: "open list"
+            }
+        );
+        // Reaching the mark from an outer value type-errors the same way.
+        assert_eq!(
+            run_err("1 [ 2 +"),
+            ErrorKind::TypeError {
+                expected: "number",
+                found: "open list"
+            }
+        );
+        // Shuffles, though, move and copy the mark like any other value, so a
+        // collection is not a sealed scope.
+        assert_eq!(
+            run("[ dup").stack(),
+            &[Value::Mark(MarkKind::List), Value::Mark(MarkKind::List)]
+        );
+        // An under-supplied shuffle therefore reshapes rather than erroring:
+        // `rot` lifts the mark to the top, so `]` closes an empty list.
+        assert_eq!(
+            run("[ 1 2 rot ]").stack(),
+            &[Value::Int(1), Value::Int(2), list(&[])]
+        );
+    }
+
+    #[test]
+    fn an_open_collection_persists_on_the_stack() {
+        // Leaving `[` unclosed is legal — the mark stays, ready for a later `]`.
+        assert_eq!(
+            run("[ 1 2").stack(),
+            &[Value::Mark(MarkKind::List), Value::Int(1), Value::Int(2)]
+        );
+        // A `]` in a later batch closes it.
+        assert_eq!(
+            run("[ 1 2").apply(&parse("]").unwrap()).unwrap().stack(),
+            &[list(&[Value::Int(1), Value::Int(2)])]
+        );
+    }
+
+    #[test]
+    fn an_unmatched_close_is_an_error() {
+        assert_eq!(run_err("]"), ErrorKind::UnmatchedClose);
+        assert_eq!(run_err("1 2 ]"), ErrorKind::UnmatchedClose);
+    }
+
+    #[test]
+    fn a_list_is_an_ordinary_value() {
+        // It shuffles as one unit.
+        assert_eq!(
+            run("[ 1 2 ] dup").stack(),
+            &[list(&[Value::Int(1), Value::Int(2)]), list(&[Value::Int(1), Value::Int(2)])]
+        );
+    }
+
+    #[test]
+    fn lists_compare_by_structure() {
+        assert_eq!(run("[ 1 2 ] [ 1 2 ] =").stack(), &[true]);
+        assert_eq!(run("[ 1 2 ] [ 1 3 ] =").stack(), &[false]);
+    }
+
+    #[test]
+    fn length_counts_list_elements() {
+        assert_eq!(run("[ 1 2 3 ] length").stack(), &[Value::Int(3)]);
+        assert_eq!(run("[ ] length").stack(), &[Value::Int(0)]);
+    }
+
+    #[test]
+    fn to_str_of_a_list_is_its_display() {
+        assert_eq!(run("[ 1 2 ] to_str").stack(), &[Value::from("[ 1 2 ]")]);
+    }
+
+    #[test]
+    fn lists_display_space_padded() {
+        assert_eq!(list(&[]).to_string(), "[ ]");
+        assert_eq!(list(&[Value::Int(1), Value::Int(2)]).to_string(), "[ 1 2 ]");
+        assert_eq!(
+            list(&[Value::Int(1), list(&[Value::Int(2)])]).to_string(),
+            "[ 1 [ 2 ] ]"
+        );
+        // A string element keeps its quotes inside a list.
+        assert_eq!(list(&[Value::from("a")]).to_string(), r#"[ "a" ]"#);
     }
 }

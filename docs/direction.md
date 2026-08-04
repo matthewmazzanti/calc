@@ -42,8 +42,8 @@ machinery, then behavior:
 |---|---|---|
 | **M0** | Value enum + scalar atoms: `Bool`, `Int`/`Num`, `Str`; their ops | **done** |
 | **M1** | Round out the stack vocabulary (§9.1); `as_index` for level-from-stack | **done** |
-| **M2** | Lists: `[ ]` **mark discipline** — first consumer of marks | next |
-| **M3** | Functions, environments, frames, sigils, `call`, `set` | todo |
+| **M2** | Lists: `[ ]` **mark discipline** — first consumer of marks | **done** |
+| **M3** | Functions, environments, frames, sigils, `call`, `set` | next |
 | **M4+** | Vocabulary: combinators, `if`/`each`/`map`, unquote — mostly in-language | todo |
 
 Ints landed early (numeric-tower-lite: int/float literals, promotion,
