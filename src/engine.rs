@@ -1,10 +1,11 @@
 //! The RPN calculator engine: an [`Engine`] wrapping a stack of values (and,
 //! later, evaluation settings). No I/O and no history. The individual ops take
 //! `&mut self` and return `Result<(), ErrorKind>` — they pop, mutate in place,
-//! and bail with `?`. [`Engine::apply`] runs a whole slice of commands and is
-//! the consuming boundary: it threads one engine through the batch and, on the
-//! first failure, attaches the [`Trace`] to make a [`CalcError`]. Turning a line
-//! of text into commands is a frontend concern, handled by [`parse`].
+//! and bail with `?`. [`Engine::apply`] runs a whole program (a slice of
+//! [`Element`]s) and is the consuming boundary: it threads one engine through
+//! the batch and, on the first failure, attaches the [`Trace`] to make a
+//! [`CalcError`]. Turning a line of text into a program is a frontend concern,
+//! handled by [`parse`].
 //!
 //! **Atomicity is the caller's, not the op's.** An op may leave the stack
 //! half-consumed when it fails (it pops before it type-checks), so there is no
@@ -42,8 +43,8 @@ pub enum Value {
     /// the tokenizer's `"…"` literals and by `to_str`; concatenated with `+`.
     Str(Rc<String>),
     /// A list — a growable, heterogeneous sequence, `Rc`-shared like `Str`.
-    /// Built by the `[ … ]` words via the mark discipline, never a `Push`
-    /// literal; the list ops copy-on-write.
+    /// Built by the `[ … ]` words via the mark discipline, never an
+    /// `Element::Literal`; the list ops copy-on-write.
     List(Rc<Vec<Value>>),
     /// A name — an environment key. Pushed by the `'x` sigil, consumed by
     /// `set`/`get`. Compares and hashes by its text (not yet interned).
@@ -145,7 +146,7 @@ impl std::fmt::Display for Value {
             Value::Num(n) => write!(f, "{n}"),
             Value::Bool(b) => write!(f, "{b}"),
             // Quoted (and escaped) so a string is visibly distinct from a
-            // number on the stack, and so a `Push` renders re-parseably in a
+            // number on the stack, and so a literal renders re-parseably in a
             // trace. `to_str` uses `content_string` for the unquoted form.
             Value::Str(s) => write!(f, "{s:?}"),
             // Space-padded so the brackets are their own tokens (`[ 1 2 ]`),
@@ -555,14 +556,14 @@ pub struct Trace {
 }
 
 /// A semantic error plus the context to show it: what went wrong, and (for a
-/// runtime error) the command sequence it was running.
+/// runtime error) the program it was running.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CalcError {
     /// What went wrong.
     pub kind: ErrorKind,
-    /// The command sequence being run and which command failed, for a runtime
-    /// error. `None` for parse errors (whose offending token is already named in
-    /// `kind`) and for bare-op failures that carry no batch.
+    /// The program being run and which element failed, for a runtime error.
+    /// `None` for parse errors (whose offending token is already named in
+    /// `kind`) and for bare-op failures that carry no program.
     pub trace: Option<Trace>,
 }
 
@@ -578,15 +579,15 @@ impl std::fmt::Display for CalcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.kind)?;
         if let Some(trace) = &self.trace {
-            // Show the batch with the failing command bracketed, e.g.
+            // Show the program with the failing element bracketed, e.g.
             // `1 2 + [/]`.
             write!(f, " in `")?;
-            for (i, command) in trace.program.iter().enumerate() {
+            for (i, element) in trace.program.iter().enumerate() {
                 match (i, i == trace.index) {
-                    (0, true) => write!(f, "[{command}]")?,
-                    (0, false) => write!(f, "{command}")?,
-                    (_, true) => write!(f, " [{command}]")?,
-                    (_, false) => write!(f, " {command}")?,
+                    (0, true) => write!(f, "[{element}]")?,
+                    (0, false) => write!(f, "{element}")?,
+                    (_, true) => write!(f, " [{element}]")?,
+                    (_, false) => write!(f, " {element}")?,
                 }
             }
             write!(f, "`")?;
@@ -666,8 +667,8 @@ impl Engine {
         &self.stack
     }
 
-    /// Apply a batch of commands in order, threading one engine through the
-    /// whole batch (this is the consuming boundary). The first failure
+    /// Apply a program (a slice of elements) in order, threading one engine
+    /// through the whole batch (this is the consuming boundary). The first failure
     /// short-circuits and is wrapped with a [`Trace`] of the batch plus the
     /// index that failed — "here's what was running." A partially-applied engine
     /// is simply dropped; the caller kept its own copy (see the module docs).
@@ -1563,9 +1564,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_maps_tokens_to_commands() {
-        // Numbers and `'x` names become `Push`; every other token is a `Word`,
-        // resolved at runtime (so `+`/`dup` and an unknown `nope` are alike).
+    fn parse_maps_tokens_to_elements() {
+        // Numbers and `'x` names become a `Literal`; every other token is a
+        // `Word`, resolved at runtime (so `+`/`dup` and unknown `nope` alike).
         assert_eq!(Element::parse("3.5"), Element::Literal(Value::Num(3.5)));
         assert_eq!(Element::parse("+"), Element::Word(Rc::from("+")));
         assert_eq!(Element::parse("dup"), Element::Word(Rc::from("dup")));
