@@ -43,8 +43,8 @@ machinery, then behavior:
 | **M0** | Value enum + scalar atoms: `Bool`, `Int`/`Num`, `Str`; their ops | **done** |
 | **M1** | Round out the stack vocabulary (§9.1); `as_index` for level-from-stack | **done** |
 | **M2** | Lists: `[ ]` **mark discipline** — first consumer of marks | **done** |
-| **M3a** | Immutable values via `Rc` + copy-on-write | next |
-| **M3b** | A flat environment: `'x` quoted names, `set`/`get` | after M3a |
+| **M3a** | Immutable values via `Rc` + copy-on-write | **done** |
+| **M3b** | A flat environment: `'x` quoted names, `set`/`get` | **done** |
 | **M3c** | Functions, frame chain, closures, `call`, `&`, bare-word application | after M3b |
 | **M4+** | Vocabulary: combinators, `if`/`each`/`map`, unquote — mostly in-language | todo |
 

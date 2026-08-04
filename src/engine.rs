@@ -45,6 +45,9 @@ pub enum Value {
     /// Built by the `[ … ]` words via the mark discipline, never a `Push`
     /// literal; the list ops copy-on-write.
     List(Rc<Vec<Value>>),
+    /// A name — an environment key. Pushed by the `'x` sigil, consumed by
+    /// `set`/`get`. Compares and hashes by its text (not yet interned).
+    Name(Rc<str>),
     /// A collection mark: a typed stack sentinel, *not* a first-class value.
     /// `[` pushes one and `]` collects the values above it into a [`Value::List`].
     /// The value words reject it with a type error (so `[ 1 +` is a type error),
@@ -63,6 +66,7 @@ impl Value {
             Value::Bool(_) => "bool",
             Value::Str(_) => "string",
             Value::List(_) => "list",
+            Value::Name(_) => "name",
             // The open-collection sentinel isn't a first-class value: the value
             // words reject it, naming it as an "open list" in the error.
             Value::Mark(MarkKind::List) => "open list",
@@ -121,6 +125,8 @@ impl Value {
     fn content_string(&self) -> String {
         match self {
             Value::Str(s) => s.as_ref().clone(),
+            // The bare name text, not the `'x` display form.
+            Value::Name(n) => n.to_string(),
             other => other.to_string(),
         }
     }
@@ -145,6 +151,10 @@ impl std::fmt::Display for Value {
                 }
                 write!(f, " ]")
             }
+            // Names print *with* the quote (`'x`) — otherwise a name and a
+            // look-alike number/string are indistinguishable on the stack, and
+            // this form is also re-parseable. (A deliberate departure from §3.)
+            Value::Name(n) => write!(f, "'{n}"),
             // A lone, still-open mark — shown so an unclosed `[` is visible on
             // the stack. Distinct from the empty list's `[ ]`.
             Value::Mark(MarkKind::List) => write!(f, "["),
@@ -224,6 +234,8 @@ pub enum ErrorKind {
     UnmatchedClose,
     /// A list index (or `first`/`rest` on an empty list) fell outside the list.
     IndexOutOfRange,
+    /// `get` on a name with no binding in the environment.
+    UnboundName(String),
     /// An operation got a value of the wrong type — e.g. `+` on a bool. The
     /// failing word is named by the surrounding [`Trace`], so this only records
     /// the type mismatch itself.
@@ -242,6 +254,7 @@ impl std::fmt::Display for ErrorKind {
             ErrorKind::UnterminatedString => write!(f, "unterminated string"),
             ErrorKind::UnmatchedClose => write!(f, "unmatched ]"),
             ErrorKind::IndexOutOfRange => write!(f, "index out of range"),
+            ErrorKind::UnboundName(n) => write!(f, "unbound name: {n}"),
             ErrorKind::TypeError { expected, found } => {
                 write!(f, "expected {expected}, found {found}")
             }
@@ -318,6 +331,10 @@ pub enum Command {
     Append, // [a b] [c d] -- [a b c d]
     Nth,    // [a b c] n -- (the 0-based nth element)
 
+    // Environment.
+    Set, // value name -- (bind name to value)
+    Get, // name -- value (look up name)
+
     Clear,
 }
 
@@ -327,6 +344,11 @@ impl Command {
     /// A token that parses as a number becomes `Push`; otherwise it must be a
     /// known command word. This is the only place text becomes a `Command`.
     pub fn parse(token: &str) -> Result<Command, ErrorKind> {
+        // The `'` sigil: `'x` pushes the name `x` (§3). Owned here rather than
+        // as a builtin word so it can't be shadowed.
+        if let Some(name) = token.strip_prefix('\'') {
+            return Ok(Command::Push(Value::Name(Rc::from(name))));
+        }
         // Integer first, then float: `3` is an `Int`, but `3.0`/`2e3`/`1e-2`
         // (anything with a `.`, exponent, or out of i64 range) is a `Num`.
         if let Ok(i) = token.parse::<i64>() {
@@ -379,6 +401,8 @@ impl Command {
             "cons" => Command::Cons,
             "append" => Command::Append,
             "nth" => Command::Nth,
+            "set" => Command::Set,
+            "get" => Command::Get,
             "clear" => Command::Clear,
             other => return Err(ErrorKind::UnknownCommand(other.to_string())),
         })
@@ -428,6 +452,8 @@ impl std::fmt::Display for Command {
             Command::Cons => write!(f, "cons"),
             Command::Append => write!(f, "append"),
             Command::Nth => write!(f, "nth"),
+            Command::Set => write!(f, "set"),
+            Command::Get => write!(f, "get"),
             Command::Clear => write!(f, "clear"),
         }
     }
@@ -560,6 +586,9 @@ pub type Outcome = Result<Engine, CalcError>;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Engine {
     stack: Stack,
+    /// The environment: names to bound values. A single flat frame for now (the
+    /// REPL/module scope); the frame chain arrives with functions.
+    env: std::collections::HashMap<Rc<str>, Value>,
 }
 
 impl Engine {
@@ -651,6 +680,8 @@ impl Engine {
             Command::Cons => self.cons(),
             Command::Append => self.append(),
             Command::Nth => self.nth(),
+            Command::Set => self.set(),
+            Command::Get => self.get(),
             Command::Clear => {
                 self.stack.clear();
                 Ok(())
@@ -685,6 +716,18 @@ impl Engine {
             Value::List(items) => Ok(items),
             other => Err(ErrorKind::TypeError {
                 expected: "list",
+                found: other.type_name(),
+            }),
+        }
+    }
+
+    /// Pop a name, or underflow / type error. `set`/`get` funnel their name
+    /// operand through this.
+    fn pop_name(&mut self) -> Result<Rc<str>, ErrorKind> {
+        match self.pop()? {
+            Value::Name(n) => Ok(n),
+            other => Err(ErrorKind::TypeError {
+                expected: "name",
                 found: other.type_name(),
             }),
         }
@@ -1025,6 +1068,29 @@ impl Engine {
             .cloned()
             .ok_or(ErrorKind::IndexOutOfRange)?;
         self.stack.push(item);
+        Ok(())
+    }
+
+    /// `set` ( value name -- ): bind `name` to `value` in the environment,
+    /// shadowing any prior binding. The name is on top (`3 'x set`).
+    fn set(&mut self) -> Result<(), ErrorKind> {
+        let name = self.pop_name()?;
+        let value = self.pop()?;
+        self.env.insert(name, value);
+        Ok(())
+    }
+
+    /// `get` ( name -- value ): push the value bound to `name`, or fail with
+    /// `UnboundName`. The value is cloned out (an `Rc` bump), leaving the
+    /// binding in place; a later mutation copies-on-write.
+    fn get(&mut self) -> Result<(), ErrorKind> {
+        let name = self.pop_name()?;
+        let value = self
+            .env
+            .get(&name)
+            .cloned()
+            .ok_or_else(|| ErrorKind::UnboundName(name.to_string()))?;
+        self.stack.push(value);
         Ok(())
     }
 }
@@ -1726,6 +1792,85 @@ mod tests {
         assert_eq!(
             run(r#""ab" dup "c" +"#).stack(),
             &[Value::from("ab"), Value::from("abc")]
+        );
+    }
+
+    // --- M3b: the environment ---
+
+    /// A name value from text.
+    fn name(s: &str) -> Value {
+        Value::Name(Rc::from(s))
+    }
+
+    #[test]
+    fn quote_pushes_a_name() {
+        assert_eq!(run("'x").stack(), &[name("x")]);
+        // Names print with the quote so they're distinct from a look-alike.
+        assert_eq!(name("1").to_string(), "'1");
+        assert_ne!(name("1").to_string(), Value::Int(1).to_string());
+    }
+
+    #[test]
+    fn set_then_get_round_trips() {
+        assert_eq!(run("3 'x set 'x get").stack(), &[Value::Int(3)]);
+        // Any value binds — a list too.
+        assert_eq!(
+            run("[ 1 2 ] 'xs set 'xs get").stack(),
+            &[list(&[Value::Int(1), Value::Int(2)])]
+        );
+    }
+
+    #[test]
+    fn set_shadows_the_prior_binding() {
+        assert_eq!(run("1 'x set 2 'x set 'x get").stack(), &[Value::Int(2)]);
+    }
+
+    #[test]
+    fn get_on_an_unbound_name_fails() {
+        assert_eq!(run_err("'y get"), ErrorKind::UnboundName("y".to_string()));
+    }
+
+    #[test]
+    fn set_and_get_want_a_name() {
+        // `set`'s name operand is on top; a number there is a type error.
+        assert_eq!(
+            run_err("3 4 set"),
+            ErrorKind::TypeError {
+                expected: "name",
+                found: "number"
+            }
+        );
+        assert_eq!(
+            run_err("3 get"),
+            ErrorKind::TypeError {
+                expected: "name",
+                found: "number"
+            }
+        );
+    }
+
+    #[test]
+    fn names_compare_by_text() {
+        assert_eq!(run("'x 'x =").stack(), &[true]);
+        assert_eq!(run("'x 'y =").stack(), &[false]);
+    }
+
+    #[test]
+    fn to_str_of_a_name_is_its_bare_text() {
+        assert_eq!(run("'x to_str").stack(), &[Value::from("x")]);
+    }
+
+    #[test]
+    fn a_bound_value_shares_but_get_plus_mutation_copies_on_write() {
+        // `foo` holds a list; `get` shares it (Rc bump). Mutating the retrieved
+        // copy must not corrupt the binding — the durable-alias case that made
+        // us pick Rc + copy-on-write.
+        assert_eq!(
+            run("[ 1 2 3 ] 'foo set 'foo get rest 'foo get").stack(),
+            &[
+                list(&[Value::Int(2), Value::Int(3)]),
+                list(&[Value::Int(1), Value::Int(2), Value::Int(3)]),
+            ]
         );
     }
 }
