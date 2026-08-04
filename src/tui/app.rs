@@ -277,16 +277,34 @@ impl App {
             KeyCode::Char('j') | KeyCode::Down => self.cursor += 1,
             KeyCode::Char('k') | KeyCode::Up => self.cursor = self.cursor.saturating_sub(1),
 
-            // Cursor-relative stack edits, expressed as level-parameterized
-            // commands that update the live engine.
-            KeyCode::Char('x') | KeyCode::Char('d') => self.run(&[Command::DropAt(self.cursor)]),
-            KeyCode::Char('s') => self.run(&[Command::SwapAt(self.cursor)]),
+            // Cursor-relative stack edits. These call the engine's stack ops
+            // *directly* (not through a Command / `apply`), so a stack edit is
+            // never intercepted by collection mode — it always hits the stack.
+            KeyCode::Char('x') | KeyCode::Char('d') => {
+                let level = self.cursor;
+                self.update(cursor_label("drop", "dropn", level), move |e| e.drop_at(level));
+            }
+            KeyCode::Char('s') => {
+                let level = self.cursor;
+                self.update(cursor_label("swap", "swapn", level), move |e| e.swap_at(level));
+            }
             // Ctrl-R redoes (vim-style); a bare `r` rotates at the cursor.
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => self.redo(),
-            KeyCode::Char('r') => self.run(&[Command::RollAt(self.cursor)]),
+            KeyCode::Char('r') => {
+                let level = self.cursor;
+                let label = if level == 3 {
+                    "rot".to_string()
+                } else {
+                    format!("rolln {level}")
+                };
+                self.update(label, move |e| e.roll_at(level));
+            }
             KeyCode::Char('u') => self.undo(),
             // Copy the selected value to the top.
-            KeyCode::Enter => self.run(&[Command::PickAt(self.cursor)]),
+            KeyCode::Enter => {
+                let level = self.cursor;
+                self.update(cursor_label("dup", "pickn", level), move |e| e.pick_at(level));
+            }
             _ => {}
         }
     }
@@ -469,6 +487,17 @@ impl App {
 impl Default for App {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Info-bar label for a cursor stack edit at `level`: the fixed-shuffle word
+/// when the level names one (level 1 == top), else the N-suffixed word plus the
+/// level — so editing the top reads `drop`, deeper reads `dropn 3`.
+fn cursor_label(fixed: &str, wordn: &str, level: usize) -> String {
+    if level == 1 {
+        fixed.to_string()
+    } else {
+        format!("{wordn} {level}")
     }
 }
 

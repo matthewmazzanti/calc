@@ -285,28 +285,21 @@ pub enum Command {
     TwoDup,  // a b -- a b a b   (2dup)
     TwoDrop, // a b --           (2drop)
 
-    // Indexed ops, stack-consuming form: the 1-based level (level 1 == top) is
-    // popped off the stack. This is the text/RPN surface — `n roll`, `n pick`.
+    // Indexed ops: the 1-based level (level 1 == top) is popped off the stack.
+    // This is the in-language surface — `n rolln`, `n pickn`. Uniformly
+    // N-suffixed to mark that they consume a level argument. The TUI cursor does
+    // not go through these; it calls the engine's `*_at` methods directly (so a
+    // stack edit is never intercepted by collection mode).
     /// Copy the value at the popped level to the top.
-    Pick,
+    PickN,
     /// Move the value at the popped level up to the top.
-    Roll,
-    /// Roll the top down to the popped level (Rot's inverse at level 3).
-    Rolld,
+    RollN,
+    /// Roll the top down to the popped level (Unrot's general form).
+    RolldN,
     /// Drop the value at the popped level.
     DropN,
     /// Swap the value at the popped level with the one just below it.
     SwapN,
-
-    // Indexed ops, parameterized form: the level is baked into the instruction.
-    // Not produced by the tokenizer (a flat word can't carry an argument) — the
-    // TUI cursor emits these directly. They render as `<word> <level>`. Only the
-    // four the cursor actually emits exist; `rolld` has no cursor key, so there
-    // is no `RolldAt` (add it with its emitter).
-    PickAt(usize),
-    RollAt(usize),
-    DropAt(usize),
-    SwapAt(usize),
 
     /// `[` — push a list mark, opening a collection.
     OpenList,
@@ -367,10 +360,10 @@ impl Command {
             "dupd" => Command::Dupd,
             "2dup" => Command::TwoDup,
             "2drop" => Command::TwoDrop,
-            // Indexed ops — the level comes off the stack.
-            "pick" => Command::Pick,
-            "roll" => Command::Roll,
-            "rolld" => Command::Rolld,
+            // Indexed ops — the level comes off the stack (uniform N-suffix).
+            "pickn" => Command::PickN,
+            "rolln" => Command::RollN,
+            "rolldn" => Command::RolldN,
             "dropn" => Command::DropN,
             "swapn" => Command::SwapN,
             // Lists — `[` and `]` are ordinary words (spaces required).
@@ -418,22 +411,11 @@ impl std::fmt::Display for Command {
             Command::Dupd => write!(f, "dupd"),
             Command::TwoDup => write!(f, "2dup"),
             Command::TwoDrop => write!(f, "2drop"),
-            Command::Pick => write!(f, "pick"),
-            Command::Roll => write!(f, "roll"),
-            Command::Rolld => write!(f, "rolld"),
+            Command::PickN => write!(f, "pickn"),
+            Command::RollN => write!(f, "rolln"),
+            Command::RolldN => write!(f, "rolldn"),
             Command::DropN => write!(f, "dropn"),
             Command::SwapN => write!(f, "swapn"),
-            // Parameterized (TUI-emitted): the word plus the baked level, but
-            // render the level that names a fixed shuffle as that word — so a
-            // cursor op on the top of stack reads `drop`, not `dropn 1`.
-            Command::PickAt(1) => write!(f, "dup"),
-            Command::PickAt(l) => write!(f, "pick {l}"),
-            Command::RollAt(3) => write!(f, "rot"),
-            Command::RollAt(l) => write!(f, "roll {l}"),
-            Command::DropAt(1) => write!(f, "drop"),
-            Command::DropAt(l) => write!(f, "dropn {l}"),
-            Command::SwapAt(1) => write!(f, "swap"),
-            Command::SwapAt(l) => write!(f, "swapn {l}"),
             Command::OpenList => write!(f, "["),
             Command::CloseList => write!(f, "]"),
             Command::First => write!(f, "first"),
@@ -655,17 +637,12 @@ impl Engine {
             Command::Dupd => self.dupd(),
             Command::TwoDup => self.two_dup(),
             Command::TwoDrop => self.two_drop(),
-            // Indexed, stack-consuming: pop the level, then run the op.
-            Command::Pick => self.indexed(Engine::pick_at),
-            Command::Roll => self.indexed(Engine::roll_at),
-            Command::Rolld => self.indexed(Engine::rolld_at),
+            // Indexed: pop the level, then run the op.
+            Command::PickN => self.indexed(Engine::pick_at),
+            Command::RollN => self.indexed(Engine::roll_at),
+            Command::RolldN => self.indexed(Engine::rolld_at),
             Command::DropN => self.indexed(Engine::drop_at),
             Command::SwapN => self.indexed(Engine::swap_at),
-            // Indexed, parameterized: the level is baked in.
-            Command::PickAt(level) => self.pick_at(*level),
-            Command::RollAt(level) => self.roll_at(*level),
-            Command::DropAt(level) => self.drop_at(*level),
-            Command::SwapAt(level) => self.swap_at(*level),
             Command::OpenList => {
                 self.stack.push(Value::Mark(MarkKind::List));
                 Ok(self)
@@ -950,7 +927,7 @@ impl Engine {
     }
 
     /// Copy the value at `level` to the top (`dup` = 1, `over` = 2, `pick`).
-    fn pick_at(mut self, level: usize) -> Outcome {
+    pub(crate) fn pick_at(mut self, level: usize) -> Outcome {
         let Some(i) = self.index_of_level(level) else {
             return self.fail(ErrorKind::StackUnderflow);
         };
@@ -960,7 +937,7 @@ impl Engine {
     }
 
     /// Remove the value at `level` (`drop` = 1, `nip` = 2, `dropn`).
-    fn drop_at(mut self, level: usize) -> Outcome {
+    pub(crate) fn drop_at(mut self, level: usize) -> Outcome {
         let Some(i) = self.index_of_level(level) else {
             return self.fail(ErrorKind::StackUnderflow);
         };
@@ -970,7 +947,7 @@ impl Engine {
 
     /// Exchange the value at `level` with the one just below it (`level + 1`).
     /// `swap` = 1, `swapn`.
-    fn swap_at(mut self, level: usize) -> Outcome {
+    pub(crate) fn swap_at(mut self, level: usize) -> Outcome {
         let (Some(i), Some(j)) = (
             self.index_of_level(level),
             self.index_of_level(level + 1),
@@ -984,7 +961,7 @@ impl Engine {
 
     /// Move the value at `level` up to the top, shifting shallower values down.
     /// `rot` = 3, `roll`.
-    fn roll_at(mut self, level: usize) -> Outcome {
+    pub(crate) fn roll_at(mut self, level: usize) -> Outcome {
         let Some(i) = self.index_of_level(level) else {
             return self.fail(ErrorKind::StackUnderflow);
         };
@@ -1579,72 +1556,6 @@ mod tests {
         assert_eq!(engine.stack(), &[6.0]);
     }
 
-    #[test]
-    fn pick_at_copies_a_level_to_the_top() {
-        // copy level 3 to the top
-        assert_eq!(
-            run("1 2 3").apply(&[Command::PickAt(3)]).unwrap().stack(),
-            &[1.0, 2.0, 3.0, 1.0]
-        );
-    }
-
-    #[test]
-    fn drop_at_a_level_removes_it() {
-        // remove the `2`
-        assert_eq!(
-            run("1 2 3").apply(&[Command::DropAt(2)]).unwrap().stack(),
-            &[1.0, 3.0]
-        );
-    }
-
-    #[test]
-    fn swap_at_exchanges_with_the_level_below() {
-        // level 1 with level 2: same as plain swap
-        assert_eq!(
-            run("1 2 3").apply(&[Command::SwapAt(1)]).unwrap().stack(),
-            &[1.0, 3.0, 2.0]
-        );
-        // level 2 with level 3
-        assert_eq!(
-            run("1 2 3").apply(&[Command::SwapAt(2)]).unwrap().stack(),
-            &[2.0, 1.0, 3.0]
-        );
-    }
-
-    #[test]
-    fn swap_at_the_bottom_has_nothing_below() {
-        assert_eq!(
-            run("1 2 3").apply(&[Command::SwapAt(3)]).unwrap_err().kind,
-            ErrorKind::StackUnderflow
-        );
-    }
-
-    #[test]
-    fn roll_at_brings_a_level_to_the_top() {
-        // bring level 3 to the top
-        assert_eq!(
-            run("1 2 3 4").apply(&[Command::RollAt(3)]).unwrap().stack(),
-            &[1.0, 3.0, 4.0, 2.0]
-        );
-        // `RollAt(3)` has the same effect as the text `rot`.
-        assert_eq!(
-            run("1 2 3 rot").stack(),
-            run("1 2 3").apply(&[Command::RollAt(3)]).unwrap().stack()
-        );
-    }
-
-    #[test]
-    fn level_zero_and_out_of_range_error() {
-        assert_eq!(
-            run("1 2").apply(&[Command::DropAt(0)]).unwrap_err().kind,
-            ErrorKind::StackUnderflow
-        );
-        assert_eq!(
-            run("1 2").apply(&[Command::RollAt(5)]).unwrap_err().kind,
-            ErrorKind::StackUnderflow
-        );
-    }
-
     // --- M1: fixed shuffles and stack-consuming indexed ops ---
 
     #[test]
@@ -1666,23 +1577,31 @@ mod tests {
 
     #[test]
     fn indexed_words_take_their_level_off_the_stack() {
-        // `3 pick` copies level 3 to the top (the level itself is consumed).
-        assert_eq!(run("1 2 3 3 pick").stack(), &[1.0, 2.0, 3.0, 1.0]);
-        assert_eq!(run("1 2 3 3 roll").stack(), &[2.0, 3.0, 1.0]);
-        assert_eq!(run("1 2 3 3 rolld").stack(), &[3.0, 1.0, 2.0]);
+        // `3 pickn` copies level 3 to the top (the level itself is consumed).
+        assert_eq!(run("1 2 3 3 pickn").stack(), &[1.0, 2.0, 3.0, 1.0]);
+        assert_eq!(run("1 2 3 3 rolln").stack(), &[2.0, 3.0, 1.0]);
+        assert_eq!(run("1 2 3 3 rolldn").stack(), &[3.0, 1.0, 2.0]);
         assert_eq!(run("1 2 3 2 dropn").stack(), &[1.0, 3.0]);
         assert_eq!(run("1 2 3 2 swapn").stack(), &[2.0, 1.0, 3.0]);
     }
 
     #[test]
-    fn rolld_inverts_roll() {
-        assert_eq!(run("1 2 3 4 3 roll 3 rolld").stack(), &[1.0, 2.0, 3.0, 4.0]);
+    fn a_swapn_at_the_bottom_has_nothing_below() {
+        assert_eq!(run_err("1 2 3 3 swapn"), ErrorKind::StackUnderflow);
+    }
+
+    #[test]
+    fn rolldn_inverts_rolln() {
+        assert_eq!(
+            run("1 2 3 4 3 rolln 3 rolldn").stack(),
+            &[1.0, 2.0, 3.0, 4.0]
+        );
     }
 
     #[test]
     fn a_non_integer_level_is_rejected_not_rounded() {
         assert_eq!(
-            run_err("1 2 3 2.5 roll"),
+            run_err("1 2 3 2.5 rolln"),
             ErrorKind::TypeError {
                 expected: "integer",
                 found: "float"
@@ -1692,26 +1611,18 @@ mod tests {
 
     #[test]
     fn a_level_out_of_range_underflows() {
-        assert_eq!(run_err("1 2 5 pick"), ErrorKind::StackUnderflow);
+        assert_eq!(run_err("1 2 5 pickn"), ErrorKind::StackUnderflow);
         // A level of 0 is not a valid 1-based level either.
-        assert_eq!(run_err("1 2 0 roll"), ErrorKind::StackUnderflow);
+        assert_eq!(run_err("1 2 0 rolln"), ErrorKind::StackUnderflow);
     }
 
     #[test]
-    fn parameterized_indexed_commands_render_with_their_level() {
-        assert_eq!(Command::PickAt(3).to_string(), "pick 3");
-        assert_eq!(Command::RollAt(2).to_string(), "roll 2");
-        assert_eq!(Command::DropAt(2).to_string(), "dropn 2");
-        assert_eq!(Command::SwapAt(2).to_string(), "swapn 2");
-    }
-
-    #[test]
-    fn a_parameterized_op_at_a_named_level_renders_as_that_word() {
-        // A cursor op on the top of stack reads as the fixed shuffle.
-        assert_eq!(Command::PickAt(1).to_string(), "dup");
-        assert_eq!(Command::DropAt(1).to_string(), "drop");
-        assert_eq!(Command::SwapAt(1).to_string(), "swap");
-        assert_eq!(Command::RollAt(3).to_string(), "rot");
+    fn indexed_words_render_n_suffixed() {
+        assert_eq!(Command::PickN.to_string(), "pickn");
+        assert_eq!(Command::RollN.to_string(), "rolln");
+        assert_eq!(Command::RolldN.to_string(), "rolldn");
+        assert_eq!(Command::DropN.to_string(), "dropn");
+        assert_eq!(Command::SwapN.to_string(), "swapn");
     }
 
     // --- M2: lists and the mark discipline ---
