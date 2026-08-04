@@ -1,15 +1,17 @@
-//! The RPN calculator engine: an [`Engine`] wrapping a stack of floating-point
-//! values (and, later, evaluation settings). No I/O and no history — its
-//! transforms *consume* `self` and return the new engine, so a batch of
-//! commands folds through with no intermediate copies: the same value is moved
-//! from step to step. [`Engine::apply`] runs a whole slice of commands; turning
-//! a line of text into one is a frontend concern, handled by [`parse`].
+//! The RPN calculator engine: an [`Engine`] wrapping a stack of values (and,
+//! later, evaluation settings). No I/O and no history. The individual ops take
+//! `&mut self` and return `Result<(), ErrorKind>` — they pop, mutate in place,
+//! and bail with `?`. [`Engine::apply`] runs a whole slice of commands and is
+//! the consuming boundary: it threads one engine through the batch and, on the
+//! first failure, attaches the [`Trace`] to make a [`CalcError`]. Turning a line
+//! of text into commands is a frontend concern, handled by [`parse`].
 //!
-//! On failure a transform moves `self` *into* the error rather than dropping it:
-//! [`CalcError`] carries the engine as it stood when the command failed — its
-//! stack is exactly the state the command saw, since ops check before mutating —
-//! so callers can inspect it. The caller keeps its own copy for undo (see the
-//! `history` module) and commits the returned engine only on `Ok`.
+//! **Atomicity is the caller's, not the op's.** An op may leave the stack
+//! half-consumed when it fails (it pops before it type-checks), so there is no
+//! "operands intact on error" guarantee. That doesn't matter, because every
+//! caller applies to a *copy* and commits only on `Ok` (see the `history`
+//! module) — a failed batch's damage is confined to a discarded clone, and the
+//! caller's own engine is untouched. This is the standard transactional model.
 
 /// The kind of an open collection, carried by its [`Value::Mark`]. Only lists
 /// for now; `{` will add a function mark (carrying the captured environment) in
@@ -499,29 +501,23 @@ pub struct Trace {
     pub index: usize,
 }
 
-/// A semantic error plus the context to inspect it: the engine as it stood when
-/// evaluation failed, and the command sequence it was running.
+/// A semantic error plus the context to show it: what went wrong, and (for a
+/// runtime error) the command sequence it was running.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CalcError {
     /// What went wrong.
     pub kind: ErrorKind,
-    /// The engine at the moment of failure. Since every op checks its
-    /// preconditions before mutating, its stack is exactly the state the failing
-    /// command saw — nothing partially applied.
-    pub engine: Engine,
     /// The command sequence being run and which command failed, for a runtime
-    /// error. `None` for parse errors, whose offending token is already named
-    /// in `kind`.
+    /// error. `None` for parse errors (whose offending token is already named in
+    /// `kind`) and for bare-op failures that carry no batch.
     pub trace: Option<Trace>,
 }
 
-impl CalcError {
-    fn new(engine: Engine, kind: ErrorKind) -> Self {
-        Self {
-            kind,
-            engine,
-            trace: None,
-        }
+/// A bare error with no batch context — used where a single op fails outside a
+/// program (e.g. the TUI's cursor edits).
+impl From<ErrorKind> for CalcError {
+    fn from(kind: ErrorKind) -> Self {
+        Self { kind, trace: None }
     }
 }
 
@@ -548,17 +544,16 @@ impl std::fmt::Display for CalcError {
 
 impl std::error::Error for CalcError {}
 
-/// The result of a transform: the new engine, or a [`CalcError`] carrying the
-/// engine at the point of failure.
+/// The result of [`Engine::apply`]: the engine threaded through the whole batch,
+/// or a [`CalcError`] naming what failed.
 pub type Outcome = Result<Engine, CalcError>;
 
 /// The calculator engine: the RPN stack, plus (later) evaluation settings such
 /// as angle mode, display precision, or named registers.
 ///
-/// Transforms consume `self` and return the new engine, so a sequence of
-/// commands folds through with no intermediate copies (`self` is moved from
-/// step to step). Callers keep their own copy for undo and commit the result
-/// only on `Ok` — see the `history` module.
+/// [`Engine::apply`] consumes `self` and threads it through the batch;
+/// individual ops take `&mut self` and mutate in place. The caller keeps its own
+/// copy for undo and commits the result only on `Ok` — see the `history` module.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Engine {
     stack: Stack,
@@ -574,33 +569,33 @@ impl Engine {
         &self.stack
     }
 
-    /// Apply a batch of commands in order, threading the engine through each.
-    /// The first runtime error short-circuits the fold and carries a [`Trace`]
-    /// of the whole batch plus the index that failed — "here's what was running."
-    pub fn apply(self, program: &[Command]) -> Outcome {
-        program
-            .iter()
-            .enumerate()
-            .try_fold(self, |engine, (index, command)| {
-                engine.apply_one(command).map_err(|mut e| {
-                    e.trace = Some(Trace {
+    /// Apply a batch of commands in order, threading one engine through the
+    /// whole batch (this is the consuming boundary). The first failure
+    /// short-circuits and is wrapped with a [`Trace`] of the batch plus the
+    /// index that failed — "here's what was running." A partially-applied engine
+    /// is simply dropped; the caller kept its own copy (see the module docs).
+    pub fn apply(mut self, program: &[Command]) -> Outcome {
+        for (index, command) in program.iter().enumerate() {
+            if let Err(kind) = self.apply_one(command) {
+                return Err(CalcError {
+                    kind,
+                    trace: Some(Trace {
                         program: program.to_vec(),
                         index,
-                    });
-                    e
-                })
-            })
+                    }),
+                });
+            }
+        }
+        Ok(self)
     }
 
-    /// Apply a single command, consuming `self` and returning the new engine.
-    /// Borrows the command (it is no longer `Copy`, and the caller still needs
-    /// the program for the trace). A total match, so a new command variant is a
-    /// compile error until handled.
-    fn apply_one(mut self, cmd: &Command) -> Outcome {
+    /// Apply a single command in place. A total match, so a new command variant
+    /// is a compile error until handled.
+    fn apply_one(&mut self, cmd: &Command) -> Result<(), ErrorKind> {
         match cmd {
             Command::Push(value) => {
                 self.stack.push(value.clone());
-                Ok(self)
+                Ok(())
             }
             // `+` concatenates two strings, else adds numbers.
             Command::Add => self.add(),
@@ -645,7 +640,7 @@ impl Engine {
             Command::SwapN => self.indexed(Engine::swap_at),
             Command::OpenList => {
                 self.stack.push(Value::Mark(MarkKind::List));
-                Ok(self)
+                Ok(())
             }
             Command::CloseList => self.close_list(),
             Command::First => self.first(),
@@ -655,20 +650,40 @@ impl Engine {
             Command::Nth => self.nth(),
             Command::Clear => {
                 self.stack.clear();
-                Ok(self)
+                Ok(())
             }
         }
     }
 
-    // Stack transforms. Each consumes `self`; on failure it moves `self` into
-    // the error (via `fail`) instead of dropping it, so the engine is available
-    // for inspection. The pure checks return an `ErrorKind`; the one `match`
-    // per op is where `self` gets attached.
+    // Stack transforms. Each takes `&mut self`, pops what it needs, mutates in
+    // place, and bails with `?` on the first bad pop — so a failure may leave the
+    // stack half-consumed (the caller's transaction, not the op, is atomic).
 
-    /// The failure path of every transform: move `self` into the error and
-    /// return it as an `Err`, ready to hand straight back.
-    fn fail<T>(self, kind: ErrorKind) -> Result<T, CalcError> {
-        Err(CalcError::new(self, kind))
+    /// Pop the top value, or `StackUnderflow` if the stack is empty.
+    fn pop(&mut self) -> Result<Value, ErrorKind> {
+        self.stack.pop().ok_or(ErrorKind::StackUnderflow)
+    }
+
+    /// Pop and widen to a number (an `Int` is accepted). Underflow, or a type
+    /// error naming what was found.
+    fn pop_num(&mut self) -> Result<f64, ErrorKind> {
+        self.pop()?.as_num()
+    }
+
+    /// Pop a boolean, or underflow / type error.
+    fn pop_bool(&mut self) -> Result<bool, ErrorKind> {
+        self.pop()?.as_bool()
+    }
+
+    /// Pop a list's elements, or underflow / type error.
+    fn pop_list(&mut self) -> Result<Vec<Value>, ErrorKind> {
+        match self.pop()? {
+            Value::List(items) => Ok(items),
+            other => Err(ErrorKind::TypeError {
+                expected: "list",
+                found: other.type_name(),
+            }),
+        }
     }
 
     /// The `Vec` index for a 1-based level (level 1 == top of stack), or `None`
@@ -681,351 +696,246 @@ impl Engine {
         (1..=len).contains(&level).then(|| len - level)
     }
 
-    /// Two-operand op whose result is always a float. `a` is the deeper
-    /// operand, `b` the top, so `a b <op>` reads left-to-right as `a <op> b`.
-    /// Both operands are widened via [`Value::as_num`] (so `Int`s are accepted);
-    /// the op may still reject them (e.g. divide-by-zero). This is the path for
-    /// `/`; the integer-preserving ops use [`Engine::arith`]. The type/arity
-    /// check runs before any mutation, so a failure leaves the stack untouched.
+    /// Two-operand op whose result is always a float. `a` is the deeper operand,
+    /// `b` the top, so `a b <op>` reads left-to-right as `a <op> b`. Both widen
+    /// via [`Value::as_num`] (so `Int`s are accepted); the op may still reject
+    /// them (divide-by-zero). Used by `/`; integer-preserving ops use `arith`.
     fn num_binary(
-        mut self,
+        &mut self,
         op: impl FnOnce(f64, f64) -> Result<f64, ErrorKind>,
-    ) -> Outcome {
-        let n = self.stack.len();
-        let result = if n < 2 {
-            Err(ErrorKind::StackUnderflow)
-        } else {
-            self.stack[n - 2]
-                .as_num()
-                .and_then(|a| self.stack[n - 1].as_num().map(|b| (a, b)))
-                .and_then(|(a, b)| op(a, b))
-        };
-        match result {
-            Ok(value) => {
-                self.stack.truncate(n - 2);
-                self.stack.push(Value::Num(value));
-                Ok(self)
-            }
-            Err(kind) => self.fail(kind),
+    ) -> Result<(), ErrorKind> {
+        let b = self.pop_num()?;
+        let a = self.pop_num()?;
+        self.stack.push(Value::Num(op(a, b)?));
+        Ok(())
+    }
+
+    /// Combine two owned values with integer-preserving arithmetic: two `Int`s
+    /// stay an `Int` via `checked` (promoting to `f64` on overflow), else both
+    /// widen to `f64`. Shared by `+ - *`; a bool operand is a `TypeError`.
+    fn arith_values(
+        a: Value,
+        b: Value,
+        checked: impl FnOnce(i64, i64) -> Option<i64>,
+        float: impl FnOnce(f64, f64) -> f64,
+    ) -> Result<Value, ErrorKind> {
+        match (&a, &b) {
+            (Value::Int(x), Value::Int(y)) => Ok(checked(*x, *y)
+                .map(Value::Int)
+                .unwrap_or_else(|| Value::Num(float(*x as f64, *y as f64)))),
+            _ => Ok(Value::Num(float(a.as_num()?, b.as_num()?))),
         }
     }
 
-    /// Integer-preserving binary arithmetic (`+ - *`). Two `Int`s stay an `Int`
-    /// via `checked`; if that overflows, or either operand is a float, the op
-    /// promotes to `f64` and uses `float`. A bool operand is a `TypeError`.
+    /// Integer-preserving binary arithmetic (`- *`, and the numeric branch of
+    /// `+`).
     fn arith(
-        mut self,
+        &mut self,
         checked: impl FnOnce(i64, i64) -> Option<i64>,
         float: impl FnOnce(f64, f64) -> f64,
-    ) -> Outcome {
-        let n = self.stack.len();
-        let result = if n < 2 {
-            Err(ErrorKind::StackUnderflow)
-        } else {
-            match (&self.stack[n - 2], &self.stack[n - 1]) {
-                (Value::Int(a), Value::Int(b)) => Ok(checked(*a, *b)
-                    .map(Value::Int)
-                    .unwrap_or_else(|| Value::Num(float(*a as f64, *b as f64)))),
-                (a, b) => a
-                    .as_num()
-                    .and_then(|a| b.as_num().map(|b| Value::Num(float(a, b)))),
-            }
-        };
-        match result {
-            Ok(value) => {
-                self.stack.truncate(n - 2);
-                self.stack.push(value);
-                Ok(self)
-            }
-            Err(kind) => self.fail(kind),
-        }
+    ) -> Result<(), ErrorKind> {
+        let b = self.pop()?;
+        let a = self.pop()?;
+        let v = Self::arith_values(a, b, checked, float)?;
+        self.stack.push(v);
+        Ok(())
     }
 
     /// Negate the top of stack, preserving `Int` (falling back to a float only
     /// on the `i64::MIN` overflow).
-    fn negate(mut self) -> Outcome {
-        let n = self.stack.len();
-        let result = if n < 1 {
-            Err(ErrorKind::StackUnderflow)
-        } else {
-            match &self.stack[n - 1] {
-                Value::Int(i) => Ok(i
-                    .checked_neg()
-                    .map(Value::Int)
-                    .unwrap_or_else(|| Value::Num(-(*i as f64)))),
-                Value::Num(x) => Ok(Value::Num(-*x)),
-                other => Err(ErrorKind::TypeError {
+    fn negate(&mut self) -> Result<(), ErrorKind> {
+        let v = match self.pop()? {
+            Value::Int(i) => i
+                .checked_neg()
+                .map(Value::Int)
+                .unwrap_or_else(|| Value::Num(-(i as f64))),
+            Value::Num(x) => Value::Num(-x),
+            other => {
+                return Err(ErrorKind::TypeError {
                     expected: "number",
                     found: other.type_name(),
-                }),
+                })
             }
         };
-        match result {
-            Ok(value) => {
-                self.stack[n - 1] = value;
-                Ok(self)
-            }
-            Err(kind) => self.fail(kind),
-        }
+        self.stack.push(v);
+        Ok(())
     }
 
     /// Two-operand numeric comparison, pushing a `Bool` (`< > <= >=`).
-    fn num_compare(mut self, op: impl FnOnce(f64, f64) -> bool) -> Outcome {
-        let n = self.stack.len();
-        let result = if n < 2 {
-            Err(ErrorKind::StackUnderflow)
-        } else {
-            self.stack[n - 2]
-                .as_num()
-                .and_then(|a| self.stack[n - 1].as_num().map(|b| op(a, b)))
-        };
-        match result {
-            Ok(b) => {
-                self.stack.truncate(n - 2);
-                self.stack.push(Value::Bool(b));
-                Ok(self)
-            }
-            Err(kind) => self.fail(kind),
-        }
+    fn num_compare(&mut self, op: impl FnOnce(f64, f64) -> bool) -> Result<(), ErrorKind> {
+        let b = self.pop_num()?;
+        let a = self.pop_num()?;
+        self.stack.push(Value::Bool(op(a, b)));
+        Ok(())
     }
 
     /// Equality of the top two values, pushing a `Bool`. Takes any two values —
-    /// no type check. Numbers compare by value across the int/float split, so
-    /// `2 2.0 =` is true; a number and a bool simply compare unequal.
-    fn equality(mut self) -> Outcome {
-        let n = self.stack.len();
-        if n < 2 {
-            return self.fail(ErrorKind::StackUnderflow);
-        }
-        let (a, b) = (&self.stack[n - 2], &self.stack[n - 1]);
-        // Widen numerics so `Int(2)` equals `Num(2.0)`; anything else (bools,
-        // strings, cross-type) falls back to structural equality.
+    /// numbers compare by value across the int/float split, so `2 2.0 =` is
+    /// true; anything else falls back to structural equality.
+    fn equality(&mut self) -> Result<(), ErrorKind> {
+        let b = self.pop()?;
+        let a = self.pop()?;
         let eq = match (a.as_num(), b.as_num()) {
             (Ok(a), Ok(b)) => a == b,
             _ => a == b,
         };
-        self.stack.truncate(n - 2);
         self.stack.push(Value::Bool(eq));
-        Ok(self)
+        Ok(())
     }
 
-    /// Two-operand boolean op (`and`/`or`). Both operands must be `Bool` —
-    /// there is no truthiness rule, so a number is a `TypeError`.
-    fn bool_binary(mut self, op: impl FnOnce(bool, bool) -> bool) -> Outcome {
-        let n = self.stack.len();
-        let result = if n < 2 {
-            Err(ErrorKind::StackUnderflow)
-        } else {
-            self.stack[n - 2]
-                .as_bool()
-                .and_then(|a| self.stack[n - 1].as_bool().map(|b| op(a, b)))
-        };
-        match result {
-            Ok(b) => {
-                self.stack.truncate(n - 2);
-                self.stack.push(Value::Bool(b));
-                Ok(self)
+    /// Two-operand boolean op (`and`/`or`). Both operands must be `Bool` — no
+    /// truthiness rule, so a number is a `TypeError`.
+    fn bool_binary(&mut self, op: impl FnOnce(bool, bool) -> bool) -> Result<(), ErrorKind> {
+        let b = self.pop_bool()?;
+        let a = self.pop_bool()?;
+        self.stack.push(Value::Bool(op(a, b)));
+        Ok(())
+    }
+
+    /// One-operand boolean op (`not`).
+    fn bool_unary(&mut self, op: impl FnOnce(bool) -> bool) -> Result<(), ErrorKind> {
+        let a = self.pop_bool()?;
+        self.stack.push(Value::Bool(op(a)));
+        Ok(())
+    }
+
+    /// `+`: concatenate two strings, or add two numbers. A string and a number
+    /// is a type error from the numeric path (no implicit `to_str`).
+    fn add(&mut self) -> Result<(), ErrorKind> {
+        let b = self.pop()?;
+        let a = self.pop()?;
+        let v = match (a, b) {
+            (Value::Str(mut a), Value::Str(b)) => {
+                a.push_str(&b);
+                Value::Str(a)
             }
-            Err(kind) => self.fail(kind),
-        }
-    }
-
-    /// One-operand boolean op (`not`), applied to the top of stack.
-    fn bool_unary(mut self, op: impl FnOnce(bool) -> bool) -> Outcome {
-        let n = self.stack.len();
-        let result = if n < 1 {
-            Err(ErrorKind::StackUnderflow)
-        } else {
-            self.stack[n - 1].as_bool().map(op)
+            (a, b) => Self::arith_values(a, b, i64::checked_add, |a, b| a + b)?,
         };
-        match result {
-            Ok(b) => {
-                self.stack[n - 1] = Value::Bool(b);
-                Ok(self)
-            }
-            Err(kind) => self.fail(kind),
-        }
+        self.stack.push(v);
+        Ok(())
     }
 
-    /// `+`: concatenate two strings, or add two numbers. Strings only
-    /// concatenate with strings — a string and a number is a `TypeError` from
-    /// the numeric path, not an implicit `to_str`.
-    fn add(mut self) -> Outcome {
-        let n = self.stack.len();
-        let both_str = n >= 2
-            && matches!(self.stack[n - 2], Value::Str(_))
-            && matches!(self.stack[n - 1], Value::Str(_));
-        if both_str {
-            // Pop top first, then reuse the deeper string's allocation.
-            let Value::Str(b) = self.stack.pop().unwrap() else {
-                unreachable!()
-            };
-            let Value::Str(mut a) = self.stack.pop().unwrap() else {
-                unreachable!()
-            };
-            a.push_str(&b);
-            self.stack.push(Value::Str(a));
-            Ok(self)
-        } else {
-            self.arith(i64::checked_add, |a, b| a + b)
-        }
-    }
-
-    /// `length`: the element count of the top string (characters) or list,
-    /// pushed as an `Int`.
-    fn length(mut self) -> Outcome {
-        let n = self.stack.len();
-        let result = if n < 1 {
-            Err(ErrorKind::StackUnderflow)
-        } else {
-            match &self.stack[n - 1] {
-                Value::Str(s) => Ok(s.chars().count() as i64),
-                Value::List(items) => Ok(items.len() as i64),
-                other => Err(ErrorKind::TypeError {
+    /// `length`: the element count of the top string (characters) or list.
+    fn length(&mut self) -> Result<(), ErrorKind> {
+        let len = match self.pop()? {
+            Value::Str(s) => s.chars().count() as i64,
+            Value::List(items) => items.len() as i64,
+            other => {
+                return Err(ErrorKind::TypeError {
                     expected: "string or list",
                     found: other.type_name(),
-                }),
+                })
             }
         };
-        match result {
-            Ok(len) => {
-                self.stack[n - 1] = Value::Int(len);
-                Ok(self)
-            }
-            Err(kind) => self.fail(kind),
-        }
+        self.stack.push(Value::Int(len));
+        Ok(())
     }
 
     /// `to_str`: replace the top value with its string content (no quotes).
     /// Total — every value has a string form. (Named `stringify`, not `to_str`,
-    /// since it consumes `self` as an engine transform rather than borrowing.)
-    fn stringify(mut self) -> Outcome {
-        let n = self.stack.len();
-        if n < 1 {
-            return self.fail(ErrorKind::StackUnderflow);
-        }
-        let s = self.stack[n - 1].content_string();
-        self.stack[n - 1] = Value::Str(s);
-        Ok(self)
+    /// to avoid the `to_*`-should-borrow lint.)
+    fn stringify(&mut self) -> Result<(), ErrorKind> {
+        let s = self.pop()?.content_string();
+        self.stack.push(Value::Str(s));
+        Ok(())
     }
 
-    /// Run an indexed op with its level popped off the stack: check there is a
-    /// level, read it as an index, remove it, then delegate. This is the
-    /// stack-consuming (`n roll`) surface; the parameterized commands call the
-    /// `*_at` helpers directly.
-    fn indexed(mut self, op: impl FnOnce(Engine, usize) -> Outcome) -> Outcome {
-        let n = self.stack.len();
-        if n < 1 {
-            return self.fail(ErrorKind::StackUnderflow);
-        }
-        let level = match self.stack[n - 1].as_index() {
-            Ok(level) => level,
-            Err(kind) => return self.fail(kind),
-        };
-        self.stack.pop();
+    /// Run an indexed op with its level popped off the stack (`n rolln`).
+    fn indexed(
+        &mut self,
+        op: impl FnOnce(&mut Engine, usize) -> Result<(), ErrorKind>,
+    ) -> Result<(), ErrorKind> {
+        let level = self.pop()?.as_index()?;
         op(self, level)
     }
 
-    /// Copy the value at `level` to the top (`dup` = 1, `over` = 2, `pick`).
-    pub(crate) fn pick_at(mut self, level: usize) -> Outcome {
-        let Some(i) = self.index_of_level(level) else {
-            return self.fail(ErrorKind::StackUnderflow);
-        };
+    /// Copy the value at `level` to the top (`dup` = 1, `over` = 2, `pickn`).
+    pub(crate) fn pick_at(&mut self, level: usize) -> Result<(), ErrorKind> {
+        let i = self.index_of_level(level).ok_or(ErrorKind::StackUnderflow)?;
         let v = self.stack[i].clone();
         self.stack.push(v);
-        Ok(self)
+        Ok(())
     }
 
     /// Remove the value at `level` (`drop` = 1, `nip` = 2, `dropn`).
-    pub(crate) fn drop_at(mut self, level: usize) -> Outcome {
-        let Some(i) = self.index_of_level(level) else {
-            return self.fail(ErrorKind::StackUnderflow);
-        };
+    pub(crate) fn drop_at(&mut self, level: usize) -> Result<(), ErrorKind> {
+        let i = self.index_of_level(level).ok_or(ErrorKind::StackUnderflow)?;
         self.stack.remove(i);
-        Ok(self)
+        Ok(())
     }
 
-    /// Exchange the value at `level` with the one just below it (`level + 1`).
-    /// `swap` = 1, `swapn`.
-    pub(crate) fn swap_at(mut self, level: usize) -> Outcome {
-        let (Some(i), Some(j)) = (
-            self.index_of_level(level),
-            self.index_of_level(level + 1),
-        )
-        else {
-            return self.fail(ErrorKind::StackUnderflow);
-        };
+    /// Exchange the value at `level` with the one just below it. `swap` = 1.
+    pub(crate) fn swap_at(&mut self, level: usize) -> Result<(), ErrorKind> {
+        let i = self.index_of_level(level).ok_or(ErrorKind::StackUnderflow)?;
+        let j = self
+            .index_of_level(level + 1)
+            .ok_or(ErrorKind::StackUnderflow)?;
         self.stack.swap(i, j);
-        Ok(self)
+        Ok(())
     }
 
-    /// Move the value at `level` up to the top, shifting shallower values down.
-    /// `rot` = 3, `roll`.
-    pub(crate) fn roll_at(mut self, level: usize) -> Outcome {
-        let Some(i) = self.index_of_level(level) else {
-            return self.fail(ErrorKind::StackUnderflow);
-        };
+    /// Move the value at `level` up to the top. `rot` = 3, `rolln`.
+    pub(crate) fn roll_at(&mut self, level: usize) -> Result<(), ErrorKind> {
+        let i = self.index_of_level(level).ok_or(ErrorKind::StackUnderflow)?;
         let v = self.stack.remove(i);
         self.stack.push(v);
-        Ok(self)
+        Ok(())
     }
 
-    /// Move the top value down to `level`, shifting the intervening values up —
-    /// the inverse of `roll_at`. `unrot` = 3, `rolld`.
-    fn rolld_at(mut self, level: usize) -> Outcome {
-        let Some(dest) = self.index_of_level(level) else {
-            return self.fail(ErrorKind::StackUnderflow);
-        };
+    /// Move the top value down to `level` — the inverse of `roll_at`.
+    /// `unrot` = 3, `rolldn`.
+    fn rolld_at(&mut self, level: usize) -> Result<(), ErrorKind> {
+        let dest = self.index_of_level(level).ok_or(ErrorKind::StackUnderflow)?;
         // `dest` is where the top must land. Popping first leaves every index
         // ≤ dest unchanged (dest ≤ len - 1), so we can insert straight in.
         let v = self.stack.pop().expect("level ≥ 1 implies a non-empty stack");
         self.stack.insert(dest, v);
-        Ok(self)
+        Ok(())
     }
 
     /// `tuck` ( a b -- b a b ): insert a copy of the top below the second.
-    fn tuck(mut self) -> Outcome {
+    fn tuck(&mut self) -> Result<(), ErrorKind> {
         let n = self.stack.len();
         if n < 2 {
-            return self.fail(ErrorKind::StackUnderflow);
+            return Err(ErrorKind::StackUnderflow);
         }
         let top = self.stack[n - 1].clone();
         self.stack.insert(n - 2, top);
-        Ok(self)
+        Ok(())
     }
 
     /// `dupd` ( a b -- a a b ): duplicate the second element in place.
-    fn dupd(mut self) -> Outcome {
+    fn dupd(&mut self) -> Result<(), ErrorKind> {
         let n = self.stack.len();
         if n < 2 {
-            return self.fail(ErrorKind::StackUnderflow);
+            return Err(ErrorKind::StackUnderflow);
         }
         let second = self.stack[n - 2].clone();
         self.stack.insert(n - 1, second);
-        Ok(self)
+        Ok(())
     }
 
     /// `2dup` ( a b -- a b a b ): copy the top two, order preserved.
-    fn two_dup(mut self) -> Outcome {
+    fn two_dup(&mut self) -> Result<(), ErrorKind> {
         let n = self.stack.len();
         if n < 2 {
-            return self.fail(ErrorKind::StackUnderflow);
+            return Err(ErrorKind::StackUnderflow);
         }
         let a = self.stack[n - 2].clone();
         let b = self.stack[n - 1].clone();
         self.stack.push(a);
         self.stack.push(b);
-        Ok(self)
+        Ok(())
     }
 
     /// `2drop` ( a b -- ): drop the top two.
-    fn two_drop(mut self) -> Outcome {
+    fn two_drop(&mut self) -> Result<(), ErrorKind> {
         let n = self.stack.len();
         if n < 2 {
-            return self.fail(ErrorKind::StackUnderflow);
+            return Err(ErrorKind::StackUnderflow);
         }
         self.stack.truncate(n - 2);
-        Ok(self)
+        Ok(())
     }
 
     /// `]`: collect the values above the topmost mark into a `List`, consuming
@@ -1033,153 +943,85 @@ impl Engine {
     /// collected values are, by the region discipline, all non-marks — so the
     /// list never contains a mark. (When `{` arrives, this will also reject a
     /// mark of the wrong kind.)
-    fn close_list(mut self) -> Outcome {
-        let Some(mark) = self
+    fn close_list(&mut self) -> Result<(), ErrorKind> {
+        let mark = self
             .stack
             .iter()
             .rposition(|v| matches!(v, Value::Mark(_)))
-        else {
-            return self.fail(ErrorKind::UnmatchedClose);
-        };
+            .ok_or(ErrorKind::UnmatchedClose)?;
         let items: Vec<Value> = self.stack.drain(mark + 1..).collect();
         self.stack.pop(); // the mark, now on top
         self.stack.push(Value::List(items));
-        Ok(self)
+        Ok(())
     }
 
-    /// `first` ( [a b c] -- a ): the head of the top list. Empty list is out of
-    /// range.
-    fn first(mut self) -> Outcome {
-        let n = self.stack.len();
-        if n < 1 {
-            return self.fail(ErrorKind::StackUnderflow);
-        }
-        let result = match &self.stack[n - 1] {
-            Value::List(items) => items.first().cloned().ok_or(ErrorKind::IndexOutOfRange),
-            other => Err(ErrorKind::TypeError {
-                expected: "list",
-                found: other.type_name(),
-            }),
-        };
-        match result {
-            Ok(v) => {
-                self.stack[n - 1] = v;
-                Ok(self)
-            }
-            Err(kind) => self.fail(kind),
-        }
+    /// `first` ( [a b c] -- a ): the head of the top list; empty is out of range.
+    fn first(&mut self) -> Result<(), ErrorKind> {
+        let head = self
+            .pop_list()?
+            .into_iter()
+            .next()
+            .ok_or(ErrorKind::IndexOutOfRange)?;
+        self.stack.push(head);
+        Ok(())
     }
 
-    /// `rest` ( [a b c] -- [b c] ): the top list without its head. Empty list is
-    /// out of range.
-    fn rest(mut self) -> Outcome {
-        let n = self.stack.len();
-        if n < 1 {
-            return self.fail(ErrorKind::StackUnderflow);
+    /// `rest` ( [a b c] -- [b c] ): the top list without its head; empty is out
+    /// of range.
+    fn rest(&mut self) -> Result<(), ErrorKind> {
+        let mut items = self.pop_list()?;
+        if items.is_empty() {
+            return Err(ErrorKind::IndexOutOfRange);
         }
-        let result = match &self.stack[n - 1] {
-            Value::List(items) if items.is_empty() => Err(ErrorKind::IndexOutOfRange),
-            Value::List(items) => Ok(Value::List(items[1..].to_vec())),
-            other => Err(ErrorKind::TypeError {
-                expected: "list",
-                found: other.type_name(),
-            }),
-        };
-        match result {
-            Ok(v) => {
-                self.stack[n - 1] = v;
-                Ok(self)
-            }
-            Err(kind) => self.fail(kind),
-        }
+        items.remove(0);
+        self.stack.push(Value::List(items));
+        Ok(())
     }
 
     /// `cons` ( x [b c] -- [x b c] ): prepend the element below to the top list.
-    fn cons(mut self) -> Outcome {
-        let n = self.stack.len();
-        if n < 2 {
-            return self.fail(ErrorKind::StackUnderflow);
-        }
-        // The top must be a list; the element below can be anything.
-        if let Value::List(_) = self.stack[n - 1] {
-        } else {
-            let kind = ErrorKind::TypeError {
-                expected: "list",
-                found: self.stack[n - 1].type_name(),
-            };
-            return self.fail(kind);
-        }
-        let Value::List(mut items) = self.stack.pop().unwrap() else {
-            unreachable!()
-        };
-        let x = self.stack.pop().unwrap();
+    fn cons(&mut self) -> Result<(), ErrorKind> {
+        let mut items = self.pop_list()?;
+        let x = self.pop()?;
         items.insert(0, x);
         self.stack.push(Value::List(items));
-        Ok(self)
+        Ok(())
     }
 
     /// `append` ( [a b] [c d] -- [a b c d] ): concatenate two lists.
-    fn append(mut self) -> Outcome {
-        let n = self.stack.len();
-        if n < 2 {
-            return self.fail(ErrorKind::StackUnderflow);
-        }
-        let result = match (&self.stack[n - 2], &self.stack[n - 1]) {
-            (Value::List(_), Value::List(_)) => Ok(()),
-            (Value::List(_), other) | (other, _) => Err(ErrorKind::TypeError {
-                expected: "list",
-                found: other.type_name(),
-            }),
-        };
-        if let Err(kind) = result {
-            return self.fail(kind);
-        }
-        let Value::List(b) = self.stack.pop().unwrap() else {
-            unreachable!()
-        };
-        let Value::List(mut a) = self.stack.pop().unwrap() else {
-            unreachable!()
-        };
+    fn append(&mut self) -> Result<(), ErrorKind> {
+        let b = self.pop_list()?;
+        let mut a = self.pop_list()?;
         a.extend(b);
         self.stack.push(Value::List(a));
-        Ok(self)
+        Ok(())
     }
 
-    /// `nth` ( [a b c] i -- x ): the 0-based `i`th element of the list. List
-    /// indexing follows other-language convention (0-based), distinct from the
-    /// 1-based stack levels of `pick`/`roll`.
-    fn nth(mut self) -> Outcome {
-        let n = self.stack.len();
-        if n < 2 {
-            return self.fail(ErrorKind::StackUnderflow);
-        }
-        let idx = match &self.stack[n - 1] {
-            Value::Int(i) if *i >= 0 => Ok(*i as usize),
-            Value::Int(_) => Err(ErrorKind::IndexOutOfRange),
-            Value::Num(_) => Err(ErrorKind::TypeError {
-                expected: "integer",
-                found: "float",
-            }),
-            other => Err(ErrorKind::TypeError {
-                expected: "integer",
-                found: other.type_name(),
-            }),
-        };
-        let result = idx.and_then(|idx| match &self.stack[n - 2] {
-            Value::List(items) => items.get(idx).cloned().ok_or(ErrorKind::IndexOutOfRange),
-            other => Err(ErrorKind::TypeError {
-                expected: "list",
-                found: other.type_name(),
-            }),
-        });
-        match result {
-            Ok(v) => {
-                self.stack.truncate(n - 2);
-                self.stack.push(v);
-                Ok(self)
+    /// `nth` ( [a b c] i -- x ): the 0-based `i`th element. List indexing is
+    /// 0-based (other-language convention), unlike the 1-based `pickn`/`rolln`.
+    fn nth(&mut self) -> Result<(), ErrorKind> {
+        let idx = match self.pop()? {
+            Value::Int(i) if i >= 0 => i as usize,
+            Value::Int(_) => return Err(ErrorKind::IndexOutOfRange),
+            Value::Num(_) => {
+                return Err(ErrorKind::TypeError {
+                    expected: "integer",
+                    found: "float",
+                })
             }
-            Err(kind) => self.fail(kind),
-        }
+            other => {
+                return Err(ErrorKind::TypeError {
+                    expected: "integer",
+                    found: other.type_name(),
+                })
+            }
+        };
+        let item = self
+            .pop_list()?
+            .into_iter()
+            .nth(idx)
+            .ok_or(ErrorKind::IndexOutOfRange)?;
+        self.stack.push(item);
+        Ok(())
     }
 }
 
@@ -1285,10 +1127,20 @@ mod tests {
     }
 
     #[test]
-    fn a_type_error_leaves_the_stack_untouched() {
-        // The check runs before any mutation, so the operands are still there.
+    fn a_type_error_names_the_mismatch_and_the_command() {
+        // Ops no longer preserve their operands on error — atomicity is the
+        // caller's transaction (see `an_error_leaves_the_callers_engine_untouched`).
+        // The error still names the mismatch and which command failed.
         let err = Engine::new().apply(&parse("true 1 +").unwrap()).unwrap_err();
-        assert_eq!(err.engine.stack(), &[Value::Bool(true), Value::Int(1)]);
+        assert_eq!(
+            err.kind,
+            ErrorKind::TypeError {
+                expected: "number",
+                found: "bool"
+            }
+        );
+        let trace = err.trace.unwrap();
+        assert_eq!(trace.program[trace.index], Command::Add);
     }
 
     #[test]
@@ -1445,12 +1297,11 @@ mod tests {
     }
 
     #[test]
-    fn errors_carry_the_engine_at_the_point_of_failure() {
-        // The whole engine is attached for inspection; its stack is the state
-        // the failing command saw (operands still present, nothing partial).
+    fn errors_carry_the_trace_of_the_failing_command() {
+        // No engine is attached (atomicity is the caller's); the error carries
+        // the kind and a trace pointing at the command that failed.
         let err = Engine::new().apply(&parse("1 0 /").unwrap()).unwrap_err();
         assert_eq!(err.kind, ErrorKind::DivideByZero);
-        assert_eq!(err.engine.stack(), &[1.0, 0.0]);
         let trace = err.trace.unwrap();
         assert_eq!(trace.index, 2);
         assert_eq!(trace.program[trace.index], Command::Div);

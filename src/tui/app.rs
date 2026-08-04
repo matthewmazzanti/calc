@@ -5,7 +5,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::engine::{self, CalcError, Command, Engine, Outcome, Value};
+use crate::engine::{self, CalcError, Command, Engine, ErrorKind, Outcome, Value};
 use crate::history::History;
 
 /// Vim-style editing modes.
@@ -282,11 +282,11 @@ impl App {
             // never intercepted by collection mode — it always hits the stack.
             KeyCode::Char('x') | KeyCode::Char('d') => {
                 let level = self.cursor;
-                self.update(cursor_label("drop", "dropn", level), move |e| e.drop_at(level));
+                self.edit(cursor_label("drop", "dropn", level), move |e| e.drop_at(level));
             }
             KeyCode::Char('s') => {
                 let level = self.cursor;
-                self.update(cursor_label("swap", "swapn", level), move |e| e.swap_at(level));
+                self.edit(cursor_label("swap", "swapn", level), move |e| e.swap_at(level));
             }
             // Ctrl-R redoes (vim-style); a bare `r` rotates at the cursor.
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => self.redo(),
@@ -297,13 +297,13 @@ impl App {
                 } else {
                     format!("rolln {level}")
                 };
-                self.update(label, move |e| e.roll_at(level));
+                self.edit(label, move |e| e.roll_at(level));
             }
             KeyCode::Char('u') => self.undo(),
             // Copy the selected value to the top.
             KeyCode::Enter => {
                 let level = self.cursor;
-                self.update(cursor_label("dup", "pickn", level), move |e| e.pick_at(level));
+                self.edit(cursor_label("dup", "pickn", level), move |e| e.pick_at(level));
             }
             _ => {}
         }
@@ -444,6 +444,13 @@ impl App {
     /// state with the command for the info bar.
     fn run(&mut self, commands: &[Command]) {
         self.update(describe(commands), |e| e.apply(commands));
+    }
+
+    /// Apply an in-place engine op (the cursor stack edits) as one undo unit,
+    /// adapting the `&mut` op into the consuming transform `update` expects. A
+    /// bare `ErrorKind` becomes a trace-less `CalcError`.
+    fn edit(&mut self, cmd: String, f: impl FnOnce(&mut Engine) -> Result<(), ErrorKind>) {
+        self.update(cmd, |mut e| f(&mut e).map(|()| e).map_err(CalcError::from));
     }
 
     /// Run a transform on a copy of the current engine and adopt the result as
