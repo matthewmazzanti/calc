@@ -217,6 +217,8 @@ pub enum ErrorKind {
     /// A `]` with no open collection to close (or, later, one whose open mark is
     /// the wrong kind — a `]` closing a `{`).
     UnmatchedClose,
+    /// A list index (or `first`/`rest` on an empty list) fell outside the list.
+    IndexOutOfRange,
     /// An operation got a value of the wrong type — e.g. `+` on a bool. The
     /// failing word is named by the surrounding [`Trace`], so this only records
     /// the type mismatch itself.
@@ -234,6 +236,7 @@ impl std::fmt::Display for ErrorKind {
             ErrorKind::UnknownCommand(c) => write!(f, "unknown command: {c}"),
             ErrorKind::UnterminatedString => write!(f, "unterminated string"),
             ErrorKind::UnmatchedClose => write!(f, "unmatched ]"),
+            ErrorKind::IndexOutOfRange => write!(f, "index out of range"),
             ErrorKind::TypeError { expected, found } => {
                 write!(f, "expected {expected}, found {found}")
             }
@@ -310,6 +313,13 @@ pub enum Command {
     /// `]` — collect the values above the topmost mark into a `List`.
     CloseList,
 
+    // List operations.
+    First,  // [a b c] -- a
+    Rest,   // [a b c] -- [b c]
+    Cons,   // x [b c] -- [x b c]
+    Append, // [a b] [c d] -- [a b c d]
+    Nth,    // [a b c] n -- (the 0-based nth element)
+
     Clear,
 }
 
@@ -366,6 +376,11 @@ impl Command {
             // Lists — `[` and `]` are ordinary words (spaces required).
             "[" => Command::OpenList,
             "]" => Command::CloseList,
+            "first" => Command::First,
+            "rest" => Command::Rest,
+            "cons" => Command::Cons,
+            "append" => Command::Append,
+            "nth" => Command::Nth,
             "clear" => Command::Clear,
             other => return Err(ErrorKind::UnknownCommand(other.to_string())),
         })
@@ -421,6 +436,11 @@ impl std::fmt::Display for Command {
             Command::SwapAt(l) => write!(f, "swapn {l}"),
             Command::OpenList => write!(f, "["),
             Command::CloseList => write!(f, "]"),
+            Command::First => write!(f, "first"),
+            Command::Rest => write!(f, "rest"),
+            Command::Cons => write!(f, "cons"),
+            Command::Append => write!(f, "append"),
+            Command::Nth => write!(f, "nth"),
             Command::Clear => write!(f, "clear"),
         }
     }
@@ -651,6 +671,11 @@ impl Engine {
                 Ok(self)
             }
             Command::CloseList => self.close_list(),
+            Command::First => self.first(),
+            Command::Rest => self.rest(),
+            Command::Cons => self.cons(),
+            Command::Append => self.append(),
+            Command::Nth => self.nth(),
             Command::Clear => {
                 self.stack.clear();
                 Ok(self)
@@ -1043,6 +1068,141 @@ impl Engine {
         self.stack.pop(); // the mark, now on top
         self.stack.push(Value::List(items));
         Ok(self)
+    }
+
+    /// `first` ( [a b c] -- a ): the head of the top list. Empty list is out of
+    /// range.
+    fn first(mut self) -> Outcome {
+        let n = self.stack.len();
+        if n < 1 {
+            return self.fail(ErrorKind::StackUnderflow);
+        }
+        let result = match &self.stack[n - 1] {
+            Value::List(items) => items.first().cloned().ok_or(ErrorKind::IndexOutOfRange),
+            other => Err(ErrorKind::TypeError {
+                expected: "list",
+                found: other.type_name(),
+            }),
+        };
+        match result {
+            Ok(v) => {
+                self.stack[n - 1] = v;
+                Ok(self)
+            }
+            Err(kind) => self.fail(kind),
+        }
+    }
+
+    /// `rest` ( [a b c] -- [b c] ): the top list without its head. Empty list is
+    /// out of range.
+    fn rest(mut self) -> Outcome {
+        let n = self.stack.len();
+        if n < 1 {
+            return self.fail(ErrorKind::StackUnderflow);
+        }
+        let result = match &self.stack[n - 1] {
+            Value::List(items) if items.is_empty() => Err(ErrorKind::IndexOutOfRange),
+            Value::List(items) => Ok(Value::List(items[1..].to_vec())),
+            other => Err(ErrorKind::TypeError {
+                expected: "list",
+                found: other.type_name(),
+            }),
+        };
+        match result {
+            Ok(v) => {
+                self.stack[n - 1] = v;
+                Ok(self)
+            }
+            Err(kind) => self.fail(kind),
+        }
+    }
+
+    /// `cons` ( x [b c] -- [x b c] ): prepend the element below to the top list.
+    fn cons(mut self) -> Outcome {
+        let n = self.stack.len();
+        if n < 2 {
+            return self.fail(ErrorKind::StackUnderflow);
+        }
+        // The top must be a list; the element below can be anything.
+        if let Value::List(_) = self.stack[n - 1] {
+        } else {
+            let kind = ErrorKind::TypeError {
+                expected: "list",
+                found: self.stack[n - 1].type_name(),
+            };
+            return self.fail(kind);
+        }
+        let Value::List(mut items) = self.stack.pop().unwrap() else {
+            unreachable!()
+        };
+        let x = self.stack.pop().unwrap();
+        items.insert(0, x);
+        self.stack.push(Value::List(items));
+        Ok(self)
+    }
+
+    /// `append` ( [a b] [c d] -- [a b c d] ): concatenate two lists.
+    fn append(mut self) -> Outcome {
+        let n = self.stack.len();
+        if n < 2 {
+            return self.fail(ErrorKind::StackUnderflow);
+        }
+        let result = match (&self.stack[n - 2], &self.stack[n - 1]) {
+            (Value::List(_), Value::List(_)) => Ok(()),
+            (Value::List(_), other) | (other, _) => Err(ErrorKind::TypeError {
+                expected: "list",
+                found: other.type_name(),
+            }),
+        };
+        if let Err(kind) = result {
+            return self.fail(kind);
+        }
+        let Value::List(b) = self.stack.pop().unwrap() else {
+            unreachable!()
+        };
+        let Value::List(mut a) = self.stack.pop().unwrap() else {
+            unreachable!()
+        };
+        a.extend(b);
+        self.stack.push(Value::List(a));
+        Ok(self)
+    }
+
+    /// `nth` ( [a b c] i -- x ): the 0-based `i`th element of the list. List
+    /// indexing follows other-language convention (0-based), distinct from the
+    /// 1-based stack levels of `pick`/`roll`.
+    fn nth(mut self) -> Outcome {
+        let n = self.stack.len();
+        if n < 2 {
+            return self.fail(ErrorKind::StackUnderflow);
+        }
+        let idx = match &self.stack[n - 1] {
+            Value::Int(i) if *i >= 0 => Ok(*i as usize),
+            Value::Int(_) => Err(ErrorKind::IndexOutOfRange),
+            Value::Num(_) => Err(ErrorKind::TypeError {
+                expected: "integer",
+                found: "float",
+            }),
+            other => Err(ErrorKind::TypeError {
+                expected: "integer",
+                found: other.type_name(),
+            }),
+        };
+        let result = idx.and_then(|idx| match &self.stack[n - 2] {
+            Value::List(items) => items.get(idx).cloned().ok_or(ErrorKind::IndexOutOfRange),
+            other => Err(ErrorKind::TypeError {
+                expected: "list",
+                found: other.type_name(),
+            }),
+        });
+        match result {
+            Ok(v) => {
+                self.stack.truncate(n - 2);
+                self.stack.push(v);
+                Ok(self)
+            }
+            Err(kind) => self.fail(kind),
+        }
     }
 }
 
@@ -1692,5 +1852,84 @@ mod tests {
         );
         // A string element keeps its quotes inside a list.
         assert_eq!(list(&[Value::from("a")]).to_string(), r#"[ "a" ]"#);
+    }
+
+    // --- List operations ---
+
+    #[test]
+    fn first_and_rest_split_the_head() {
+        assert_eq!(run("[ 1 2 3 ] first").stack(), &[Value::Int(1)]);
+        assert_eq!(
+            run("[ 1 2 3 ] rest").stack(),
+            &[list(&[Value::Int(2), Value::Int(3)])]
+        );
+        // rest of a singleton is the empty list.
+        assert_eq!(run("[ 1 ] rest").stack(), &[list(&[])]);
+    }
+
+    #[test]
+    fn first_and_rest_reject_an_empty_list() {
+        assert_eq!(run_err("[ ] first"), ErrorKind::IndexOutOfRange);
+        assert_eq!(run_err("[ ] rest"), ErrorKind::IndexOutOfRange);
+    }
+
+    #[test]
+    fn cons_prepends_an_element() {
+        assert_eq!(
+            run("1 [ 2 3 ] cons").stack(),
+            &[list(&[Value::Int(1), Value::Int(2), Value::Int(3)])]
+        );
+        // Any value conses, onto the empty list too.
+        assert_eq!(
+            run(r#""x" [ ] cons"#).stack(),
+            &[list(&[Value::from("x")])]
+        );
+    }
+
+    #[test]
+    fn append_concatenates_two_lists() {
+        assert_eq!(
+            run("[ 1 2 ] [ 3 4 ] append").stack(),
+            &[list(&[Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)])]
+        );
+        assert_eq!(run("[ ] [ ] append").stack(), &[list(&[])]);
+    }
+
+    #[test]
+    fn nth_indexes_zero_based() {
+        assert_eq!(run("[ 10 20 30 ] 0 nth").stack(), &[Value::Int(10)]);
+        assert_eq!(run("[ 10 20 30 ] 2 nth").stack(), &[Value::Int(30)]);
+        assert_eq!(run_err("[ 10 20 30 ] 3 nth"), ErrorKind::IndexOutOfRange);
+        // A negative index is out of range, not wrapped.
+        assert_eq!(run_err("[ 10 20 ] -1 nth"), ErrorKind::IndexOutOfRange);
+    }
+
+    #[test]
+    fn list_ops_reject_non_lists() {
+        assert_eq!(
+            run_err("1 first"),
+            ErrorKind::TypeError {
+                expected: "list",
+                found: "number"
+            }
+        );
+        assert_eq!(
+            run_err("1 2 append"),
+            ErrorKind::TypeError {
+                expected: "list",
+                found: "number"
+            }
+        );
+    }
+
+    #[test]
+    fn list_ops_compose() {
+        // cons then first round-trips the head.
+        assert_eq!(run("9 [ 1 2 ] cons first").stack(), &[Value::Int(9)]);
+        // build up with append, read back with nth.
+        assert_eq!(
+            run("[ 1 ] [ 2 3 ] append 1 nth").stack(),
+            &[Value::Int(2)]
+        );
     }
 }
