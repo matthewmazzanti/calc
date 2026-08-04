@@ -279,14 +279,14 @@ impl App {
 
             // Cursor-relative stack edits, expressed as level-parameterized
             // commands that update the live engine.
-            KeyCode::Char('x') | KeyCode::Char('d') => self.run(&[Command::Drop(self.cursor)]),
-            KeyCode::Char('s') => self.run(&[Command::Swap(self.cursor)]),
+            KeyCode::Char('x') | KeyCode::Char('d') => self.run(&[Command::DropAt(self.cursor)]),
+            KeyCode::Char('s') => self.run(&[Command::SwapAt(self.cursor)]),
             // Ctrl-R redoes (vim-style); a bare `r` rotates at the cursor.
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => self.redo(),
-            KeyCode::Char('r') => self.run(&[Command::Roll(self.cursor)]),
+            KeyCode::Char('r') => self.run(&[Command::RollAt(self.cursor)]),
             KeyCode::Char('u') => self.undo(),
-            // Duplicate the selected value to the top.
-            KeyCode::Enter => self.run(&[Command::Dup(self.cursor)]),
+            // Copy the selected value to the top.
+            KeyCode::Enter => self.run(&[Command::PickAt(self.cursor)]),
             _ => {}
         }
     }
@@ -304,7 +304,7 @@ impl App {
             // once). With an empty buffer it duplicates the top of stack.
             KeyCode::Enter => {
                 if self.input.text().trim().is_empty() {
-                    self.run(&[Command::Dup(1)]);
+                    self.run(&[Command::Dup]);
                 } else {
                     self.commit_input();
                 }
