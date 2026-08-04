@@ -44,7 +44,7 @@ machinery, then behavior:
 | **M1** | Round out the stack vocabulary (§9.1); `as_index` for level-from-stack | **done** |
 | **M2** | Lists: `[ ]` **mark discipline** — first consumer of marks | **done** |
 | **M3a** | Immutable values via `Rc` + copy-on-write | **done** |
-| **M3b** | A flat environment: `'x` names, `set`/`get`, bare-word lookup, builtins as a prelude | **done** |
+| **M3b** | Environment: `'x` names, `set`/`get`, bare-word lookup, builtins as a shared first-class prelude frame | **done** |
 | **M3c** | Functions, frame chain, closures, `call`, `&`, bare-word application | after M3b |
 | **M4+** | Vocabulary: combinators, `if`/`each`/`map`, unquote — mostly in-language | todo |
 
@@ -75,12 +75,42 @@ frame ever becomes a first-class value (§9.5 objects), decide whether it's the
 mutable exception or also persistent.
 
 Bare-word resolution landed in M3b: every non-number, non-`'name` token parses
-to a `Command::Word`, resolved at runtime — a user binding (which shadows),
-else a builtin from the prelude (`Command::builtin`), else `UnboundName`. So
-`parse` no longer fails on unknown words (a typo is a runtime unbound name),
-and the builtin vocabulary is one definition reached uniformly through lookup.
-For a value binding, "applying" the word is a push; **function** bindings that
-*run* on lookup wait for M3c. Still deferred: the frame chain / closures, `&`,
-and a persistent-map (HAMT) environment for cheap snapshots (§8). `Rc`
-refcounts leak cycles, which closures-over-frames can form — the GC problem
-§10 already earmarks, separate from value COW.
+to an `Element::Word`, resolved at runtime. So `parse` no longer fails on
+unknown words (a typo is a runtime unbound name).
+
+**Program vs. primitive split** (commit `cc96938`). A program is a flat
+`Vec<Element>`, where an `Element` is a `Literal(Value)` or a `Word` — the
+only two things a program contains (§12). The primitive ops are a separate
+`Builtin` enum, reached *only* by resolving a word, never present in a program.
+The TUI's operator keys call `run_builtin` directly rather than emitting a word,
+so `+` always means addition regardless of any user rebinding — matching how the
+cursor ops already hit the engine. Consequence: an operator's own error is now
+trace-less (the pending entry still traces).
+
+**Default env — shared root frame + first-class builtins.** The environment is
+two frames: a mutable `top: Frame` of user `set` bindings over a shared,
+immutable `base: Rc<Frame>` — the prelude, every builtin bound under its word
+as a first-class `Value::Builtin`. Resolution walks `top → base`, then
+*applies* the found value: a callable (a builtin, later a function) runs, any
+other value is pushed. That "run-if-callable, else push" rule is the bare-word
+application semantics, arriving early. `get` reaches the prelude too and
+*pushes* the value (so `'+ get` captures the op as a value), the reflective
+inverse of bare-word application. Why this shape:
+
+- **Uniform lookup, first-class words.** One resolution path, and a word can be
+  captured/passed, not just applied — this is what combinators (`map`, `each`)
+  will need. It also fixed the old asymmetry where `dup` ran but `'dup get`
+  failed.
+- **Sharing.** `base` is `Rc`-shared, so a per-keystroke snapshot clone is one
+  refcount bump, not a 40-entry copy. `Engine`'s `PartialEq` is hand-written
+  over `stack + top` only — `base` is invariant, so the change-check never
+  deep-compares the prelude.
+- **The frame chain, at depth 2.** `top` over `base` *is* the chain M3c needs;
+  functions just add frames. Names are single-sourced through `Display` +
+  `Builtin::ALL` (the `from_name` match is gone).
+
+The base frame is the root of that chain. Still deferred to M3c+: functions /
+closures / `call` / `&`, the multi-frame chain, and a persistent-map (HAMT)
+environment for cheap snapshots (§8). `Rc` refcounts leak cycles, which
+closures-over-frames can form — the GC problem §10 already earmarks, separate
+from value COW.

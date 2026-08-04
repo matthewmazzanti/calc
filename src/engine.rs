@@ -54,6 +54,11 @@ pub enum Value {
     /// but the shuffles move and copy it like any other stack item — a collection
     /// is a manipulable region, not a sealed scope (see `language.md` §13).
     Mark(MarkKind),
+    /// A captured primitive op — a first-class word. A *bare* word runs its op;
+    /// `'name get` instead pushes it here, so a builtin can be stored, passed,
+    /// and later applied. `Builtin` is `Copy`, so this stays cheap. Functions
+    /// (`{ … }`) will join it as the other callable value.
+    Builtin(Builtin),
 }
 
 impl Value {
@@ -67,6 +72,7 @@ impl Value {
             Value::Str(_) => "string",
             Value::List(_) => "list",
             Value::Name(_) => "name",
+            Value::Builtin(_) => "builtin",
             // The open-collection sentinel isn't a first-class value: the value
             // words reject it, naming it as an "open list" in the error.
             Value::Mark(MarkKind::List) => "open list",
@@ -155,6 +161,9 @@ impl std::fmt::Display for Value {
             // look-alike number/string are indistinguishable on the stack, and
             // this form is also re-parseable. (A deliberate departure from §3.)
             Value::Name(n) => write!(f, "'{n}"),
+            // A captured op shows as its word — a display choice to revisit
+            // when functions get their own rendering.
+            Value::Builtin(b) => write!(f, "{b}"),
             // A lone, still-open mark — shown so an unclosed `[` is visible on
             // the stack. Distinct from the empty list's `[ ]`.
             Value::Mark(MarkKind::List) => write!(f, "["),
@@ -366,56 +375,54 @@ impl Element {
 }
 
 impl Builtin {
-    /// The core-op prelude: the fixed words of the global scope. Resolving a
-    /// bare word falls here when it isn't a user binding, yielding the op the
-    /// word names. One definition of the builtin vocabulary, reached uniformly
-    /// through word lookup.
-    fn from_name(name: &str) -> Option<Builtin> {
-        Some(match name {
-            "+" => Builtin::Add,
-            "-" => Builtin::Sub,
-            "*" => Builtin::Mul,
-            "/" => Builtin::Div,
-            "neg" => Builtin::Neg,
-            "=" => Builtin::Eq,
-            "<" => Builtin::Lt,
-            ">" => Builtin::Gt,
-            "<=" => Builtin::Le,
-            ">=" => Builtin::Ge,
-            "not" => Builtin::Not,
-            "and" => Builtin::And,
-            "or" => Builtin::Or,
-            "length" => Builtin::Length,
-            "to_str" => Builtin::ToStr,
-            "dup" => Builtin::Dup,
-            "drop" => Builtin::Drop,
-            "swap" => Builtin::Swap,
-            "over" => Builtin::Over,
-            "rot" => Builtin::Rot,
-            "unrot" => Builtin::Unrot,
-            "nip" => Builtin::Nip,
-            "tuck" => Builtin::Tuck,
-            "dupd" => Builtin::Dupd,
-            "2dup" => Builtin::TwoDup,
-            "2drop" => Builtin::TwoDrop,
-            "pickn" => Builtin::PickN,
-            "rolln" => Builtin::RollN,
-            "rolldn" => Builtin::RolldN,
-            "dropn" => Builtin::DropN,
-            "swapn" => Builtin::SwapN,
-            "[" => Builtin::OpenList,
-            "]" => Builtin::CloseList,
-            "first" => Builtin::First,
-            "rest" => Builtin::Rest,
-            "cons" => Builtin::Cons,
-            "append" => Builtin::Append,
-            "nth" => Builtin::Nth,
-            "set" => Builtin::Set,
-            "get" => Builtin::Get,
-            "clear" => Builtin::Clear,
-            _ => return None,
-        })
-    }
+    /// Every builtin, in declaration order — the single enumeration of the
+    /// vocabulary, used to build the prelude frame ([`prelude`]). `run_builtin`
+    /// and [`Display`](std::fmt::Display) are exhaustiveness-checked, so a new
+    /// variant makes them fail to compile; *this* list is not, so keep it
+    /// complete (the `every_builtin_is_in_the_prelude` test guards it).
+    const ALL: &'static [Builtin] = &[
+        Builtin::Add,
+        Builtin::Sub,
+        Builtin::Mul,
+        Builtin::Div,
+        Builtin::Neg,
+        Builtin::Eq,
+        Builtin::Lt,
+        Builtin::Gt,
+        Builtin::Le,
+        Builtin::Ge,
+        Builtin::Not,
+        Builtin::And,
+        Builtin::Or,
+        Builtin::Length,
+        Builtin::ToStr,
+        Builtin::Dup,
+        Builtin::Drop,
+        Builtin::Swap,
+        Builtin::Over,
+        Builtin::Rot,
+        Builtin::Unrot,
+        Builtin::Nip,
+        Builtin::Tuck,
+        Builtin::Dupd,
+        Builtin::TwoDup,
+        Builtin::TwoDrop,
+        Builtin::PickN,
+        Builtin::RollN,
+        Builtin::RolldN,
+        Builtin::DropN,
+        Builtin::SwapN,
+        Builtin::OpenList,
+        Builtin::CloseList,
+        Builtin::First,
+        Builtin::Rest,
+        Builtin::Cons,
+        Builtin::Append,
+        Builtin::Nth,
+        Builtin::Set,
+        Builtin::Get,
+        Builtin::Clear,
+    ];
 }
 
 impl std::fmt::Display for Element {
@@ -600,12 +607,53 @@ pub type Outcome = Result<Engine, CalcError>;
 /// [`Engine::apply`] consumes `self` and threads it through the batch;
 /// individual ops take `&mut self` and mutate in place. The caller keeps its own
 /// copy for undo and commits the result only on `Ok` — see the `history` module.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Engine {
     stack: Stack,
-    /// The environment: names to bound values. A single flat frame for now (the
-    /// REPL/module scope); the frame chain arrives with functions.
-    env: std::collections::HashMap<Rc<str>, Value>,
+    /// User bindings — the mutable top frame, grown by `set` and cloned per
+    /// snapshot. A lookup falls through to `base`. A single flat frame for now
+    /// (the REPL/module scope); the frame *chain* arrives with functions.
+    top: Frame,
+    /// The prelude: the builtin vocabulary as first-class [`Value::Builtin`]s.
+    /// Shared and immutable, so a clone is one refcount bump rather than a copy
+    /// of the whole map — and it never enters equality (see [`PartialEq`]).
+    base: Rc<Frame>,
+}
+
+/// A single environment frame: names bound to values.
+type Frame = std::collections::HashMap<Rc<str>, Value>;
+
+/// Build the prelude frame — every builtin as a first-class [`Value::Builtin`]
+/// under its canonical word (from [`Display`](std::fmt::Display), the single
+/// source of names). Each engine holds this behind an `Rc`, so snapshots share
+/// one immutable copy.
+fn prelude() -> Rc<Frame> {
+    Rc::new(
+        Builtin::ALL
+            .iter()
+            .map(|&b| (Rc::from(b.to_string()), Value::Builtin(b)))
+            .collect(),
+    )
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        Self {
+            stack: Stack::new(),
+            top: Frame::new(),
+            base: prelude(),
+        }
+    }
+}
+
+/// Two engines are equal when their stacks and user bindings match. The prelude
+/// (`base`) is invariant — every engine shares the same immutable vocabulary —
+/// so excluding it keeps the per-keystroke change check (in `update`) off the
+/// prelude map entirely.
+impl PartialEq for Engine {
+    fn eq(&self, other: &Self) -> bool {
+        self.stack == other.stack && self.top == other.top
+    }
 }
 
 impl Engine {
@@ -1101,34 +1149,49 @@ impl Engine {
     /// For a plain value this "application" is just a push — a value is a
     /// nullary function (§1); once functions land, a function binding runs.
     fn resolve_word(&mut self, name: &Rc<str>) -> Result<(), ErrorKind> {
-        if let Some(value) = self.env.get(name).cloned() {
-            self.stack.push(value);
-            Ok(())
-        } else if let Some(builtin) = Builtin::from_name(name) {
-            self.run_builtin(builtin)
-        } else {
-            Err(ErrorKind::UnboundName(name.to_string()))
+        match self.lookup(name) {
+            Some(value) => self.apply_value(value),
+            None => Err(ErrorKind::UnboundName(name.to_string())),
         }
     }
 
-    /// `set` ( value name -- ): bind `name` to `value` in the environment,
-    /// shadowing any prior binding. The name is on top (`3 'x set`).
+    /// Look up a name — the user frame shadows the prelude. Returns a clone (an
+    /// `Rc` bump for heap values), leaving the binding in place.
+    fn lookup(&self, name: &str) -> Option<Value> {
+        self.top.get(name).or_else(|| self.base.get(name)).cloned()
+    }
+
+    /// Apply a looked-up value: a callable (a builtin, later a function) runs;
+    /// anything else is data and is pushed. This is what makes a bare word *do*
+    /// its op while a word bound to a number just lands it on the stack.
+    fn apply_value(&mut self, value: Value) -> Result<(), ErrorKind> {
+        match value {
+            Value::Builtin(builtin) => self.run_builtin(builtin),
+            data => {
+                self.stack.push(data);
+                Ok(())
+            }
+        }
+    }
+
+    /// `set` ( value name -- ): bind `name` to `value` in the user frame,
+    /// shadowing any prior binding (including a prelude builtin). The name is on
+    /// top (`3 'x set`). Never touches the shared prelude.
     fn set(&mut self) -> Result<(), ErrorKind> {
         let name = self.pop_name()?;
         let value = self.pop()?;
-        self.env.insert(name, value);
+        self.top.insert(name, value);
         Ok(())
     }
 
-    /// `get` ( name -- value ): push the value bound to `name`, or fail with
-    /// `UnboundName`. The value is cloned out (an `Rc` bump), leaving the
-    /// binding in place; a later mutation copies-on-write.
+    /// `get` ( name -- value ): push the value bound to `name` — a user binding
+    /// or a prelude builtin (so `'+ get` captures the op) — or fail with
+    /// `UnboundName`. The value is *pushed*, not run: this is the capture that
+    /// mirrors bare-word application. A later mutation copies-on-write.
     fn get(&mut self) -> Result<(), ErrorKind> {
         let name = self.pop_name()?;
         let value = self
-            .env
-            .get(&name)
-            .cloned()
+            .lookup(&name)
             .ok_or_else(|| ErrorKind::UnboundName(name.to_string()))?;
         self.stack.push(value);
         Ok(())
@@ -1938,8 +2001,31 @@ mod tests {
 
     #[test]
     fn builtins_are_reached_by_the_same_lookup() {
-        // `+` is just a word resolved to its prelude op — no special parse case.
-        assert_eq!(Builtin::from_name("+"), Some(Builtin::Add));
-        assert_eq!(Builtin::from_name("nope"), None);
+        // `+` is a word resolved to a prelude binding — no special parse case;
+        // `get` reaches it through the same lookup as any user binding.
+        assert_eq!(run("'+ get").stack(), &[Value::Builtin(Builtin::Add)]);
+        assert_eq!(run_err("nope"), ErrorKind::UnboundName("nope".to_string()));
+    }
+
+    #[test]
+    fn a_captured_builtin_runs_when_applied() {
+        // `get` captures the op as a value; binding it to a name and applying
+        // that name runs it — first-class words end to end.
+        assert_eq!(run("3 4 '+ get 'plus set plus").stack(), &[7.0]);
+    }
+
+    #[test]
+    fn every_builtin_is_in_the_prelude() {
+        // `Builtin::ALL` isn't exhaustiveness-checked; this guards that the
+        // prelude binds every op under its canonical word.
+        let base = prelude();
+        for &b in Builtin::ALL {
+            let name = b.to_string();
+            assert_eq!(
+                base.get(name.as_str()),
+                Some(&Value::Builtin(b)),
+                "prelude missing `{name}`",
+            );
+        }
     }
 }
