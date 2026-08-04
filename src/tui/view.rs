@@ -60,7 +60,7 @@ fn stack_lines(app: &App) -> Vec<Line<'static>> {
     }
     (1..=depth.min(MAX_STACK_ROWS as usize))
         .map(|level| {
-            let value = app.stack()[depth - level];
+            let value = &app.stack()[depth - level];
             let label = format!("{level:>3}: ");
             if app.mode() == Mode::Normal && level == app.cursor() {
                 Line::from(format!("{label}{value}")).reversed()

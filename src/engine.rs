@@ -14,7 +14,7 @@
 /// A value on the stack. Started as a bare `f64`; now a small sum type so the
 /// stack can hold more than numbers. Grows further later (strings, lists,
 /// functions). Kept `Copy` while every variant is — strings will end that.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     /// An integer. Preserved through `+ - *` and `neg` when both operands are
     /// integers; any float operand (or overflow) promotes to [`Value::Num`].
@@ -25,6 +25,10 @@ pub enum Value {
     /// A boolean — a genuine type, not Forth's 0/-1. Produced by comparisons
     /// and the boolean words, and (later) consumed by `if`.
     Bool(bool),
+    /// A string. Owns its bytes, so `Value` is no longer `Copy` — the stack ops
+    /// clone or move rather than copy. Built by the tokenizer's `"…"` literals
+    /// and by `to_str`; concatenated with `+`.
+    Str(String),
 }
 
 impl Value {
@@ -35,16 +39,17 @@ impl Value {
         match self {
             Value::Int(_) | Value::Num(_) => "number",
             Value::Bool(_) => "bool",
+            Value::Str(_) => "string",
         }
     }
 
     /// Widen to `f64`, or a [`ErrorKind::TypeError`] naming what was found.
     /// Comparisons, division, and mixed arithmetic funnel operands through this,
     /// so an `Int` is accepted wherever a number is wanted.
-    fn as_num(self) -> Result<f64, ErrorKind> {
+    fn as_num(&self) -> Result<f64, ErrorKind> {
         match self {
-            Value::Int(i) => Ok(i as f64),
-            Value::Num(n) => Ok(n),
+            Value::Int(i) => Ok(*i as f64),
+            Value::Num(n) => Ok(*n),
             other => Err(ErrorKind::TypeError {
                 expected: "number",
                 found: other.type_name(),
@@ -54,13 +59,35 @@ impl Value {
 
     /// Extract a boolean, or a [`ErrorKind::TypeError`]. The boolean words
     /// (`not`/`and`/`or`) funnel their operands through this.
-    fn as_bool(self) -> Result<bool, ErrorKind> {
+    fn as_bool(&self) -> Result<bool, ErrorKind> {
         match self {
-            Value::Bool(b) => Ok(b),
+            Value::Bool(b) => Ok(*b),
             other => Err(ErrorKind::TypeError {
                 expected: "bool",
                 found: other.type_name(),
             }),
+        }
+    }
+
+    /// Borrow the string content, or a [`ErrorKind::TypeError`]. `length` funnels
+    /// its operand through this.
+    fn as_str(&self) -> Result<&str, ErrorKind> {
+        match self {
+            Value::Str(s) => Ok(s),
+            other => Err(ErrorKind::TypeError {
+                expected: "string",
+                found: other.type_name(),
+            }),
+        }
+    }
+
+    /// The plain content string, no quotes — what `to_str` produces. For a
+    /// `Str` that's the content itself; for anything else it's the `Display`
+    /// form, so `3 to_str` is `"3"` and `true to_str` is `"true"`.
+    fn content_string(&self) -> String {
+        match self {
+            Value::Str(s) => s.clone(),
+            other => other.to_string(),
         }
     }
 }
@@ -71,6 +98,10 @@ impl std::fmt::Display for Value {
             Value::Int(i) => write!(f, "{i}"),
             Value::Num(n) => write!(f, "{n}"),
             Value::Bool(b) => write!(f, "{b}"),
+            // Quoted (and escaped) so a string is visibly distinct from a
+            // number on the stack, and so a `Push` renders re-parseably in a
+            // trace. `to_str` uses `content_string` for the unquoted form.
+            Value::Str(s) => write!(f, "{s:?}"),
         }
     }
 }
@@ -84,6 +115,18 @@ impl From<i64> for Value {
 impl From<f64> for Value {
     fn from(n: f64) -> Self {
         Value::Num(n)
+    }
+}
+
+impl From<String> for Value {
+    fn from(s: String) -> Self {
+        Value::Str(s)
+    }
+}
+
+impl From<&str> for Value {
+    fn from(s: &str) -> Self {
+        Value::Str(s.to_string())
     }
 }
 
@@ -101,7 +144,7 @@ impl PartialEq<f64> for Value {
         match self {
             Value::Int(i) => (*i as f64) == *other,
             Value::Num(n) => n == other,
-            Value::Bool(_) => false,
+            Value::Bool(_) | Value::Str(_) => false,
         }
     }
 }
@@ -128,6 +171,8 @@ pub enum ErrorKind {
     DivideByZero,
     /// A token that was neither a number nor a known command.
     UnknownCommand(String),
+    /// A `"` string literal ran to end-of-input without a closing `"`.
+    UnterminatedString,
     /// An operation got a value of the wrong type — e.g. `+` on a bool. The
     /// failing word is named by the surrounding [`Trace`], so this only records
     /// the type mismatch itself.
@@ -143,6 +188,7 @@ impl std::fmt::Display for ErrorKind {
             ErrorKind::StackUnderflow => write!(f, "too few arguments"),
             ErrorKind::DivideByZero => write!(f, "divide by zero"),
             ErrorKind::UnknownCommand(c) => write!(f, "unknown command: {c}"),
+            ErrorKind::UnterminatedString => write!(f, "unterminated string"),
             ErrorKind::TypeError { expected, found } => {
                 write!(f, "expected {expected}, found {found}")
             }
@@ -153,7 +199,7 @@ impl std::fmt::Display for ErrorKind {
 /// A single parsed instruction. Parsing turns text into these; evaluation
 /// consumes them. `Push` carries its literal, so the whole program is a flat
 /// stream of `Command`s — no AST, because RPN has no nesting.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Push(Value),
     Add,
@@ -173,6 +219,10 @@ pub enum Command {
     Not,
     And,
     Or,
+    /// The character count of a string, pushed as an `Int`.
+    Length,
+    /// Convert the top value to its string content (no quotes).
+    ToStr,
     /// Push a copy of the value at the given 1-based level (level 1 == top of
     /// stack) onto the top.
     Dup(usize),
@@ -217,6 +267,8 @@ impl Command {
             "not" => Command::Not,
             "and" => Command::And,
             "or" => Command::Or,
+            "length" => Command::Length,
+            "to_str" => Command::ToStr,
             "dup" => Command::Dup(1),
             // The text commands are the fixed-level cases of the parameterized
             // stack ops: drop the top, swap the top two, roll the top three.
@@ -248,6 +300,8 @@ impl std::fmt::Display for Command {
             Command::Not => write!(f, "not"),
             Command::And => write!(f, "and"),
             Command::Or => write!(f, "or"),
+            Command::Length => write!(f, "length"),
+            Command::ToStr => write!(f, "to_str"),
             Command::Dup(1) => write!(f, "dup"),
             Command::Dup(l) => write!(f, "dup {l}"),
             Command::Drop(1) => write!(f, "drop"),
@@ -262,12 +316,65 @@ impl std::fmt::Display for Command {
     }
 }
 
-/// Parse a whitespace-separated line into a program, failing on the first
-/// unknown token (its text is carried in the [`ErrorKind`]). Parsing is a
+/// Parse a line into a program, failing on the first unknown token (its text is
+/// carried in the [`ErrorKind`]) or an unterminated string. Parsing is a
 /// frontend concern — the engine itself only runs programs, via
 /// [`Engine::apply`].
+///
+/// Mostly a whitespace split, but with the §4 lookahead: a `"` opens a string
+/// literal that runs (across spaces) to its closing `"`, so strings are the one
+/// thing [`Command::parse`] never sees — the tokenizer owns them. Every other
+/// token is handed to [`Command::parse`] word-for-word.
 pub fn parse(input: &str) -> Result<Vec<Command>, ErrorKind> {
-    input.split_whitespace().map(Command::parse).collect()
+    let mut commands = Vec::new();
+    let mut chars = input.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+        } else if c == '"' {
+            commands.push(Command::Push(Value::Str(read_string(&mut chars)?)));
+        } else {
+            // A plain word: everything up to the next whitespace.
+            let mut word = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_whitespace() {
+                    break;
+                }
+                word.push(c);
+                chars.next();
+            }
+            commands.push(Command::parse(&word)?);
+        }
+    }
+    Ok(commands)
+}
+
+/// Read a `"…"` literal, the opening quote still unconsumed. Supports the
+/// escapes `\"`, `\\`, `\n`, `\t`; an unknown escape keeps both characters
+/// verbatim. Fails with [`ErrorKind::UnterminatedString`] at end-of-input.
+fn read_string(
+    chars: &mut std::iter::Peekable<std::str::Chars>,
+) -> Result<String, ErrorKind> {
+    chars.next(); // opening quote
+    let mut s = String::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Ok(s),
+            '\\' => match chars.next() {
+                Some('"') => s.push('"'),
+                Some('\\') => s.push('\\'),
+                Some('n') => s.push('\n'),
+                Some('t') => s.push('\t'),
+                Some(other) => {
+                    s.push('\\');
+                    s.push(other);
+                }
+                None => return Err(ErrorKind::UnterminatedString),
+            },
+            _ => s.push(c),
+        }
+    }
+    Err(ErrorKind::UnterminatedString)
 }
 
 /// The command sequence that was executing when an error struck, and the index
@@ -362,7 +469,7 @@ impl Engine {
         program
             .iter()
             .enumerate()
-            .try_fold(self, |engine, (index, &command)| {
+            .try_fold(self, |engine, (index, command)| {
                 engine.apply_one(command).map_err(|mut e| {
                     e.trace = Some(Trace {
                         program: program.to_vec(),
@@ -374,14 +481,17 @@ impl Engine {
     }
 
     /// Apply a single command, consuming `self` and returning the new engine.
-    /// A total match, so a new command variant is a compile error until handled.
-    fn apply_one(mut self, cmd: Command) -> Outcome {
+    /// Borrows the command (it is no longer `Copy`, and the caller still needs
+    /// the program for the trace). A total match, so a new command variant is a
+    /// compile error until handled.
+    fn apply_one(mut self, cmd: &Command) -> Outcome {
         match cmd {
-            Command::Push(n) => {
-                self.stack.push(n);
+            Command::Push(value) => {
+                self.stack.push(value.clone());
                 Ok(self)
             }
-            Command::Add => self.arith(i64::checked_add, |a, b| a + b),
+            // `+` concatenates two strings, else adds numbers.
+            Command::Add => self.add(),
             Command::Sub => self.arith(i64::checked_sub, |a, b| a - b),
             Command::Mul => self.arith(i64::checked_mul, |a, b| a * b),
             // Division always yields a float — `1 2 /` is `0.5`, not `0`.
@@ -401,12 +511,14 @@ impl Engine {
             Command::Not => self.bool_unary(|a| !a),
             Command::And => self.bool_binary(|a, b| a && b),
             Command::Or => self.bool_binary(|a, b| a || b),
-            Command::Dup(level) => self.dup(level),
-            Command::Drop(level) => self.drop_at(level),
-            Command::Swap(level) => self.swap(level),
+            Command::Length => self.length(),
+            Command::ToStr => self.stringify(),
+            Command::Dup(level) => self.dup(*level),
+            Command::Drop(level) => self.drop_at(*level),
+            Command::Swap(level) => self.swap(*level),
             // `over` copies the second-from-top value to the top.
             Command::Over => self.dup(2),
-            Command::Roll(level) => self.roll(level),
+            Command::Roll(level) => self.roll(*level),
             Command::Clear => {
                 self.stack.clear();
                 Ok(self)
@@ -474,10 +586,10 @@ impl Engine {
         let result = if n < 2 {
             Err(ErrorKind::StackUnderflow)
         } else {
-            match (self.stack[n - 2], self.stack[n - 1]) {
-                (Value::Int(a), Value::Int(b)) => Ok(checked(a, b)
+            match (&self.stack[n - 2], &self.stack[n - 1]) {
+                (Value::Int(a), Value::Int(b)) => Ok(checked(*a, *b)
                     .map(Value::Int)
-                    .unwrap_or_else(|| Value::Num(float(a as f64, b as f64)))),
+                    .unwrap_or_else(|| Value::Num(float(*a as f64, *b as f64)))),
                 (a, b) => a
                     .as_num()
                     .and_then(|a| b.as_num().map(|b| Value::Num(float(a, b)))),
@@ -500,12 +612,12 @@ impl Engine {
         let result = if n < 1 {
             Err(ErrorKind::StackUnderflow)
         } else {
-            match self.stack[n - 1] {
+            match &self.stack[n - 1] {
                 Value::Int(i) => Ok(i
                     .checked_neg()
                     .map(Value::Int)
-                    .unwrap_or_else(|| Value::Num(-(i as f64)))),
-                Value::Num(x) => Ok(Value::Num(-x)),
+                    .unwrap_or_else(|| Value::Num(-(*i as f64)))),
+                Value::Num(x) => Ok(Value::Num(-*x)),
                 other => Err(ErrorKind::TypeError {
                     expected: "number",
                     found: other.type_name(),
@@ -549,9 +661,9 @@ impl Engine {
         if n < 2 {
             return self.fail(ErrorKind::StackUnderflow);
         }
-        let (a, b) = (self.stack[n - 2], self.stack[n - 1]);
+        let (a, b) = (&self.stack[n - 2], &self.stack[n - 1]);
         // Widen numerics so `Int(2)` equals `Num(2.0)`; anything else (bools,
-        // cross-type) falls back to structural equality.
+        // strings, cross-type) falls back to structural equality.
         let eq = match (a.as_num(), b.as_num()) {
             (Ok(a), Ok(b)) => a == b,
             _ => a == b,
@@ -599,12 +711,66 @@ impl Engine {
         }
     }
 
+    /// `+`: concatenate two strings, or add two numbers. Strings only
+    /// concatenate with strings — a string and a number is a `TypeError` from
+    /// the numeric path, not an implicit `to_str`.
+    fn add(mut self) -> Outcome {
+        let n = self.stack.len();
+        let both_str = n >= 2
+            && matches!(self.stack[n - 2], Value::Str(_))
+            && matches!(self.stack[n - 1], Value::Str(_));
+        if both_str {
+            // Pop top first, then reuse the deeper string's allocation.
+            let Value::Str(b) = self.stack.pop().unwrap() else {
+                unreachable!()
+            };
+            let Value::Str(mut a) = self.stack.pop().unwrap() else {
+                unreachable!()
+            };
+            a.push_str(&b);
+            self.stack.push(Value::Str(a));
+            Ok(self)
+        } else {
+            self.arith(i64::checked_add, |a, b| a + b)
+        }
+    }
+
+    /// `length`: the character count of the top string, pushed as an `Int`.
+    fn length(mut self) -> Outcome {
+        let n = self.stack.len();
+        let result = if n < 1 {
+            Err(ErrorKind::StackUnderflow)
+        } else {
+            self.stack[n - 1].as_str().map(|s| s.chars().count() as i64)
+        };
+        match result {
+            Ok(len) => {
+                self.stack[n - 1] = Value::Int(len);
+                Ok(self)
+            }
+            Err(kind) => self.fail(kind),
+        }
+    }
+
+    /// `to_str`: replace the top value with its string content (no quotes).
+    /// Total — every value has a string form. (Named `stringify`, not `to_str`,
+    /// since it consumes `self` as an engine transform rather than borrowing.)
+    fn stringify(mut self) -> Outcome {
+        let n = self.stack.len();
+        if n < 1 {
+            return self.fail(ErrorKind::StackUnderflow);
+        }
+        let s = self.stack[n - 1].content_string();
+        self.stack[n - 1] = Value::Str(s);
+        Ok(self)
+    }
+
     /// Push a copy of the value at `level`.
     fn dup(mut self, level: usize) -> Outcome {
         let Some(i) = self.index_of_level(level) else {
             return self.fail(ErrorKind::StackUnderflow);
         };
-        let v = self.stack[i];
+        let v = self.stack[i].clone();
         self.stack.push(v);
         Ok(self)
     }
@@ -801,6 +967,84 @@ mod tests {
     fn equality_spans_the_int_float_split() {
         assert_eq!(run("2 2.0 =").stack(), &[true]);
         assert_eq!(run("2 3.0 =").stack(), &[false]);
+    }
+
+    #[test]
+    fn string_literals_hold_their_spaces() {
+        assert_eq!(run(r#""hello""#).stack(), &[Value::from("hello")]);
+        // The tokenizer's lookahead keeps the interior spaces as one token.
+        assert_eq!(
+            run(r#""hello world""#).stack(),
+            &[Value::from("hello world")]
+        );
+    }
+
+    #[test]
+    fn string_escapes_are_decoded() {
+        assert_eq!(run(r#""a\nb\tc""#).stack(), &[Value::from("a\nb\tc")]);
+        assert_eq!(run(r#""say \"hi\"""#).stack(), &[Value::from(r#"say "hi""#)]);
+    }
+
+    #[test]
+    fn an_unterminated_string_is_a_parse_error() {
+        assert_eq!(parse(r#""oops"#), Err(ErrorKind::UnterminatedString));
+        assert_eq!(parse(r#""bad \"#), Err(ErrorKind::UnterminatedString));
+    }
+
+    #[test]
+    fn plus_concatenates_two_strings() {
+        assert_eq!(run(r#""foo" "bar" +"#).stack(), &[Value::from("foobar")]);
+    }
+
+    #[test]
+    fn plus_does_not_mix_strings_and_numbers() {
+        // No implicit `to_str`: the numeric path rejects the string.
+        assert_eq!(
+            run_err(r#""foo" 1 +"#),
+            ErrorKind::TypeError {
+                expected: "number",
+                found: "string"
+            }
+        );
+    }
+
+    #[test]
+    fn length_counts_characters() {
+        assert_eq!(run(r#""hello" length"#).stack(), &[Value::Int(5)]);
+        assert_eq!(run(r#""" length"#).stack(), &[Value::Int(0)]);
+        assert_eq!(
+            run_err("1 length"),
+            ErrorKind::TypeError {
+                expected: "string",
+                found: "number"
+            }
+        );
+    }
+
+    #[test]
+    fn to_str_renders_any_value_unquoted() {
+        assert_eq!(run("3 to_str").stack(), &[Value::from("3")]);
+        assert_eq!(run("true to_str").stack(), &[Value::from("true")]);
+        // Idempotent on a string.
+        assert_eq!(run(r#""hi" to_str"#).stack(), &[Value::from("hi")]);
+        // The doc's computed-name shape: build "x1" from a string and a number.
+        assert_eq!(run(r#""x" 1 to_str +"#).stack(), &[Value::from("x1")]);
+    }
+
+    #[test]
+    fn strings_compare_by_content() {
+        assert_eq!(run(r#""a" "a" ="#).stack(), &[true]);
+        assert_eq!(run(r#""a" "b" ="#).stack(), &[false]);
+        // A string never equals a number, even a look-alike.
+        assert_eq!(run(r#"1 "1" ="#).stack(), &[false]);
+    }
+
+    #[test]
+    fn strings_display_quoted_on_the_stack() {
+        // Display quotes and escapes, so a string is visibly not a number;
+        // `to_str` / `content_string` give the bare content.
+        assert_eq!(Value::from("hi").to_string(), r#""hi""#);
+        assert_eq!(Value::from("a\nb").to_string(), r#""a\nb""#);
     }
 
     #[test]
