@@ -92,12 +92,12 @@ fn error_line(e: &CalcError) -> Line<'static> {
     let mut spans = vec![Span::styled(format!("error: {}", e.kind), red)];
     if let Some(trace) = &e.trace {
         spans.push(Span::styled(" in '", red));
-        for (i, command) in trace.program.iter().enumerate() {
+        for (i, element) in trace.program.iter().enumerate() {
             if i > 0 {
                 spans.push(Span::styled(" ", red));
             }
             let style = if i == trace.index { red.underlined() } else { red };
-            spans.push(Span::styled(command.to_string(), style));
+            spans.push(Span::styled(element.to_string(), style));
         }
         spans.push(Span::styled("'", red));
     }

@@ -5,7 +5,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::engine::{self, CalcError, Command, Engine, ErrorKind, Outcome, Value};
+use crate::engine::{self, Builtin, CalcError, Element, Engine, ErrorKind, Outcome, Value};
 use crate::history::History;
 
 /// Vim-style editing modes.
@@ -278,8 +278,8 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.cursor = self.cursor.saturating_sub(1),
 
             // Cursor-relative stack edits. These call the engine's stack ops
-            // *directly* (not through a Command / `apply`), so a stack edit is
-            // never intercepted by collection mode — it always hits the stack.
+            // *directly* (not as a program element through `apply`), so a stack
+            // edit always hits the stack rather than being read as a word.
             KeyCode::Char('x') | KeyCode::Char('d') => {
                 let level = self.cursor;
                 self.edit(cursor_label("drop", "dropn", level), move |e| e.drop_at(level));
@@ -322,15 +322,15 @@ impl App {
             // once). With an empty buffer it duplicates the top of stack.
             KeyCode::Enter => {
                 if self.input.text().trim().is_empty() {
-                    self.run(&[Command::Dup]);
+                    self.edit("dup".to_string(), |e| e.run_builtin(Builtin::Dup));
                 } else {
                     self.commit_input();
                 }
             }
             // Operators auto-push: commit the pending number, then apply.
-            KeyCode::Char('+') => self.apply_operator(Command::Add),
-            KeyCode::Char('*') => self.apply_operator(Command::Mul),
-            KeyCode::Char('/') => self.apply_operator(Command::Div),
+            KeyCode::Char('+') => self.apply_operator(Builtin::Add),
+            KeyCode::Char('*') => self.apply_operator(Builtin::Mul),
+            KeyCode::Char('/') => self.apply_operator(Builtin::Div),
             KeyCode::Char('-') => {
                 // A `-` right after an exponent marker is part of the number
                 // (e.g. `1e-3`), not the subtract operator.
@@ -338,7 +338,7 @@ impl App {
                 if text.ends_with('e') || text.ends_with('E') {
                     self.input.insert('-');
                 } else {
-                    self.apply_operator(Command::Sub);
+                    self.apply_operator(Builtin::Sub);
                 }
             }
             // A leading `'` opens quote mode for literal entry; mid-entry it is
@@ -422,28 +422,33 @@ impl App {
         }
     }
 
-    /// Commit any pending entry, then apply an operator — as one undo unit.
-    /// The entry and operator are folded into one program so the error trace
-    /// (and `cmd`) shows the whole thing, e.g. `10 0 /`. On error the buffer is
-    /// kept so the user can fix it.
-    fn apply_operator(&mut self, op: Command) {
-        let mut program = match engine::parse(self.input.text().trim()) {
+    /// Commit any pending entry, then apply an operator — as one undo unit. The
+    /// operator hits the engine *directly* (like the cursor ops), not as a
+    /// program word, so the `+` key always means addition regardless of any
+    /// user rebinding. The pending entry keeps its trace; the operator's own
+    /// error is trace-less. `cmd` still reads the whole thing, e.g. `10 0 /`. On
+    /// error the buffer is kept so the user can fix it.
+    fn apply_operator(&mut self, op: Builtin) {
+        let program = match engine::parse(self.input.text().trim()) {
             Ok(program) => program,
             Err(kind) => {
                 self.notice = Some(Notice::Note(format!("error: {kind}")));
                 return;
             }
         };
-        program.push(op);
-        if self.update(describe(&program), |e| e.apply(&program)) {
+        let entry = describe(&program);
+        let cmd = if entry.is_empty() {
+            op.to_string()
+        } else {
+            format!("{entry} {op}")
+        };
+        if self.update(cmd, |e| {
+            let mut e = e.apply(&program)?;
+            e.run_builtin(op)?;
+            Ok(e)
+        }) {
             self.input.clear();
         }
-    }
-
-    /// Apply a batch of commands to the live engine, labelling the resulting
-    /// state with the command for the info bar.
-    fn run(&mut self, commands: &[Command]) {
-        self.update(describe(commands), |e| e.apply(commands));
     }
 
     /// Apply an in-place engine op (the cursor stack edits) as one undo unit,
@@ -509,10 +514,10 @@ fn cursor_label(fixed: &str, wordn: &str, level: usize) -> String {
 }
 
 /// Join a program into its canonical text (`10 0 /`), for the info bar's `cmd`.
-fn describe(program: &[Command]) -> String {
+fn describe(program: &[Element]) -> String {
     program
         .iter()
-        .map(Command::to_string)
+        .map(Element::to_string)
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -827,17 +832,17 @@ mod tests {
     }
 
     #[test]
-    fn operator_error_traces_the_whole_line() {
-        // `10 0 /`: the operator folds the pending entry in, so the trace is the
-        // full batch, not just `/`.
+    fn operator_error_reports_without_a_trace() {
+        // `10 0 /`: the pending entry applies, then the operator runs directly
+        // on the engine (not as a program word), so its divide-by-zero is a
+        // trace-less error — but `cmd` still names the whole line.
         let mut app = App::new();
         typ(&mut app, "10 0");
         ch(&mut app, '/'); // divide by zero
         match &app.notice {
             Some(Notice::Error(e)) => {
-                let trace = e.trace.as_ref().unwrap();
-                assert_eq!(trace.program.len(), 3); // 10, 0, /
-                assert_eq!(trace.program[trace.index], Command::Div);
+                assert!(e.trace.is_none());
+                assert_eq!(e.kind, ErrorKind::DivideByZero);
             }
             _ => panic!("expected an error notice"),
         }

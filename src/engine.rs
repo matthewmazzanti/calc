@@ -259,232 +259,240 @@ impl std::fmt::Display for ErrorKind {
     }
 }
 
-/// A single parsed instruction. Parsing turns text into these; evaluation
-/// consumes them. `Push` carries its literal, so the whole program is a flat
-/// stream of `Command`s — no AST, because RPN has no nesting.
+/// A program element: a literal to push, or a word to resolve at runtime
+/// (language.md §12 — "a word reference or a literal"). `parse` produces a flat
+/// `Vec<Element>` — no AST, since RPN has no nesting — and a function body will
+/// be one too. This is the *only* thing a program contains; the primitive ops
+/// ([`Builtin`]) are reached only by resolving a `Word`.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Command {
-    Push(Value),
+pub enum Element {
+    /// A literal value: a number, string, name, or boolean.
+    Literal(Value),
     /// A bare word, resolved against the environment at runtime: a user binding
     /// (which shadows), else a builtin from the prelude, else `UnboundName`.
     Word(Rc<str>),
+}
+
+/// A primitive operation — the builtin vocabulary. Reached only by resolving a
+/// [`Element::Word`] (a bare word, or the TUI dispatching one directly), never
+/// present in a program. `Copy`, since none carry data.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Builtin {
     Add,
     Sub,
     Mul,
     Div,
     Neg,
-    /// Equality — pops two values, pushes a `Bool`. Works across types (a
-    /// number never equals a bool); inequality is `=` then `not`.
+    /// Equality — pops two values, pushes a `Bool` (a number never equals a
+    /// bool); inequality is `=` then `not`.
     Eq,
     /// Ordering comparisons — pop two numbers, push a `Bool`.
     Lt,
     Gt,
     Le,
     Ge,
-    /// Boolean words — operate on `Bool`s only (no truthiness rule).
+    /// Boolean ops — `Bool`s only (no truthiness rule).
     Not,
     And,
     Or,
-    /// The character count of a string, pushed as an `Int`.
+    /// The element count of a string (characters) or list, as an `Int`.
     Length,
     /// Convert the top value to its string content (no quotes).
     ToStr,
 
-    // Fixed shuffles — fixed arity, no level. The ergonomic core.
-    Dup,    // a -- a a
-    Drop,   // a --
-    Swap,   // a b -- b a
-    Over,   // a b -- a b a
-    Rot,    // a b c -- b c a
-    Unrot,  // a b c -- c a b   (Factor's -rot)
-    Nip,    // a b -- b
-    Tuck,   // a b -- b a b
-    Dupd,   // a b -- a a b
+    // Fixed shuffles.
+    Dup,     // a -- a a
+    Drop,    // a --
+    Swap,    // a b -- b a
+    Over,    // a b -- a b a
+    Rot,     // a b c -- b c a
+    Unrot,   // a b c -- c a b
+    Nip,     // a b -- b
+    Tuck,    // a b -- b a b
+    Dupd,    // a b -- a a b
     TwoDup,  // a b -- a b a b   (2dup)
     TwoDrop, // a b --           (2drop)
 
-    // Indexed ops: the 1-based level (level 1 == top) is popped off the stack.
-    // This is the in-language surface — `n rolln`, `n pickn`. Uniformly
-    // N-suffixed to mark that they consume a level argument. The TUI cursor does
-    // not go through these; it calls the engine's `*_at` methods directly (so a
-    // stack edit is never intercepted by collection mode).
-    /// Copy the value at the popped level to the top.
+    // Indexed ops: the 1-based level is popped off the stack (`n rolln`).
     PickN,
-    /// Move the value at the popped level up to the top.
     RollN,
-    /// Roll the top down to the popped level (Unrot's general form).
     RolldN,
-    /// Drop the value at the popped level.
     DropN,
-    /// Swap the value at the popped level with the one just below it.
     SwapN,
 
-    /// `[` — push a list mark, opening a collection.
-    OpenList,
-    /// `]` — collect the values above the topmost mark into a `List`.
-    CloseList,
-
-    // List operations.
-    First,  // [a b c] -- a
-    Rest,   // [a b c] -- [b c]
-    Cons,   // x [b c] -- [x b c]
-    Append, // [a b] [c d] -- [a b c d]
-    Nth,    // [a b c] n -- (the 0-based nth element)
+    // Lists.
+    OpenList,  // [
+    CloseList, // ]
+    First,     // [a b c] -- a
+    Rest,      // [a b c] -- [b c]
+    Cons,      // x [b c] -- [x b c]
+    Append,    // [a b] [c d] -- [a b c d]
+    Nth,       // [a b c] n -- (0-based nth element)
 
     // Environment.
-    Set, // value name -- (bind name to value)
-    Get, // name -- value (look up name)
+    Set, // value name --
+    Get, // name -- value
 
     Clear,
 }
 
-impl Command {
-    /// Parse one whitespace-delimited token into a `Command`. A number or a
-    /// `'x` name becomes a `Push`; every other token is a [`Command::Word`],
-    /// resolved against the environment at runtime. So parsing never fails on an
-    /// unknown word — that's a runtime `UnboundName` — and this never errors.
-    pub fn parse(token: &str) -> Command {
+impl Element {
+    /// Parse one whitespace-delimited token into an `Element`. A number, a
+    /// `'x` name, or `true`/`false` becomes a `Literal`; every other token is a
+    /// [`Element::Word`], resolved against the environment at runtime. So parsing
+    /// never fails on an unknown word — that's a runtime `UnboundName`.
+    pub fn parse(token: &str) -> Element {
         // The `'` sigil: `'x` pushes the name `x` (§3). Owned here rather than
         // as a builtin word so it can't be shadowed.
         if let Some(name) = token.strip_prefix('\'') {
-            return Command::Push(Value::Name(Rc::from(name)));
+            return Element::Literal(Value::Name(Rc::from(name)));
+        }
+        // Boolean literals — like numbers, they're literals, not words.
+        match token {
+            "true" => return Element::Literal(Value::Bool(true)),
+            "false" => return Element::Literal(Value::Bool(false)),
+            _ => {}
         }
         // Integer first, then float: `3` is an `Int`, but `3.0`/`2e3`/`1e-2`
         // (anything with a `.`, exponent, or out of i64 range) is a `Num`.
         if let Ok(i) = token.parse::<i64>() {
-            return Command::Push(Value::Int(i));
+            return Element::Literal(Value::Int(i));
         }
         if let Ok(n) = token.parse::<f64>() {
-            return Command::Push(Value::Num(n));
+            return Element::Literal(Value::Num(n));
         }
-        Command::Word(Rc::from(token))
+        Element::Word(Rc::from(token))
     }
+}
 
+impl Builtin {
     /// The core-op prelude: the fixed words of the global scope. Resolving a
     /// bare word falls here when it isn't a user binding, yielding the op the
-    /// word names. This is where the builtin vocabulary lives — one definition,
-    /// reached uniformly through word lookup.
-    fn builtin(name: &str) -> Option<Command> {
+    /// word names. One definition of the builtin vocabulary, reached uniformly
+    /// through word lookup.
+    fn from_name(name: &str) -> Option<Builtin> {
         Some(match name {
-            "true" => Command::Push(Value::Bool(true)),
-            "false" => Command::Push(Value::Bool(false)),
-            "+" => Command::Add,
-            "-" => Command::Sub,
-            "*" => Command::Mul,
-            "/" => Command::Div,
-            "neg" => Command::Neg,
-            "=" => Command::Eq,
-            "<" => Command::Lt,
-            ">" => Command::Gt,
-            "<=" => Command::Le,
-            ">=" => Command::Ge,
-            "not" => Command::Not,
-            "and" => Command::And,
-            "or" => Command::Or,
-            "length" => Command::Length,
-            "to_str" => Command::ToStr,
-            // Fixed shuffles.
-            "dup" => Command::Dup,
-            "drop" => Command::Drop,
-            "swap" => Command::Swap,
-            "over" => Command::Over,
-            "rot" => Command::Rot,
-            "unrot" => Command::Unrot,
-            "nip" => Command::Nip,
-            "tuck" => Command::Tuck,
-            "dupd" => Command::Dupd,
-            "2dup" => Command::TwoDup,
-            "2drop" => Command::TwoDrop,
-            // Indexed ops — the level comes off the stack (uniform N-suffix).
-            "pickn" => Command::PickN,
-            "rolln" => Command::RollN,
-            "rolldn" => Command::RolldN,
-            "dropn" => Command::DropN,
-            "swapn" => Command::SwapN,
-            // Lists — `[` and `]` are ordinary words (spaces required).
-            "[" => Command::OpenList,
-            "]" => Command::CloseList,
-            "first" => Command::First,
-            "rest" => Command::Rest,
-            "cons" => Command::Cons,
-            "append" => Command::Append,
-            "nth" => Command::Nth,
-            "set" => Command::Set,
-            "get" => Command::Get,
-            "clear" => Command::Clear,
+            "+" => Builtin::Add,
+            "-" => Builtin::Sub,
+            "*" => Builtin::Mul,
+            "/" => Builtin::Div,
+            "neg" => Builtin::Neg,
+            "=" => Builtin::Eq,
+            "<" => Builtin::Lt,
+            ">" => Builtin::Gt,
+            "<=" => Builtin::Le,
+            ">=" => Builtin::Ge,
+            "not" => Builtin::Not,
+            "and" => Builtin::And,
+            "or" => Builtin::Or,
+            "length" => Builtin::Length,
+            "to_str" => Builtin::ToStr,
+            "dup" => Builtin::Dup,
+            "drop" => Builtin::Drop,
+            "swap" => Builtin::Swap,
+            "over" => Builtin::Over,
+            "rot" => Builtin::Rot,
+            "unrot" => Builtin::Unrot,
+            "nip" => Builtin::Nip,
+            "tuck" => Builtin::Tuck,
+            "dupd" => Builtin::Dupd,
+            "2dup" => Builtin::TwoDup,
+            "2drop" => Builtin::TwoDrop,
+            "pickn" => Builtin::PickN,
+            "rolln" => Builtin::RollN,
+            "rolldn" => Builtin::RolldN,
+            "dropn" => Builtin::DropN,
+            "swapn" => Builtin::SwapN,
+            "[" => Builtin::OpenList,
+            "]" => Builtin::CloseList,
+            "first" => Builtin::First,
+            "rest" => Builtin::Rest,
+            "cons" => Builtin::Cons,
+            "append" => Builtin::Append,
+            "nth" => Builtin::Nth,
+            "set" => Builtin::Set,
+            "get" => Builtin::Get,
+            "clear" => Builtin::Clear,
             _ => return None,
         })
     }
 }
 
-impl std::fmt::Display for Command {
-    /// The canonical token, so errors can name the command that failed.
+impl std::fmt::Display for Element {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Command::Push(n) => write!(f, "{n}"),
-            Command::Word(name) => write!(f, "{name}"),
-            Command::Add => write!(f, "+"),
-            Command::Sub => write!(f, "-"),
-            Command::Mul => write!(f, "*"),
-            Command::Div => write!(f, "/"),
-            Command::Neg => write!(f, "neg"),
-            Command::Eq => write!(f, "="),
-            Command::Lt => write!(f, "<"),
-            Command::Gt => write!(f, ">"),
-            Command::Le => write!(f, "<="),
-            Command::Ge => write!(f, ">="),
-            Command::Not => write!(f, "not"),
-            Command::And => write!(f, "and"),
-            Command::Or => write!(f, "or"),
-            Command::Length => write!(f, "length"),
-            Command::ToStr => write!(f, "to_str"),
-            Command::Dup => write!(f, "dup"),
-            Command::Drop => write!(f, "drop"),
-            Command::Swap => write!(f, "swap"),
-            Command::Over => write!(f, "over"),
-            Command::Rot => write!(f, "rot"),
-            Command::Unrot => write!(f, "unrot"),
-            Command::Nip => write!(f, "nip"),
-            Command::Tuck => write!(f, "tuck"),
-            Command::Dupd => write!(f, "dupd"),
-            Command::TwoDup => write!(f, "2dup"),
-            Command::TwoDrop => write!(f, "2drop"),
-            Command::PickN => write!(f, "pickn"),
-            Command::RollN => write!(f, "rolln"),
-            Command::RolldN => write!(f, "rolldn"),
-            Command::DropN => write!(f, "dropn"),
-            Command::SwapN => write!(f, "swapn"),
-            Command::OpenList => write!(f, "["),
-            Command::CloseList => write!(f, "]"),
-            Command::First => write!(f, "first"),
-            Command::Rest => write!(f, "rest"),
-            Command::Cons => write!(f, "cons"),
-            Command::Append => write!(f, "append"),
-            Command::Nth => write!(f, "nth"),
-            Command::Set => write!(f, "set"),
-            Command::Get => write!(f, "get"),
-            Command::Clear => write!(f, "clear"),
+            Element::Literal(v) => write!(f, "{v}"),
+            Element::Word(name) => write!(f, "{name}"),
         }
     }
 }
 
-/// Parse a line into a program, failing on the first unknown token (its text is
-/// carried in the [`ErrorKind`]) or an unterminated string. Parsing is a
-/// frontend concern — the engine itself only runs programs, via
-/// [`Engine::apply`].
+impl std::fmt::Display for Builtin {
+    /// The canonical word, so a directly-dispatched op (a TUI operator) can be
+    /// labelled in the info bar.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Builtin::Add => write!(f, "+"),
+            Builtin::Sub => write!(f, "-"),
+            Builtin::Mul => write!(f, "*"),
+            Builtin::Div => write!(f, "/"),
+            Builtin::Neg => write!(f, "neg"),
+            Builtin::Eq => write!(f, "="),
+            Builtin::Lt => write!(f, "<"),
+            Builtin::Gt => write!(f, ">"),
+            Builtin::Le => write!(f, "<="),
+            Builtin::Ge => write!(f, ">="),
+            Builtin::Not => write!(f, "not"),
+            Builtin::And => write!(f, "and"),
+            Builtin::Or => write!(f, "or"),
+            Builtin::Length => write!(f, "length"),
+            Builtin::ToStr => write!(f, "to_str"),
+            Builtin::Dup => write!(f, "dup"),
+            Builtin::Drop => write!(f, "drop"),
+            Builtin::Swap => write!(f, "swap"),
+            Builtin::Over => write!(f, "over"),
+            Builtin::Rot => write!(f, "rot"),
+            Builtin::Unrot => write!(f, "unrot"),
+            Builtin::Nip => write!(f, "nip"),
+            Builtin::Tuck => write!(f, "tuck"),
+            Builtin::Dupd => write!(f, "dupd"),
+            Builtin::TwoDup => write!(f, "2dup"),
+            Builtin::TwoDrop => write!(f, "2drop"),
+            Builtin::PickN => write!(f, "pickn"),
+            Builtin::RollN => write!(f, "rolln"),
+            Builtin::RolldN => write!(f, "rolldn"),
+            Builtin::DropN => write!(f, "dropn"),
+            Builtin::SwapN => write!(f, "swapn"),
+            Builtin::OpenList => write!(f, "["),
+            Builtin::CloseList => write!(f, "]"),
+            Builtin::First => write!(f, "first"),
+            Builtin::Rest => write!(f, "rest"),
+            Builtin::Cons => write!(f, "cons"),
+            Builtin::Append => write!(f, "append"),
+            Builtin::Nth => write!(f, "nth"),
+            Builtin::Set => write!(f, "set"),
+            Builtin::Get => write!(f, "get"),
+            Builtin::Clear => write!(f, "clear"),
+        }
+    }
+}
+
+/// Parse a line into a program (a `Vec<Element>`), or fail on an unterminated
+/// string — the one lexical error. An unknown *word* is not a parse error; it
+/// becomes an `Element::Word` and fails (if unbound) at runtime.
 ///
 /// Mostly a whitespace split, but with the §4 lookahead: a `"` opens a string
 /// literal that runs (across spaces) to its closing `"`, so strings are the one
-/// thing [`Command::parse`] never sees — the tokenizer owns them. Every other
-/// token is handed to [`Command::parse`] word-for-word.
-pub fn parse(input: &str) -> Result<Vec<Command>, ErrorKind> {
-    let mut commands = Vec::new();
+/// thing [`Element::parse`] never sees — the tokenizer owns them. Every other
+/// token is handed to [`Element::parse`] word-for-word.
+pub fn parse(input: &str) -> Result<Vec<Element>, ErrorKind> {
+    let mut program = Vec::new();
     let mut chars = input.chars().peekable();
     while let Some(&c) = chars.peek() {
         if c.is_whitespace() {
             chars.next();
         } else if c == '"' {
-            commands.push(Command::Push(Value::Str(Rc::new(read_string(&mut chars)?))));
+            program.push(Element::Literal(Value::Str(Rc::new(read_string(&mut chars)?))));
         } else {
             // A plain word: everything up to the next whitespace.
             let mut word = String::new();
@@ -495,10 +503,10 @@ pub fn parse(input: &str) -> Result<Vec<Command>, ErrorKind> {
                 word.push(c);
                 chars.next();
             }
-            commands.push(Command::parse(&word));
+            program.push(Element::parse(&word));
         }
     }
-    Ok(commands)
+    Ok(program)
 }
 
 /// Read a `"…"` literal, the opening quote still unconsumed. Supports the
@@ -529,13 +537,13 @@ fn read_string(
     Err(ErrorKind::UnterminatedString)
 }
 
-/// The command sequence that was executing when an error struck, and the index
-/// of the command that failed — "here's what was running."
+/// The program that was executing when an error struck, and the index of the
+/// element that failed — "here's what was running."
 #[derive(Debug, Clone, PartialEq)]
 pub struct Trace {
-    /// The whole batch of commands being applied.
-    pub program: Vec<Command>,
-    /// The 0-based index within `program` of the command that failed.
+    /// The whole program being applied.
+    pub program: Vec<Element>,
+    /// The 0-based index within `program` of the element that failed.
     pub index: usize,
 }
 
@@ -615,9 +623,9 @@ impl Engine {
     /// short-circuits and is wrapped with a [`Trace`] of the batch plus the
     /// index that failed — "here's what was running." A partially-applied engine
     /// is simply dropped; the caller kept its own copy (see the module docs).
-    pub fn apply(mut self, program: &[Command]) -> Outcome {
-        for (index, command) in program.iter().enumerate() {
-            if let Err(kind) = self.apply_one(command) {
+    pub fn apply(mut self, program: &[Element]) -> Outcome {
+        for (index, element) in program.iter().enumerate() {
+            if let Err(kind) = self.apply_one(element) {
                 return Err(CalcError {
                     kind,
                     trace: Some(Trace {
@@ -630,69 +638,76 @@ impl Engine {
         Ok(self)
     }
 
-    /// Apply a single command in place. A total match, so a new command variant
-    /// is a compile error until handled.
-    fn apply_one(&mut self, cmd: &Command) -> Result<(), ErrorKind> {
-        match cmd {
-            Command::Push(value) => {
+    /// Apply one program element: push a literal, or resolve a word.
+    fn apply_one(&mut self, element: &Element) -> Result<(), ErrorKind> {
+        match element {
+            Element::Literal(value) => {
                 self.stack.push(value.clone());
                 Ok(())
             }
-            Command::Word(name) => self.resolve_word(name),
+            Element::Word(name) => self.resolve_word(name),
+        }
+    }
+
+    /// Dispatch a primitive op. Reached by [`Engine::resolve_word`], or called
+    /// directly by the TUI for its operator keys. A total match, so a new
+    /// [`Builtin`] variant is a compile error until handled.
+    pub(crate) fn run_builtin(&mut self, builtin: Builtin) -> Result<(), ErrorKind> {
+        match builtin {
             // `+` concatenates two strings, else adds numbers.
-            Command::Add => self.add(),
-            Command::Sub => self.arith(i64::checked_sub, |a, b| a - b),
-            Command::Mul => self.arith(i64::checked_mul, |a, b| a * b),
+            Builtin::Add => self.add(),
+            Builtin::Sub => self.arith(i64::checked_sub, |a, b| a - b),
+            Builtin::Mul => self.arith(i64::checked_mul, |a, b| a * b),
             // Division always yields a float — `1 2 /` is `0.5`, not `0`.
-            Command::Div => self.num_binary(|a, b| {
+            Builtin::Div => self.num_binary(|a, b| {
                 if b == 0.0 {
                     Err(ErrorKind::DivideByZero)
                 } else {
                     Ok(a / b)
                 }
             }),
-            Command::Neg => self.negate(),
-            Command::Eq => self.equality(),
-            Command::Lt => self.num_compare(|a, b| a < b),
-            Command::Gt => self.num_compare(|a, b| a > b),
-            Command::Le => self.num_compare(|a, b| a <= b),
-            Command::Ge => self.num_compare(|a, b| a >= b),
-            Command::Not => self.bool_unary(|a| !a),
-            Command::And => self.bool_binary(|a, b| a && b),
-            Command::Or => self.bool_binary(|a, b| a || b),
-            Command::Length => self.length(),
-            Command::ToStr => self.stringify(),
+            Builtin::Neg => self.negate(),
+            Builtin::Eq => self.equality(),
+            Builtin::Lt => self.num_compare(|a, b| a < b),
+            Builtin::Gt => self.num_compare(|a, b| a > b),
+            Builtin::Le => self.num_compare(|a, b| a <= b),
+            Builtin::Ge => self.num_compare(|a, b| a >= b),
+            Builtin::Not => self.bool_unary(|a| !a),
+            Builtin::And => self.bool_binary(|a, b| a && b),
+            Builtin::Or => self.bool_binary(|a, b| a || b),
+            Builtin::Length => self.length(),
+            Builtin::ToStr => self.stringify(),
             // Fixed shuffles — several are just a fixed level of an indexed op.
-            Command::Dup => self.pick_at(1),
-            Command::Over => self.pick_at(2),
-            Command::Rot => self.roll_at(3),
-            Command::Unrot => self.rolld_at(3),
-            Command::Drop => self.drop_at(1),
-            Command::Nip => self.drop_at(2),
-            Command::Swap => self.swap_at(1),
-            Command::Tuck => self.tuck(),
-            Command::Dupd => self.dupd(),
-            Command::TwoDup => self.two_dup(),
-            Command::TwoDrop => self.two_drop(),
+            Builtin::Dup => self.pick_at(1),
+            Builtin::Over => self.pick_at(2),
+            Builtin::Rot => self.roll_at(3),
+            Builtin::Unrot => self.rolld_at(3),
+            Builtin::Drop => self.drop_at(1),
+            Builtin::Nip => self.drop_at(2),
+            Builtin::Swap => self.swap_at(1),
+            Builtin::Tuck => self.tuck(),
+            Builtin::Dupd => self.dupd(),
+            Builtin::TwoDup => self.two_dup(),
+            Builtin::TwoDrop => self.two_drop(),
             // Indexed: pop the level, then run the op.
-            Command::PickN => self.indexed(Engine::pick_at),
-            Command::RollN => self.indexed(Engine::roll_at),
-            Command::RolldN => self.indexed(Engine::rolld_at),
-            Command::DropN => self.indexed(Engine::drop_at),
-            Command::SwapN => self.indexed(Engine::swap_at),
-            Command::OpenList => {
+            Builtin::PickN => self.indexed(Engine::pick_at),
+            Builtin::RollN => self.indexed(Engine::roll_at),
+            Builtin::RolldN => self.indexed(Engine::rolld_at),
+            Builtin::DropN => self.indexed(Engine::drop_at),
+            Builtin::SwapN => self.indexed(Engine::swap_at),
+            Builtin::OpenList => {
                 self.stack.push(Value::Mark(MarkKind::List));
                 Ok(())
             }
-            Command::CloseList => self.close_list(),
-            Command::First => self.first(),
-            Command::Rest => self.rest(),
-            Command::Cons => self.cons(),
-            Command::Append => self.append(),
-            Command::Nth => self.nth(),
-            Command::Set => self.set(),
-            Command::Get => self.get(),
-            Command::Clear => {
+            Builtin::CloseList => self.close_list(),
+            Builtin::First => self.first(),
+            Builtin::Rest => self.rest(),
+            Builtin::Cons => self.cons(),
+            Builtin::Append => self.append(),
+            Builtin::Nth => self.nth(),
+            Builtin::Set => self.set(),
+            Builtin::Get => self.get(),
+            Builtin::Clear => {
                 self.stack.clear();
                 Ok(())
             }
@@ -1089,8 +1104,8 @@ impl Engine {
         if let Some(value) = self.env.get(name).cloned() {
             self.stack.push(value);
             Ok(())
-        } else if let Some(command) = Command::builtin(name) {
-            self.apply_one(&command)
+        } else if let Some(builtin) = Builtin::from_name(name) {
+            self.run_builtin(builtin)
         } else {
             Err(ErrorKind::UnboundName(name.to_string()))
         }
@@ -1235,7 +1250,7 @@ mod tests {
             }
         );
         let trace = err.trace.unwrap();
-        assert_eq!(trace.program[trace.index], Command::Word(Rc::from("+")));
+        assert_eq!(trace.program[trace.index], Element::Word(Rc::from("+")));
     }
 
     #[test]
@@ -1378,7 +1393,7 @@ mod tests {
     #[test]
     fn divide_by_zero_is_an_error() {
         assert_eq!(
-            run("1 0").apply(&[Command::Div]).unwrap_err().kind,
+            run("1 0").run_builtin(Builtin::Div).unwrap_err(),
             ErrorKind::DivideByZero
         );
     }
@@ -1386,7 +1401,7 @@ mod tests {
     #[test]
     fn underflow_is_an_error() {
         assert_eq!(
-            run("1").apply(&[Command::Add]).unwrap_err().kind,
+            run("1").run_builtin(Builtin::Add).unwrap_err(),
             ErrorKind::StackUnderflow
         );
     }
@@ -1399,7 +1414,7 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::DivideByZero);
         let trace = err.trace.unwrap();
         assert_eq!(trace.index, 2);
-        assert_eq!(trace.program[trace.index], Command::Word(Rc::from("/")));
+        assert_eq!(trace.program[trace.index], Element::Word(Rc::from("/")));
     }
 
     #[test]
@@ -1424,10 +1439,10 @@ mod tests {
         assert_eq!(
             trace.program,
             vec![
-                Command::Push(Value::Int(1)),
-                Command::Push(Value::Int(2)),
-                Command::Word(Rc::from("+")),
-                Command::Word(Rc::from("/")),
+                Element::Literal(Value::Int(1)),
+                Element::Literal(Value::Int(2)),
+                Element::Word(Rc::from("+")),
+                Element::Word(Rc::from("/")),
             ]
         );
         // The message shows the whole batch with the failing command bracketed.
@@ -1441,10 +1456,10 @@ mod tests {
         assert_eq!(
             parse("1 2 + oops"),
             Ok(vec![
-                Command::Push(Value::Int(1)),
-                Command::Push(Value::Int(2)),
-                Command::Word(Rc::from("+")),
-                Command::Word(Rc::from("oops")),
+                Element::Literal(Value::Int(1)),
+                Element::Literal(Value::Int(2)),
+                Element::Word(Rc::from("+")),
+                Element::Word(Rc::from("oops")),
             ])
         );
         assert_eq!(run_err("oops"), ErrorKind::UnboundName("oops".to_string()));
@@ -1455,9 +1470,9 @@ mod tests {
         assert_eq!(
             parse("1 2 +"),
             Ok(vec![
-                Command::Push(Value::Int(1)),
-                Command::Push(Value::Int(2)),
-                Command::Word(Rc::from("+")),
+                Element::Literal(Value::Int(1)),
+                Element::Literal(Value::Int(2)),
+                Element::Word(Rc::from("+")),
             ])
         );
     }
@@ -1488,22 +1503,23 @@ mod tests {
     fn parse_maps_tokens_to_commands() {
         // Numbers and `'x` names become `Push`; every other token is a `Word`,
         // resolved at runtime (so `+`/`dup` and an unknown `nope` are alike).
-        assert_eq!(Command::parse("3.5"), Command::Push(Value::Num(3.5)));
-        assert_eq!(Command::parse("+"), Command::Word(Rc::from("+")));
-        assert_eq!(Command::parse("dup"), Command::Word(Rc::from("dup")));
-        assert_eq!(Command::parse("nope"), Command::Word(Rc::from("nope")));
+        assert_eq!(Element::parse("3.5"), Element::Literal(Value::Num(3.5)));
+        assert_eq!(Element::parse("+"), Element::Word(Rc::from("+")));
+        assert_eq!(Element::parse("dup"), Element::Word(Rc::from("dup")));
+        assert_eq!(Element::parse("nope"), Element::Word(Rc::from("nope")));
     }
 
     #[test]
     fn apply_runs_a_batch_of_commands() {
-        // The TUI path: hand the engine Commands without going through text.
-        let engine = Engine::new()
+        // The TUI path: push literal elements, then run an operator directly on
+        // the engine (as the operator keys do) rather than as a program word.
+        let mut engine = Engine::new()
             .apply(&[
-                Command::Push(Value::Num(2.0)),
-                Command::Push(Value::Num(3.0)),
-                Command::Mul,
+                Element::Literal(Value::Num(2.0)),
+                Element::Literal(Value::Num(3.0)),
             ])
             .unwrap();
+        engine.run_builtin(Builtin::Mul).unwrap();
         assert_eq!(engine.stack(), &[6.0]);
     }
 
@@ -1569,11 +1585,11 @@ mod tests {
 
     #[test]
     fn indexed_words_render_n_suffixed() {
-        assert_eq!(Command::PickN.to_string(), "pickn");
-        assert_eq!(Command::RollN.to_string(), "rolln");
-        assert_eq!(Command::RolldN.to_string(), "rolldn");
-        assert_eq!(Command::DropN.to_string(), "dropn");
-        assert_eq!(Command::SwapN.to_string(), "swapn");
+        assert_eq!(Builtin::PickN.to_string(), "pickn");
+        assert_eq!(Builtin::RollN.to_string(), "rolln");
+        assert_eq!(Builtin::RolldN.to_string(), "rolldn");
+        assert_eq!(Builtin::DropN.to_string(), "dropn");
+        assert_eq!(Builtin::SwapN.to_string(), "swapn");
     }
 
     // --- M2: lists and the mark discipline ---
@@ -1923,7 +1939,7 @@ mod tests {
     #[test]
     fn builtins_are_reached_by_the_same_lookup() {
         // `+` is just a word resolved to its prelude op — no special parse case.
-        assert_eq!(Command::builtin("+"), Some(Command::Add));
-        assert_eq!(Command::builtin("nope"), None);
+        assert_eq!(Builtin::from_name("+"), Some(Builtin::Add));
+        assert_eq!(Builtin::from_name("nope"), None);
     }
 }
