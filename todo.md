@@ -36,13 +36,13 @@
   which ops are legal on which), parsing/entry (literal syntax — complex
   `(re, im)`, matrix `[[…]]`; pairs with quote mode above), and display. HP48
   precedent: complex and vector/matrix objects are first-class stack values.
-- [ ] **Fix parameterized commands — read the level from the stack.**
-  `Dup/Drop/Swap/Roll(usize)` bake a level into the variant, which only exists to
-  serve the cursor UI; the text language can only reach the fixed cases
-  (`dup`=1, `swap`=1, `rot`=3). Make them RPN-idiomatic instead: un-parameterized
-  commands that pop their level argument off the stack (HP48-style `n ROLL`,
-  `n PICK`, `n ROLLD`). Open question: how the cursor ops map — push the cursor
-  level then run, or keep a separate UI path that pokes the stack directly.
+- [x] **Fix parameterized commands — read the level from the stack.** Done on
+  the `concatenative-language` branch. Ops are un-parameterized: the indexed
+  words (`pickn`/`rolln`/`rolldn`/`dropn`/`swapn`) pop their 1-based level off
+  the stack (via `Engine::indexed`), and the fixed shuffles (`dup`/`swap`/`rot`
+  …) are their own no-arg builtins. The cursor UI took the "separate path"
+  answer: it calls the `*_at(level)` engine methods directly rather than
+  emitting an op, so a stack edit never routes through word resolution.
 - [x] **TUI passes programs, not strings** — `eval(&str)` is off the engine;
   parsing is now a free `engine::parse(&str) -> Result<Vec<Command>, ErrorKind>`
   the TUI calls before `apply(&[Command])`. Parse errors (no engine/trace to
