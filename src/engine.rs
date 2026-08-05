@@ -57,9 +57,9 @@ pub enum Value {
     Mark(MarkKind),
     /// A captured primitive op — a first-class word. A *bare* word runs its op;
     /// `'name get` instead pushes it here, so a builtin can be stored, passed,
-    /// and later applied. `Builtin` is `Copy`, so this stays cheap. Functions
+    /// and later applied. [`Primitive`] is `Copy`, so this stays cheap. Functions
     /// (`{ … }`) will join it as the other callable value.
-    Builtin(Builtin),
+    Builtin(Primitive),
 }
 
 impl Value {
@@ -273,7 +273,7 @@ impl std::fmt::Display for ErrorKind {
 /// (language.md §12 — "a word reference or a literal"). `parse` produces a flat
 /// `Vec<Element>` — no AST, since RPN has no nesting — and a function body will
 /// be one too. This is the *only* thing a program contains; the primitive ops
-/// ([`Builtin`]) are reached only by resolving a `Word`.
+/// ([`Primitive`]) are reached only by resolving a `Word`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Element {
     /// A literal value: a number, string, name, or boolean.
@@ -283,68 +283,122 @@ pub enum Element {
     Word(Rc<str>),
 }
 
-/// A primitive operation — the builtin vocabulary. Reached only by resolving a
-/// [`Element::Word`] (a bare word, or the TUI dispatching one directly), never
-/// present in a program. `Copy`, since none carry data.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Builtin {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Neg,
-    /// Equality — pops two values, pushes a `Bool` (a number never equals a
-    /// bool); inequality is `=` then `not`.
-    Eq,
-    /// Ordering comparisons — pop two numbers, push a `Bool`.
-    Lt,
-    Gt,
-    Le,
-    Ge,
-    /// Boolean ops — `Bool`s only (no truthiness rule).
-    Not,
-    And,
-    Or,
-    /// The element count of a string (characters) or list, as an `Int`.
-    Length,
-    /// Convert the top value to its string content (no quotes).
-    ToStr,
-
-    // Fixed shuffles.
-    Dup,     // a -- a a
-    Drop,    // a --
-    Swap,    // a b -- b a
-    Over,    // a b -- a b a
-    Rot,     // a b c -- b c a
-    Unrot,   // a b c -- c a b
-    Nip,     // a b -- b
-    Tuck,    // a b -- b a b
-    Dupd,    // a b -- a a b
-    TwoDup,  // a b -- a b a b   (2dup)
-    TwoDrop, // a b --           (2drop)
-
-    // Indexed ops: the 1-based level is popped off the stack (`n rolln`).
-    PickN,
-    RollN,
-    RolldN,
-    DropN,
-    SwapN,
-
-    // Lists.
-    OpenList,  // [
-    CloseList, // ]
-    First,     // [a b c] -- a
-    Rest,      // [a b c] -- [b c]
-    Cons,      // x [b c] -- [x b c]
-    Append,    // [a b] [c d] -- [a b c d]
-    Nth,       // [a b c] n -- (0-based nth element)
-
-    // Environment.
-    Set, // value name --
-    Get, // name -- value
-
-    Clear,
+/// A primitive operation: a name paired with its dispatch target — a host
+/// function over the [`Engine`]. The whole vocabulary is one flat table
+/// ([`PRIMITIVES`]); a primitive is *data*, not an enum tag, so adding one is a
+/// single row and the prelude, word resolution, and the TUI all reach it
+/// uniformly. `Copy` (a `&'static str` plus a fn pointer), so it rides in a
+/// [`Value`] cheaply. Reached only by resolving an [`Element::Word`] (a bare
+/// word, or the TUI dispatching one directly), never present in a program. Once
+/// functions land, the derived words (`over`, `rot`, `nip`, …) move out of this
+/// table into an in-language prelude, leaving only the true primitives.
+#[derive(Clone, Copy)]
+pub struct Primitive {
+    name: &'static str,
+    run: fn(&mut Engine) -> Result<(), ErrorKind>,
 }
+
+/// Two primitives are equal when they name the same word — names are unique
+/// across the table, and a fn pointer has no equality worth relying on.
+impl PartialEq for Primitive {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+
+impl std::fmt::Debug for Primitive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Primitive").field(&self.name).finish()
+    }
+}
+
+impl std::fmt::Display for Primitive {
+    /// The canonical word — so a captured primitive prints re-readably, and a
+    /// directly-dispatched op (a TUI operator) can be labelled in the info bar.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name)
+    }
+}
+
+// Arithmetic operators are named so the TUI can dispatch them directly from its
+// operator keys, unshadowably — the same constants the table installs by word.
+pub(crate) const ADD: Primitive = Primitive {
+    name: "+",
+    run: Engine::add,
+};
+pub(crate) const SUB: Primitive = Primitive {
+    name: "-",
+    run: |e| e.arith(i64::checked_sub, |a, b| a - b),
+};
+pub(crate) const MUL: Primitive = Primitive {
+    name: "*",
+    run: |e| e.arith(i64::checked_mul, |a, b| a * b),
+};
+pub(crate) const DIV: Primitive = Primitive {
+    name: "/",
+    run: Engine::div,
+};
+/// `dup`, dispatched directly for the empty-Enter shortcut.
+pub(crate) const DUP: Primitive = Primitive {
+    name: "dup",
+    run: |e| e.pick_at(1),
+};
+
+/// The builtin vocabulary: every primitive under its canonical word. The single
+/// source of both names and behavior — [`prelude`] maps it straight into the
+/// base frame, and it is the only place a primitive is declared. Each `run` is
+/// the word's dispatch target: an [`Engine`] method, or a small closure over
+/// one. Not exhaustiveness-checked (there's no enum), but there's nothing to
+/// forget — a row *is* a primitive, name and behavior together.
+static PRIMITIVES: &[Primitive] = &[
+    ADD,
+    SUB,
+    MUL,
+    DIV,
+    Primitive { name: "neg", run: Engine::negate },
+    // Equality pops two values -> Bool; comparisons pop two numbers -> Bool.
+    Primitive { name: "=", run: Engine::equality },
+    Primitive { name: "<", run: |e| e.num_compare(|a, b| a < b) },
+    Primitive { name: ">", run: |e| e.num_compare(|a, b| a > b) },
+    Primitive { name: "<=", run: |e| e.num_compare(|a, b| a <= b) },
+    Primitive { name: ">=", run: |e| e.num_compare(|a, b| a >= b) },
+    // Boolean ops — Bools only (no truthiness rule).
+    Primitive { name: "not", run: |e| e.bool_unary(|a| !a) },
+    Primitive { name: "and", run: |e| e.bool_binary(|a, b| a && b) },
+    Primitive { name: "or", run: |e| e.bool_binary(|a, b| a || b) },
+    Primitive { name: "length", run: Engine::length },
+    Primitive { name: "to_str", run: Engine::stringify },
+    // Fixed shuffles — several are just a fixed level of an indexed op.
+    DUP, // a -- a a
+    Primitive { name: "drop", run: |e| e.drop_at(1) }, // a --
+    Primitive { name: "swap", run: |e| e.swap_at(1) }, // a b -- b a
+    Primitive { name: "over", run: |e| e.pick_at(2) }, // a b -- a b a
+    Primitive { name: "rot", run: |e| e.roll_at(3) },  // a b c -- b c a
+    Primitive { name: "unrot", run: |e| e.rolld_at(3) }, // a b c -- c a b
+    Primitive { name: "nip", run: |e| e.drop_at(2) },  // a b -- b
+    Primitive { name: "tuck", run: Engine::tuck },     // a b -- b a b
+    Primitive { name: "dupd", run: Engine::dupd },     // a b -- a a b
+    Primitive { name: "2dup", run: Engine::two_dup },  // a b -- a b a b
+    Primitive { name: "2drop", run: Engine::two_drop }, // a b --
+    // Indexed ops: the 1-based level is popped off the stack (`n rolln`).
+    Primitive { name: "pickn", run: |e| e.indexed(Engine::pick_at) },
+    Primitive { name: "rolln", run: |e| e.indexed(Engine::roll_at) },
+    Primitive { name: "rolldn", run: |e| e.indexed(Engine::rolld_at) },
+    Primitive { name: "dropn", run: |e| e.indexed(Engine::drop_at) },
+    Primitive { name: "swapn", run: |e| e.indexed(Engine::swap_at) },
+    // Lists.
+    Primitive { name: "[", run: Engine::open_list },   // push a list mark
+    Primitive { name: "]", run: Engine::close_list },  // collect to the mark
+    Primitive { name: "first", run: Engine::first },   // [a b c] -- a
+    Primitive { name: "rest", run: Engine::rest },     // [a b c] -- [b c]
+    Primitive { name: "cons", run: Engine::cons },     // x [b c] -- [x b c]
+    Primitive { name: "append", run: Engine::append }, // [a b] [c d] -- [a b c d]
+    Primitive { name: "nth", run: Engine::nth },       // [a b c] n -- (0-based)
+    // Environment.
+    Primitive { name: "set", run: Engine::set },       // value name --
+    Primitive { name: "get", run: Engine::get },       // name -- value
+    Primitive { name: "clear", run: Engine::clear },
+];
 
 impl Element {
     /// Parse one whitespace-delimited token into an `Element`. A number, a
@@ -375,112 +429,11 @@ impl Element {
     }
 }
 
-impl Builtin {
-    /// Every builtin, in declaration order — the single enumeration of the
-    /// vocabulary, used to build the prelude frame ([`prelude`]). `run_builtin`
-    /// and [`Display`](std::fmt::Display) are exhaustiveness-checked, so a new
-    /// variant makes them fail to compile; *this* list is not, so keep it
-    /// complete (the `every_builtin_is_in_the_prelude` test guards it).
-    const ALL: &'static [Builtin] = &[
-        Builtin::Add,
-        Builtin::Sub,
-        Builtin::Mul,
-        Builtin::Div,
-        Builtin::Neg,
-        Builtin::Eq,
-        Builtin::Lt,
-        Builtin::Gt,
-        Builtin::Le,
-        Builtin::Ge,
-        Builtin::Not,
-        Builtin::And,
-        Builtin::Or,
-        Builtin::Length,
-        Builtin::ToStr,
-        Builtin::Dup,
-        Builtin::Drop,
-        Builtin::Swap,
-        Builtin::Over,
-        Builtin::Rot,
-        Builtin::Unrot,
-        Builtin::Nip,
-        Builtin::Tuck,
-        Builtin::Dupd,
-        Builtin::TwoDup,
-        Builtin::TwoDrop,
-        Builtin::PickN,
-        Builtin::RollN,
-        Builtin::RolldN,
-        Builtin::DropN,
-        Builtin::SwapN,
-        Builtin::OpenList,
-        Builtin::CloseList,
-        Builtin::First,
-        Builtin::Rest,
-        Builtin::Cons,
-        Builtin::Append,
-        Builtin::Nth,
-        Builtin::Set,
-        Builtin::Get,
-        Builtin::Clear,
-    ];
-}
-
 impl std::fmt::Display for Element {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Element::Literal(v) => write!(f, "{v}"),
             Element::Word(name) => write!(f, "{name}"),
-        }
-    }
-}
-
-impl std::fmt::Display for Builtin {
-    /// The canonical word, so a directly-dispatched op (a TUI operator) can be
-    /// labelled in the info bar.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Builtin::Add => write!(f, "+"),
-            Builtin::Sub => write!(f, "-"),
-            Builtin::Mul => write!(f, "*"),
-            Builtin::Div => write!(f, "/"),
-            Builtin::Neg => write!(f, "neg"),
-            Builtin::Eq => write!(f, "="),
-            Builtin::Lt => write!(f, "<"),
-            Builtin::Gt => write!(f, ">"),
-            Builtin::Le => write!(f, "<="),
-            Builtin::Ge => write!(f, ">="),
-            Builtin::Not => write!(f, "not"),
-            Builtin::And => write!(f, "and"),
-            Builtin::Or => write!(f, "or"),
-            Builtin::Length => write!(f, "length"),
-            Builtin::ToStr => write!(f, "to_str"),
-            Builtin::Dup => write!(f, "dup"),
-            Builtin::Drop => write!(f, "drop"),
-            Builtin::Swap => write!(f, "swap"),
-            Builtin::Over => write!(f, "over"),
-            Builtin::Rot => write!(f, "rot"),
-            Builtin::Unrot => write!(f, "unrot"),
-            Builtin::Nip => write!(f, "nip"),
-            Builtin::Tuck => write!(f, "tuck"),
-            Builtin::Dupd => write!(f, "dupd"),
-            Builtin::TwoDup => write!(f, "2dup"),
-            Builtin::TwoDrop => write!(f, "2drop"),
-            Builtin::PickN => write!(f, "pickn"),
-            Builtin::RollN => write!(f, "rolln"),
-            Builtin::RolldN => write!(f, "rolldn"),
-            Builtin::DropN => write!(f, "dropn"),
-            Builtin::SwapN => write!(f, "swapn"),
-            Builtin::OpenList => write!(f, "["),
-            Builtin::CloseList => write!(f, "]"),
-            Builtin::First => write!(f, "first"),
-            Builtin::Rest => write!(f, "rest"),
-            Builtin::Cons => write!(f, "cons"),
-            Builtin::Append => write!(f, "append"),
-            Builtin::Nth => write!(f, "nth"),
-            Builtin::Set => write!(f, "set"),
-            Builtin::Get => write!(f, "get"),
-            Builtin::Clear => write!(f, "clear"),
         }
     }
 }
@@ -624,15 +577,14 @@ pub struct Engine {
 /// A single environment frame: names bound to values.
 type Frame = std::collections::HashMap<Rc<str>, Value>;
 
-/// Build the prelude frame — every builtin as a first-class [`Value::Builtin`]
-/// under its canonical word (from [`Display`](std::fmt::Display), the single
-/// source of names). Each engine holds this behind an `Rc`, so snapshots share
-/// one immutable copy.
+/// Build the prelude frame — every [`PRIMITIVES`] entry as a first-class
+/// [`Value::Builtin`] under its canonical word. Each engine holds this behind an
+/// `Rc`, so snapshots share one immutable copy.
 fn prelude() -> Rc<Frame> {
     Rc::new(
-        Builtin::ALL
+        PRIMITIVES
             .iter()
-            .map(|&b| (Rc::from(b.to_string()), Value::Builtin(b)))
+            .map(|&p| (Rc::from(p.name), Value::Builtin(p)))
             .collect(),
     )
 }
@@ -698,69 +650,12 @@ impl Engine {
         }
     }
 
-    /// Dispatch a primitive op. Reached by [`Engine::resolve_word`], or called
-    /// directly by the TUI for its operator keys. A total match, so a new
-    /// [`Builtin`] variant is a compile error until handled.
-    pub(crate) fn run_builtin(&mut self, builtin: Builtin) -> Result<(), ErrorKind> {
-        match builtin {
-            // `+` concatenates two strings, else adds numbers.
-            Builtin::Add => self.add(),
-            Builtin::Sub => self.arith(i64::checked_sub, |a, b| a - b),
-            Builtin::Mul => self.arith(i64::checked_mul, |a, b| a * b),
-            // Division always yields a float — `1 2 /` is `0.5`, not `0`.
-            Builtin::Div => self.num_binary(|a, b| {
-                if b == 0.0 {
-                    Err(ErrorKind::DivideByZero)
-                } else {
-                    Ok(a / b)
-                }
-            }),
-            Builtin::Neg => self.negate(),
-            Builtin::Eq => self.equality(),
-            Builtin::Lt => self.num_compare(|a, b| a < b),
-            Builtin::Gt => self.num_compare(|a, b| a > b),
-            Builtin::Le => self.num_compare(|a, b| a <= b),
-            Builtin::Ge => self.num_compare(|a, b| a >= b),
-            Builtin::Not => self.bool_unary(|a| !a),
-            Builtin::And => self.bool_binary(|a, b| a && b),
-            Builtin::Or => self.bool_binary(|a, b| a || b),
-            Builtin::Length => self.length(),
-            Builtin::ToStr => self.stringify(),
-            // Fixed shuffles — several are just a fixed level of an indexed op.
-            Builtin::Dup => self.pick_at(1),
-            Builtin::Over => self.pick_at(2),
-            Builtin::Rot => self.roll_at(3),
-            Builtin::Unrot => self.rolld_at(3),
-            Builtin::Drop => self.drop_at(1),
-            Builtin::Nip => self.drop_at(2),
-            Builtin::Swap => self.swap_at(1),
-            Builtin::Tuck => self.tuck(),
-            Builtin::Dupd => self.dupd(),
-            Builtin::TwoDup => self.two_dup(),
-            Builtin::TwoDrop => self.two_drop(),
-            // Indexed: pop the level, then run the op.
-            Builtin::PickN => self.indexed(Engine::pick_at),
-            Builtin::RollN => self.indexed(Engine::roll_at),
-            Builtin::RolldN => self.indexed(Engine::rolld_at),
-            Builtin::DropN => self.indexed(Engine::drop_at),
-            Builtin::SwapN => self.indexed(Engine::swap_at),
-            Builtin::OpenList => {
-                self.stack.push(Value::Mark(MarkKind::List));
-                Ok(())
-            }
-            Builtin::CloseList => self.close_list(),
-            Builtin::First => self.first(),
-            Builtin::Rest => self.rest(),
-            Builtin::Cons => self.cons(),
-            Builtin::Append => self.append(),
-            Builtin::Nth => self.nth(),
-            Builtin::Set => self.set(),
-            Builtin::Get => self.get(),
-            Builtin::Clear => {
-                self.stack.clear();
-                Ok(())
-            }
-        }
+    /// Run a primitive — invoke its dispatch target. Reached by
+    /// [`Engine::resolve_word`] (bare-word application), or called directly by
+    /// the TUI for its operator keys. The behavior lives in the [`PRIMITIVES`]
+    /// table, not here.
+    pub(crate) fn run_builtin(&mut self, primitive: Primitive) -> Result<(), ErrorKind> {
+        (primitive.run)(self)
     }
 
     // Stack transforms. Each takes `&mut self`, pops what it needs, mutates in
@@ -933,6 +828,29 @@ impl Engine {
             (a, b) => Self::arith_values(a, b, i64::checked_add, |a, b| a + b)?,
         };
         self.stack.push(v);
+        Ok(())
+    }
+
+    /// `/`: division, always yielding a float — `1 2 /` is `0.5`, not `0`.
+    fn div(&mut self) -> Result<(), ErrorKind> {
+        self.num_binary(|a, b| {
+            if b == 0.0 {
+                Err(ErrorKind::DivideByZero)
+            } else {
+                Ok(a / b)
+            }
+        })
+    }
+
+    /// `[`: push a list mark, opening a collection (§13 mark discipline).
+    fn open_list(&mut self) -> Result<(), ErrorKind> {
+        self.stack.push(Value::Mark(MarkKind::List));
+        Ok(())
+    }
+
+    /// `clear`: empty the stack.
+    fn clear(&mut self) -> Result<(), ErrorKind> {
+        self.stack.clear();
         Ok(())
     }
 
@@ -1167,7 +1085,7 @@ impl Engine {
     /// its op while a word bound to a number just lands it on the stack.
     fn apply_value(&mut self, value: Value) -> Result<(), ErrorKind> {
         match value {
-            Value::Builtin(builtin) => self.run_builtin(builtin),
+            Value::Builtin(primitive) => self.run_builtin(primitive),
             data => {
                 self.stack.push(data);
                 Ok(())
@@ -1457,7 +1375,7 @@ mod tests {
     #[test]
     fn divide_by_zero_is_an_error() {
         assert_eq!(
-            run("1 0").run_builtin(Builtin::Div).unwrap_err(),
+            run("1 0").run_builtin(DIV).unwrap_err(),
             ErrorKind::DivideByZero
         );
     }
@@ -1465,7 +1383,7 @@ mod tests {
     #[test]
     fn underflow_is_an_error() {
         assert_eq!(
-            run("1").run_builtin(Builtin::Add).unwrap_err(),
+            run("1").run_builtin(ADD).unwrap_err(),
             ErrorKind::StackUnderflow
         );
     }
@@ -1583,7 +1501,7 @@ mod tests {
                 Element::Literal(Value::Num(3.0)),
             ])
             .unwrap();
-        engine.run_builtin(Builtin::Mul).unwrap();
+        engine.run_builtin(MUL).unwrap();
         assert_eq!(engine.stack(), &[6.0]);
     }
 
@@ -1648,12 +1566,15 @@ mod tests {
     }
 
     #[test]
-    fn indexed_words_render_n_suffixed() {
-        assert_eq!(Builtin::PickN.to_string(), "pickn");
-        assert_eq!(Builtin::RollN.to_string(), "rolln");
-        assert_eq!(Builtin::RolldN.to_string(), "rolldn");
-        assert_eq!(Builtin::DropN.to_string(), "dropn");
-        assert_eq!(Builtin::SwapN.to_string(), "swapn");
+    fn indexed_words_are_n_suffixed() {
+        // The naming decision: the indexed shuffles carry an `n` suffix. They're
+        // bound in the prelude and render as their word (a captured primitive
+        // Displays by name).
+        let base = prelude();
+        for name in ["pickn", "rolln", "rolldn", "dropn", "swapn"] {
+            let bound = base.get(name).expect("indexed word bound in the prelude");
+            assert_eq!(bound.to_string(), name);
+        }
     }
 
     // --- M2: lists and the mark discipline ---
@@ -2004,7 +1925,7 @@ mod tests {
     fn builtins_are_reached_by_the_same_lookup() {
         // `+` is a word resolved to a prelude binding — no special parse case;
         // `get` reaches it through the same lookup as any user binding.
-        assert_eq!(run("'+ get").stack(), &[Value::Builtin(Builtin::Add)]);
+        assert_eq!(run("'+ get").stack(), &[Value::Builtin(ADD)]);
         assert_eq!(run_err("nope"), ErrorKind::UnboundName("nope".to_string()));
     }
 
@@ -2016,16 +1937,16 @@ mod tests {
     }
 
     #[test]
-    fn every_builtin_is_in_the_prelude() {
-        // `Builtin::ALL` isn't exhaustiveness-checked; this guards that the
-        // prelude binds every op under its canonical word.
+    fn every_primitive_is_in_the_prelude() {
+        // The `PRIMITIVES` table is the source of the vocabulary; this guards
+        // that the prelude binds each one under its canonical word.
         let base = prelude();
-        for &b in Builtin::ALL {
-            let name = b.to_string();
+        for &p in PRIMITIVES {
             assert_eq!(
-                base.get(name.as_str()),
-                Some(&Value::Builtin(b)),
-                "prelude missing `{name}`",
+                base.get(p.name),
+                Some(&Value::Builtin(p)),
+                "prelude missing `{}`",
+                p.name,
             );
         }
     }

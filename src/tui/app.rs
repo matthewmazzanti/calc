@@ -5,7 +5,9 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::engine::{self, Builtin, CalcError, Element, Engine, ErrorKind, Outcome, Value};
+use crate::engine::{
+    self, CalcError, Element, Engine, ErrorKind, Outcome, Primitive, Value, ADD, DIV, DUP, MUL, SUB,
+};
 use crate::history::History;
 
 /// Vim-style editing modes.
@@ -322,15 +324,15 @@ impl App {
             // once). With an empty buffer it duplicates the top of stack.
             KeyCode::Enter => {
                 if self.input.text().trim().is_empty() {
-                    self.edit("dup".to_string(), |e| e.run_builtin(Builtin::Dup));
+                    self.edit("dup".to_string(), |e| e.run_builtin(DUP));
                 } else {
                     self.commit_input();
                 }
             }
             // Operators auto-push: commit the pending number, then apply.
-            KeyCode::Char('+') => self.apply_operator(Builtin::Add),
-            KeyCode::Char('*') => self.apply_operator(Builtin::Mul),
-            KeyCode::Char('/') => self.apply_operator(Builtin::Div),
+            KeyCode::Char('+') => self.apply_operator(ADD),
+            KeyCode::Char('*') => self.apply_operator(MUL),
+            KeyCode::Char('/') => self.apply_operator(DIV),
             KeyCode::Char('-') => {
                 // A `-` right after an exponent marker is part of the number
                 // (e.g. `1e-3`), not the subtract operator.
@@ -338,7 +340,7 @@ impl App {
                 if text.ends_with('e') || text.ends_with('E') {
                     self.input.insert('-');
                 } else {
-                    self.apply_operator(Builtin::Sub);
+                    self.apply_operator(SUB);
                 }
             }
             // A leading `'` opens quote mode for literal entry; mid-entry it is
@@ -428,7 +430,7 @@ impl App {
     /// user rebinding. The pending entry keeps its trace; the operator's own
     /// error is trace-less. `cmd` still reads the whole thing, e.g. `10 0 /`. On
     /// error the buffer is kept so the user can fix it.
-    fn apply_operator(&mut self, op: Builtin) {
+    fn apply_operator(&mut self, op: Primitive) {
         let program = match engine::parse(self.input.text().trim()) {
             Ok(program) => program,
             Err(kind) => {

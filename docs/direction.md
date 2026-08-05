@@ -109,6 +109,33 @@ inverse of bare-word application. Why this shape:
   functions just add frames. Names are single-sourced through `Display` +
   `Builtin::ALL` (the `from_name` match is gone).
 
+**Primitives are a dispatch table, not an enum.** A `Primitive` is `{ name:
+&'static str, run: fn(&mut Engine) -> Result<(), ErrorKind> }` — a word paired
+with its dispatch target — and the whole vocabulary is one flat `static
+PRIMITIVES` table. This replaced the `Builtin` enum + three parallel matches
+(the variant list, `Display`, and the `run_builtin` dispatch): adding a
+primitive is now a single row, name and behavior together, and `prelude`, word
+resolution, and the TUI all reach it through the one table. `run_builtin`
+shrank to `(prim.run)(self)`. This is the canonical "primitives as host
+functions in a table" shape (Lua/Scheme/Forth); the enum's compile-time
+exhaustiveness is gone, but a row *is* a primitive so there's nothing separate
+to forget (the `every_primitive_is_in_the_prelude` test still guards the
+table→prelude mapping). The five ops the TUI dispatches directly (`+ - * / dup`)
+are named `pub(crate) const`s reused by the table. `Value::Builtin(Primitive)`
+carries a captured op; `Display`/`PartialEq` go by name. We surveyed the typed
+"extensible interpreter" machinery (data types à la carte, tagless-final) and
+parked it: it targets typed, tree-structured, multi-interpreter languages, and
+Rust's coherence/orphan rules and lack of HKTs make it stub its toe (you land at
+`frunk`-style indexed traits). The table gives the concatenative-relevant
+extensibility — an open word dictionary — for free.
+
+**Toward the in-language prelude.** When functions land, derived words (`over`,
+`rot`, `unrot`, `nip`, `tuck`, `dupd`, `2dup`, `2drop`) leave the Rust table and
+become an in-language prelude parsed at startup and bound into `base` alongside
+the primitives, shrinking Rust to a true primitive core. `apply_value` is
+already the single "run any callable" seam, so primitive-vs-quotation stays
+transparent to callers.
+
 The base frame is the root of that chain. Still deferred to M3c+: functions /
 closures / `call` / `&`, the multi-frame chain, and a persistent-map (HAMT)
 environment for cheap snapshots (§8). `Rc` refcounts leak cycles, which
