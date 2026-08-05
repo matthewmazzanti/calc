@@ -95,6 +95,10 @@ pub(crate) const DUP: Primitive = Primitive {
 /// the word's dispatch target: an [`Engine`] method, or a small closure over
 /// one. Not exhaustiveness-checked (there's no enum), but there's nothing to
 /// forget — a row *is* a primitive, name and behavior together.
+///
+/// `rustfmt::skip` keeps this as a hand-aligned table; without it each row
+/// explodes to four lines.
+#[rustfmt::skip]
 static PRIMITIVES: &[Primitive] = &[
     ADD,
     SUB,
@@ -480,7 +484,9 @@ impl Engine {
 
     /// Copy the value at `level` to the top (`dup` = 1, `over` = 2, `pickn`).
     pub(crate) fn pick_at(&mut self, level: usize) -> Result<(), ErrorKind> {
-        let i = self.index_of_level(level).ok_or(ErrorKind::StackUnderflow)?;
+        let i = self
+            .index_of_level(level)
+            .ok_or(ErrorKind::StackUnderflow)?;
         let v = self.stack[i].clone();
         self.stack.push(v);
         Ok(())
@@ -488,14 +494,18 @@ impl Engine {
 
     /// Remove the value at `level` (`drop` = 1, `nip` = 2, `dropn`).
     pub(crate) fn drop_at(&mut self, level: usize) -> Result<(), ErrorKind> {
-        let i = self.index_of_level(level).ok_or(ErrorKind::StackUnderflow)?;
+        let i = self
+            .index_of_level(level)
+            .ok_or(ErrorKind::StackUnderflow)?;
         self.stack.remove(i);
         Ok(())
     }
 
     /// Exchange the value at `level` with the one just below it. `swap` = 1.
     pub(crate) fn swap_at(&mut self, level: usize) -> Result<(), ErrorKind> {
-        let i = self.index_of_level(level).ok_or(ErrorKind::StackUnderflow)?;
+        let i = self
+            .index_of_level(level)
+            .ok_or(ErrorKind::StackUnderflow)?;
         let j = self
             .index_of_level(level + 1)
             .ok_or(ErrorKind::StackUnderflow)?;
@@ -505,7 +515,9 @@ impl Engine {
 
     /// Move the value at `level` up to the top. `rot` = 3, `rolln`.
     pub(crate) fn roll_at(&mut self, level: usize) -> Result<(), ErrorKind> {
-        let i = self.index_of_level(level).ok_or(ErrorKind::StackUnderflow)?;
+        let i = self
+            .index_of_level(level)
+            .ok_or(ErrorKind::StackUnderflow)?;
         let v = self.stack.remove(i);
         self.stack.push(v);
         Ok(())
@@ -514,10 +526,15 @@ impl Engine {
     /// Move the top value down to `level` — the inverse of `roll_at`.
     /// `unrot` = 3, `rolldn`.
     fn rolld_at(&mut self, level: usize) -> Result<(), ErrorKind> {
-        let dest = self.index_of_level(level).ok_or(ErrorKind::StackUnderflow)?;
+        let dest = self
+            .index_of_level(level)
+            .ok_or(ErrorKind::StackUnderflow)?;
         // `dest` is where the top must land. Popping first leaves every index
         // ≤ dest unchanged (dest ≤ len - 1), so we can insert straight in.
-        let v = self.stack.pop().expect("level ≥ 1 implies a non-empty stack");
+        let v = self
+            .stack
+            .pop()
+            .expect("level ≥ 1 implies a non-empty stack");
         self.stack.insert(dest, v);
         Ok(())
     }

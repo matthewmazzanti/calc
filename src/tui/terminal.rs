@@ -41,7 +41,11 @@ fn resize_terminal(
     height: u16,
 ) -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     let top = terminal.get_frame().area().y;
-    execute!(io::stdout(), MoveTo(0, top), Clear(ClearType::FromCursorDown))?;
+    execute!(
+        io::stdout(),
+        MoveTo(0, top),
+        Clear(ClearType::FromCursorDown)
+    )?;
     drop(terminal);
     new_terminal(height)
 }

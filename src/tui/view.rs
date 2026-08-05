@@ -96,7 +96,11 @@ fn error_line(e: &CalcError) -> Line<'static> {
             if i > 0 {
                 spans.push(Span::styled(" ", red));
             }
-            let style = if i == trace.index { red.underlined() } else { red };
+            let style = if i == trace.index {
+                red.underlined()
+            } else {
+                red
+            };
             spans.push(Span::styled(element.to_string(), style));
         }
         spans.push(Span::styled("'", red));

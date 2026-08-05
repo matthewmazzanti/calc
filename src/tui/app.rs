@@ -284,11 +284,15 @@ impl App {
             // edit always hits the stack rather than being read as a word.
             KeyCode::Char('x') | KeyCode::Char('d') => {
                 let level = self.cursor;
-                self.edit(cursor_label("drop", "dropn", level), move |e| e.drop_at(level));
+                self.edit(cursor_label("drop", "dropn", level), move |e| {
+                    e.drop_at(level)
+                });
             }
             KeyCode::Char('s') => {
                 let level = self.cursor;
-                self.edit(cursor_label("swap", "swapn", level), move |e| e.swap_at(level));
+                self.edit(cursor_label("swap", "swapn", level), move |e| {
+                    e.swap_at(level)
+                });
             }
             // Ctrl-R redoes (vim-style); a bare `r` rotates at the cursor.
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => self.redo(),
@@ -305,7 +309,9 @@ impl App {
             // Copy the selected value to the top.
             KeyCode::Enter => {
                 let level = self.cursor;
-                self.edit(cursor_label("dup", "pickn", level), move |e| e.pick_at(level));
+                self.edit(cursor_label("dup", "pickn", level), move |e| {
+                    e.pick_at(level)
+                });
             }
             _ => {}
         }
@@ -765,7 +771,7 @@ mod tests {
         assert_eq!(app.stack(), &[1.0, 2.0, 3.0]);
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
         assert_eq!(app.stack(), &[1.0, 2.0]); // redone
-        // The restored snapshot carries the command that produced it.
+                                              // The restored snapshot carries the command that produced it.
         assert_eq!(app.cmd(), "drop");
     }
 

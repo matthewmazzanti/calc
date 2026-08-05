@@ -50,7 +50,8 @@ impl<T> History<T> {
     pub fn undo(&mut self) -> bool {
         match self.past.pop() {
             Some(previous) => {
-                self.future.push(std::mem::replace(&mut self.current, previous));
+                self.future
+                    .push(std::mem::replace(&mut self.current, previous));
                 true
             }
             None => false,

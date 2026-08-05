@@ -36,7 +36,10 @@ fn operand_order_is_left_to_right() {
 
 /// The `ErrorKind` from running `input` against a fresh engine.
 fn run_err(input: &str) -> ErrorKind {
-    Engine::new().apply(&parse(input).unwrap()).unwrap_err().kind
+    Engine::new()
+        .apply(&parse(input).unwrap())
+        .unwrap_err()
+        .kind
 }
 
 #[test]
@@ -106,7 +109,9 @@ fn a_type_error_names_the_mismatch_and_the_command() {
     // Ops no longer preserve their operands on error — atomicity is the
     // caller's transaction (see `an_error_leaves_the_callers_engine_untouched`).
     // The error still names the mismatch and which command failed.
-    let err = Engine::new().apply(&parse("true 1 +").unwrap()).unwrap_err();
+    let err = Engine::new()
+        .apply(&parse("true 1 +").unwrap())
+        .unwrap_err();
     assert_eq!(
         err.kind,
         ErrorKind::TypeError {
@@ -176,7 +181,10 @@ fn string_literals_hold_their_spaces() {
 #[test]
 fn string_escapes_are_decoded() {
     assert_eq!(run(r#""a\nb\tc""#).stack(), &[Value::from("a\nb\tc")]);
-    assert_eq!(run(r#""say \"hi\"""#).stack(), &[Value::from(r#"say "hi""#)]);
+    assert_eq!(
+        run(r#""say \"hi\"""#).stack(),
+        &[Value::from(r#"say "hi""#)]
+    );
 }
 
 #[test]
@@ -266,7 +274,11 @@ fn an_error_leaves_the_callers_engine_untouched() {
     // intact simply because it was never moved into `apply`.
     let original = run("1");
     assert_eq!(
-        original.clone().apply(&parse("+").unwrap()).unwrap_err().kind,
+        original
+            .clone()
+            .apply(&parse("+").unwrap())
+            .unwrap_err()
+            .kind,
         ErrorKind::StackUnderflow
     );
     assert_eq!(original.stack(), &[1.0]);
@@ -523,7 +535,10 @@ fn a_list_is_an_ordinary_value() {
     // It shuffles as one unit.
     assert_eq!(
         run("[ 1 2 ] dup").stack(),
-        &[list(&[Value::Int(1), Value::Int(2)]), list(&[Value::Int(1), Value::Int(2)])]
+        &[
+            list(&[Value::Int(1), Value::Int(2)]),
+            list(&[Value::Int(1), Value::Int(2)])
+        ]
     );
 }
 
@@ -582,17 +597,19 @@ fn cons_prepends_an_element() {
         &[list(&[Value::Int(1), Value::Int(2), Value::Int(3)])]
     );
     // Any value conses, onto the empty list too.
-    assert_eq!(
-        run(r#""x" [ ] cons"#).stack(),
-        &[list(&[Value::from("x")])]
-    );
+    assert_eq!(run(r#""x" [ ] cons"#).stack(), &[list(&[Value::from("x")])]);
 }
 
 #[test]
 fn append_concatenates_two_lists() {
     assert_eq!(
         run("[ 1 2 ] [ 3 4 ] append").stack(),
-        &[list(&[Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)])]
+        &[list(&[
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3),
+            Value::Int(4)
+        ])]
     );
     assert_eq!(run("[ ] [ ] append").stack(), &[list(&[])]);
 }
@@ -629,26 +646,19 @@ fn list_ops_compose() {
     // cons then first round-trips the head.
     assert_eq!(run("9 [ 1 2 ] cons first").stack(), &[Value::Int(9)]);
     // build up with append, read back with nth.
-    assert_eq!(
-        run("[ 1 ] [ 2 3 ] append 1 nth").stack(),
-        &[Value::Int(2)]
-    );
+    assert_eq!(run("[ 1 ] [ 2 3 ] append 1 nth").stack(), &[Value::Int(2)]);
 }
 
 #[test]
 fn mutating_a_shared_value_copies_on_write() {
     // `dup` shares the underlying `Rc`; a mutating op (`make_mut`) must copy
     // so the other holder is untouched — the immutability guarantee.
-    let one_two_three =
-        list(&[Value::Int(1), Value::Int(2), Value::Int(3)]);
+    let one_two_three = list(&[Value::Int(1), Value::Int(2), Value::Int(3)]);
 
     // List `rest` on the shared top leaves the bottom copy intact.
     assert_eq!(
         run("[ 1 2 3 ] dup rest").stack(),
-        &[
-            one_two_three.clone(),
-            list(&[Value::Int(2), Value::Int(3)])
-        ]
+        &[one_two_three.clone(), list(&[Value::Int(2), Value::Int(3)])]
     );
     // List `append` onto the shared top.
     assert_eq!(

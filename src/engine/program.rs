@@ -74,7 +74,9 @@ pub fn parse(input: &str) -> Result<Vec<Element>, ErrorKind> {
         if c.is_whitespace() {
             chars.next();
         } else if c == '"' {
-            program.push(Element::Literal(Value::Str(Rc::new(read_string(&mut chars)?))));
+            program.push(Element::Literal(Value::Str(Rc::new(read_string(
+                &mut chars,
+            )?))));
         } else {
             // A plain word: everything up to the next whitespace.
             let mut word = String::new();
