@@ -787,13 +787,13 @@ fn a_captured_builtin_runs_when_applied() {
 
 #[test]
 fn every_primitive_is_in_the_prelude() {
-    // The `PRIMITIVES` table is the source of the vocabulary; this guards
+    // The `ops` category tables are the source of the vocabulary; this guards
     // that the prelude binds each one under its canonical word.
     let base = prelude();
-    for &p in PRIMITIVES {
+    for p in ops::primitives() {
         assert_eq!(
             base.get(p.name),
-            Some(&Value::Builtin(p)),
+            Some(&Value::Builtin(*p)),
             "prelude missing `{}`",
             p.name,
         );

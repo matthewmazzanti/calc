@@ -129,6 +129,21 @@ Rust's coherence/orphan rules and lack of HKTs make it stub its toe (you land at
 `frunk`-style indexed traits). The table gives the concatenative-relevant
 extensibility — an open word dictionary — for free.
 
+**Two tiers: machine + vocabulary.** The ops are split as *free functions over
+`&mut Engine`*, not methods, grouped by category under `engine/ops/` (arith,
+compare, logic, stack, seq, env) — each module owns its words and a `PRIMITIVES`
+table of its rows, and `ops::primitives()` chains them for the prelude. This
+draws a real line: `Engine` exposes a small `pub(crate)` **stack-machine API**
+(`pop`/`push`/`pop_num`/…, the indexed shuffles `pick_at`/`drop_at`/…,
+`close_list`, `clear`, `lookup`/`bind`), and the **word vocabulary** is a layer
+of functions built on it that never touches the stack `Vec` directly. Words that
+were doing raw `Vec` surgery (`tuck`/`dupd`/`2dup`/`2drop`) became pop/push
+rearrangements; only genuine machine ops (the indexed shuffles, `close_list`'s
+mark scan) keep direct field access. Rationale: the vocabulary decouples from
+`Engine`'s representation, primitives read as "functions from stack to stack"
+(the Forth/Factor dictionary model), and that machine API *is* the interface the
+in-language quotation interpreter will call — so it's built now, not later.
+
 **Toward the in-language prelude.** When functions land, derived words (`over`,
 `rot`, `unrot`, `nip`, `tuck`, `dupd`, `2dup`, `2drop`) leave the Rust table and
 become an in-language prelude parsed at startup and bound into `base` alongside
