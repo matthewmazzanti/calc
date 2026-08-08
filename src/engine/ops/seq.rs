@@ -1,16 +1,18 @@
-//! Sequence words over the two collection types — lists (`[ ] first rest cons
-//! append nth`) and, where they overlap, strings (`length`, `to_str`). `[`
-//! opens a collection via the mark discipline; `]` is the machine's mark scan.
-//! The list mutators copy-on-write through `Rc::make_mut`.
+//! Sequence words over the two collection types — lists (`first rest cons
+//! append nth`) and, where they overlap, strings (`length`, `to_str`). The list
+//! mutators copy-on-write through `Rc::make_mut`.
+//!
+//! `[` and `]` are *not* here. They were prelude words under v1; in v2 they are
+//! fixed parser elements, paired in the text and never looked up, so their
+//! dispatch lives in `Engine::apply_one` (`language-v2.md` §§3–4). The mark
+//! discipline they drive is unchanged.
 
 use std::rc::Rc;
 
-use crate::engine::{Engine, ErrorKind, MarkKind, Primitive, Value};
+use crate::engine::{Engine, ErrorKind, Primitive, Value};
 
 #[rustfmt::skip]
 pub(super) static PRIMITIVES: &[Primitive] = &[
-    Primitive { name: "[",      run: open_list },          // push a list mark
-    Primitive { name: "]",      run: Engine::close_list },  // collect to the mark
     Primitive { name: "first",  run: first },               // [a b c] -- a
     Primitive { name: "rest",   run: rest },                // [a b c] -- [b c]
     Primitive { name: "cons",   run: cons },                // x [b c] -- [x b c]
@@ -19,12 +21,6 @@ pub(super) static PRIMITIVES: &[Primitive] = &[
     Primitive { name: "length", run: length },              // string/list count
     Primitive { name: "to_str", run: to_str },
 ];
-
-/// `[`: push a list mark, opening a collection (§13 mark discipline).
-fn open_list(e: &mut Engine) -> Result<(), ErrorKind> {
-    e.push(Value::Mark(MarkKind::List));
-    Ok(())
-}
 
 /// `first` ( [a b c] -- a ): the head of the top list; empty is out of range.
 fn first(e: &mut Engine) -> Result<(), ErrorKind> {

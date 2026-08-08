@@ -43,8 +43,8 @@ characters → [tokenize] → tokens → [parse] → tree → [evaluate] → val
 
 ### Tokenize
 
-Split on whitespace, with lookahead for **strings** and **comments**, which contain spaces. Ten
-characters always tokenize on their own, whatever they are adjacent to:
+Split on whitespace, with lookahead for **strings** (`"…"`) and **comments** (`#` to end of line),
+which contain spaces. Ten characters always tokenize on their own, whatever they are adjacent to:
 
 ```
 '  &  .  :  {  }  [  ]  (  )
@@ -55,8 +55,9 @@ then `f`. A `.` between digits is part of the number, which is the one place a t
 the split.
 
 That is the whole phase: a split, a character set, and one mode. The string and comment lookahead runs
-first, so a bracket or sigil inside `"..."` is text. The output is a flat sequence of tokens, and
-resolution, nesting, and meaning all belong to the parser.
+first, so a bracket or sigil inside `"..."` or after a `#` is text. The output is a flat sequence of
+tokens, and resolution, nesting, and meaning all belong to the parser — a token is a *word* until the
+parser decides whether it is a number, a boolean, or a name to resolve.
 
 ### Parse
 
@@ -105,9 +106,10 @@ call   apply the function on top of the stack
 ( ... )   dict          " ... "   string
 ```
 
-**All eleven of `{`, `}`, `[`, `]`, `(`, `)`, `'`, `&`, `.`, `:`, and `"` are fixed.** They belong to
-the tokenizer and parser, they are never looked up, and they cannot be rebound or shadowed. No name
-may contain one. All three bracket pairs are matched at parse time; `{ }` resolves there, while
+**All twelve of `{`, `}`, `[`, `]`, `(`, `)`, `'`, `&`, `.`, `:`, `"`, and `#` are fixed.** They
+belong to the tokenizer and parser, they are never looked up, and they cannot be rebound or shadowed.
+No name may contain one. The last two are the lookahead's — a `"` opens a string and a `#` a comment,
+so neither stands alone as a token the way the ten do. All three bracket pairs are matched at parse time; `{ }` resolves there, while
 `[ ]` and `( )` take effect at runtime (sections 6 and 7).
 
 **Two sigils, because the requirements are opposite.** `&f` fetches, and requires `f` to be bound.
@@ -170,8 +172,8 @@ land there. **Always, unconditionally**: a function that never binds gets an emp
 A function is a `{ }` bound in a module frame. Binding is the whole mechanism, in two argument orders:
 
 ```
-'square {dup *} =            \ name first
-{dup *} 'square set          \ value first
+'square {dup *} =            # name first
+{dup *} 'square set          # value first
 ```
 
 Both are primitive and both bind in the current frame. `=` suits a definition, whose value is a
@@ -394,7 +396,7 @@ A caller's frame is invisible to a callee:
 'f {y 1 +} =
 'a {'y 3 =  f} =
 'y 7 =
-a          \ 8, not 4
+a          # 8, not 4
 ```
 
 `f` resolves `y` through *its* chain, not `a`'s. No `uplevel`, no dynamic override, no injection.
@@ -551,8 +553,8 @@ a computed result, or an argument arriving from a caller — since there the nam
 buried under whatever the expression consumes, and `:` is better still for parameters.
 
 ```
-'area {w h: w h *} =        \ literal value: name first
-3 4 area 'total set         \ computed value: value first
+'area {w h: w h *} =        # literal value: name first
+3 4 area 'total set         # computed value: value first
 ```
 
 **Brackets sit against their contents**, `{dup *}` rather than `{ dup * }`, since the closers of a

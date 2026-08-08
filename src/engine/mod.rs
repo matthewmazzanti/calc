@@ -19,10 +19,12 @@ use std::rc::Rc;
 mod error;
 mod ops;
 mod program;
+mod token;
 mod value;
 
-pub use error::{CalcError, ErrorKind, Outcome, Trace};
-pub use program::{parse, Element};
+pub use error::{CalcError, ErrorKind, Outcome, ParseError, ParseErrorKind, Trace};
+pub use program::{parse, Element, Region};
+pub use token::Span;
 pub use value::{MarkKind, Value};
 
 // The words the TUI dispatches directly from its operator keys, re-exported so
@@ -153,7 +155,11 @@ impl Engine {
         Ok(self)
     }
 
-    /// Apply one program element: push a literal, or resolve a word.
+    /// Apply one program element: push a literal, resolve a word, fetch a
+    /// binding unapplied, or run a region's opener/closer. The parser accepts
+    /// the whole v2 surface, so the elements evaluation doesn't reach yet — a
+    /// template (V3), a dict region or an attribute (V5) — report
+    /// [`ErrorKind::Unimplemented`] rather than being absent from the tree.
     fn apply_one(&mut self, element: &Element) -> Result<(), ErrorKind> {
         match element {
             Element::Literal(value) => {
@@ -161,6 +167,30 @@ impl Engine {
                 Ok(())
             }
             Element::Word(name) => self.resolve_word(name),
+            // `&f` is application's reflective inverse: the binding is pushed,
+            // not run. Unlike `'f`, it requires `f` to be bound (§4).
+            Element::Fetch(name) => match self.lookup(name) {
+                Some(value) => {
+                    self.stack.push(value);
+                    Ok(())
+                }
+                None => Err(ErrorKind::UnboundName(name.to_string())),
+            },
+            // `[` and `]` are fixed elements, not words — the lookup every other
+            // token gets, these skip, so they can't be rebound or shadowed. Only
+            // the *dispatch* moved here; the mark discipline is unchanged (§6).
+            Element::Open(Region::List) => {
+                self.stack.push(Value::Mark(MarkKind::List));
+                Ok(())
+            }
+            Element::Close(Region::List) => self.close_list(),
+            Element::Template(_) => Err(ErrorKind::Unimplemented("functions")),
+            Element::Open(Region::Dict) | Element::Close(Region::Dict) => {
+                Err(ErrorKind::Unimplemented("dicts"))
+            }
+            Element::Attr(_) | Element::AttrFetch(_) => {
+                Err(ErrorKind::Unimplemented("attribute access"))
+            }
         }
     }
 

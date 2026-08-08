@@ -417,8 +417,8 @@ impl App {
         }
         let program = match engine::parse(self.input.text()) {
             Ok(program) => program,
-            Err(kind) => {
-                self.notice = Some(Notice::Note(format!("error: {kind}")));
+            Err(error) => {
+                self.notice = Some(Notice::Note(syntax_note(self.input.text(), &error)));
                 return false;
             }
         };
@@ -437,10 +437,11 @@ impl App {
     /// error is trace-less. `cmd` still reads the whole thing, e.g. `10 0 /`. On
     /// error the buffer is kept so the user can fix it.
     fn apply_operator(&mut self, op: Primitive) {
-        let program = match engine::parse(self.input.text().trim()) {
+        let source = self.input.text().trim().to_string();
+        let program = match engine::parse(&source) {
             Ok(program) => program,
-            Err(kind) => {
-                self.notice = Some(Notice::Note(format!("error: {kind}")));
+            Err(error) => {
+                self.notice = Some(Notice::Note(syntax_note(&source, &error)));
                 return;
             }
         };
@@ -519,6 +520,18 @@ fn cursor_label(fixed: &str, wordn: &str, level: usize) -> String {
     } else {
         format!("{wordn} {level}")
     }
+}
+
+/// The info-bar line for a syntax error: what is wrong, where, and the text to
+/// blame — `error: unclosed `[` at column 5 (`[`)`. A parse error costs nothing
+/// (no state to restore), so the diagnostic is the whole interface to it; the
+/// column is 1-based in *characters*, since that is what a reader counts.
+fn syntax_note(source: &str, error: &engine::ParseError) -> String {
+    let column = source[..error.span.start].chars().count() + 1;
+    format!(
+        "error: {error} at column {column} (`{}`)",
+        error.span.of(source)
+    )
 }
 
 /// Join a program into its canonical text (`10 0 /`), for the info bar's `cmd`.
@@ -638,13 +651,28 @@ mod tests {
     #[test]
     fn a_failed_entry_keeps_the_buffer_for_editing() {
         let mut app = App::new();
-        typ(&mut app, "1..2"); // neither a number nor a bound word
+        typ(&mut app, "1 nope"); // an unbound word
         press(&mut app, KeyCode::Enter);
         assert!(app.stack().is_empty());
-        assert_eq!(app.input.text(), "1..2");
-        // Now a runtime error (the word `1..2` is unbound), reported as such;
-        // the buffer is kept so it can be fixed.
+        assert_eq!(app.input.text(), "1 nope");
+        // A runtime error, reported with its trace; the buffer is kept so it
+        // can be fixed.
         assert!(matches!(app.notice, Some(Notice::Error(_))));
+    }
+
+    #[test]
+    fn a_syntax_error_reports_where_it_is() {
+        let mut app = App::new();
+        typ(&mut app, "1 2 ]"); // paired in the text is now the parser's rule
+        press(&mut app, KeyCode::Enter);
+        assert!(app.stack().is_empty());
+        assert_eq!(app.input.text(), "1 2 ]");
+        // A parse error has no engine state to show, so it's a plain note —
+        // but it locates itself, which is what the span is for.
+        let Some(Notice::Note(note)) = &app.notice else {
+            panic!("expected a note, got {:?}", app.stack());
+        };
+        assert_eq!(note, "error: unmatched `]` at column 5 (`]`)");
     }
 
     #[test]
@@ -691,10 +719,10 @@ mod tests {
     fn quote_stays_open_when_the_line_fails() {
         let mut app = App::new();
         ch(&mut app, '\'');
-        typ(&mut app, "1..2"); // not a number or a bound word
+        typ(&mut app, "1 nope"); // an unbound word
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.mode, Mode::Quote); // stay in quote to fix it
-        assert_eq!(app.input.text(), "1..2");
+        assert_eq!(app.input.text(), "1 nope");
         assert!(matches!(app.notice, Some(Notice::Error(_))));
     }
 

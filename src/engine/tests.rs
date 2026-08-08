@@ -480,9 +480,10 @@ fn words_run_while_collecting() {
 
 #[test]
 fn a_mark_is_a_typed_literal_not_a_floor() {
-    // A value word rejects the mark as an operand — `[ 1 +` is a type error.
+    // A value word rejects the mark as an operand — `[ 1 + ]` is a type error,
+    // raised at the `+` before the region ever closes.
     assert_eq!(
-        run_err("[ 1 +"),
+        run_err("[ 1 + ]"),
         ErrorKind::TypeError {
             expected: "number",
             found: "open list"
@@ -490,17 +491,18 @@ fn a_mark_is_a_typed_literal_not_a_floor() {
     );
     // Reaching the mark from an outer value type-errors the same way.
     assert_eq!(
-        run_err("1 [ 2 +"),
+        run_err("1 [ 2 + ]"),
         ErrorKind::TypeError {
             expected: "number",
             found: "open list"
         }
     );
     // Shuffles, though, move and copy the mark like any other value, so a
-    // collection is not a sealed scope.
+    // collection is not a sealed scope: `dup` leaves two marks, and the `]`
+    // takes the nearer one — closing an empty list and leaving the other open.
     assert_eq!(
-        run("[ dup").stack(),
-        &[Value::Mark(MarkKind::List), Value::Mark(MarkKind::List)]
+        run("[ dup ]").stack(),
+        &[Value::Mark(MarkKind::List), list(&[])]
     );
     // An under-supplied shuffle therefore reshapes rather than erroring:
     // `rot` lifts the mark to the top, so `]` closes an empty list.
@@ -511,23 +513,39 @@ fn a_mark_is_a_typed_literal_not_a_floor() {
 }
 
 #[test]
-fn an_open_collection_persists_on_the_stack() {
-    // Leaving `[` unclosed is legal — the mark stays, ready for a later `]`.
+fn a_region_reaches_backwards_over_the_stack() {
+    // The mark is an ordinary stack value, so permutation can move it beneath
+    // values that predate the region — which is what buys runtime sizing and
+    // splicing (`language-v2.md` §6). `unrot` sends the mark below the 1 and 2,
+    // so the `]` collects all three.
     assert_eq!(
-        run("[ 1 2").stack(),
-        &[Value::Mark(MarkKind::List), Value::Int(1), Value::Int(2)]
-    );
-    // A `]` in a later batch closes it.
-    assert_eq!(
-        run("[ 1 2").apply(&parse("]").unwrap()).unwrap().stack(),
-        &[list(&[Value::Int(1), Value::Int(2)])]
+        run("1 2 [unrot 3]").stack(),
+        &[list(&[Value::Int(1), Value::Int(2), Value::Int(3)])]
     );
 }
 
 #[test]
-fn an_unmatched_close_is_an_error() {
-    assert_eq!(run_err("]"), ErrorKind::UnmatchedClose);
-    assert_eq!(run_err("1 2 ]"), ErrorKind::UnmatchedClose);
+fn a_region_must_pair_in_the_text() {
+    // v2 pairs every bracket at parse time (§3), so an open collection can no
+    // longer be left dangling for a later line to close — the v1 trick is gone.
+    // What stays dynamic is *which* mark a closer consumes, not whether the
+    // text balances (§6).
+    assert_eq!(
+        parse("[ 1 2").unwrap_err().kind,
+        ParseErrorKind::UnclosedOpen('[')
+    );
+    assert_eq!(
+        parse("1 2 ]").unwrap_err().kind,
+        ParseErrorKind::UnmatchedClose(']')
+    );
+}
+
+#[test]
+fn a_closer_with_no_mark_left_is_a_runtime_error() {
+    // Paired in the text, but `drop` ate the mark. Marks are meant to be linear
+    // — one consumer, no `drop` (§6) — and until that discipline is enforced in
+    // the primitives, the closer's own check is what catches it.
+    assert_eq!(run_err("[ drop ]"), ErrorKind::UnmatchedClose);
 }
 
 #[test]
@@ -708,6 +726,28 @@ fn set_shadows_the_prior_binding() {
 #[test]
 fn get_on_an_unbound_name_fails() {
     assert_eq!(run_err("'y get"), ErrorKind::UnboundName("y".to_string()));
+}
+
+#[test]
+fn the_fetch_sigil_pushes_a_binding_unapplied() {
+    // `&x` is what `'x get` spells the long way — application's reflective
+    // inverse (§4). It's parser-owned, so it can't be shadowed the way `get`
+    // can, and unlike `'x` it demands that the name be bound.
+    assert_eq!(run("3 'x set &x").stack(), &[Value::Int(3)]);
+    assert_eq!(run("&+ to_str").stack(), &[Value::from("+")]);
+    assert_eq!(run_err("&nope"), ErrorKind::UnboundName("nope".to_string()));
+}
+
+#[test]
+fn the_parsed_but_unevaluated_surface_names_its_milestone() {
+    // The parser accepts all of v2; the evaluator catches up in V3 (functions)
+    // and V5 (dicts, attributes). Until then these are honest about which.
+    assert_eq!(run_err("{dup *}"), ErrorKind::Unimplemented("functions"));
+    assert_eq!(run_err("('x 1)"), ErrorKind::Unimplemented("dicts"));
+    assert_eq!(
+        run_err("3 .x"),
+        ErrorKind::Unimplemented("attribute access")
+    );
 }
 
 #[test]

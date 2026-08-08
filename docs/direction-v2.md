@@ -46,8 +46,13 @@ point (`language-v2.md` §6):
 | `[ ]` list | runtime | mark on the data stack, collected by the closer |
 | `( )` dict | runtime | same mark discipline, closer checks for pairs |
 
-So the open-collection-across-a-call trick survives for `[ ]` / `( )` only. A `{`
-must close in the function it opened in — the parser enforces it.
+What survives of v1's open-collection trick is *runtime* mark reordering, not
+unbalanced text: `1 2 [unrot 3]` still reaches backwards over values that predate
+the region, and a closer still takes whichever mark permutation left nearest
+(`language-v2.md` §6). But **all three pairs are matched and nest-checked in the
+text** (§3, and the `{ [ } ]` example) — so leaving a `[` open for a later line
+to close, as v1 allowed, is now a parse error. Parse-time pairing settles the
+text; which mark a given closer consumes stays dynamic.
 
 ## What v2 changes, relative to v1
 
@@ -94,8 +99,8 @@ Carrying M0–M3b forward unchanged; renumbering from the front end outward.
 | M | Scope | Status |
 |---|---|---|
 | **M0–M3b** | atoms, lists, `Rc`/COW, two-frame env, `set`/`get`, primitive table | **done (v1 model, carried forward)** |
-| **V1** | Tokenizer: `Token` type, 10 self-delimiting chars, `#` comments, number `.` exception | todo |
-| **V2** | Parser → tree: `Template`/`Fetch` elements, `[ ] ( )` as fixed elements, `'`/`&` consume-next, `:` params, the four parse errors | todo |
+| **V1** | Tokenizer: `Token` type, 10 self-delimiting chars, `#` comments, number `.` exception | **done** (`engine/token.rs`) |
+| **V2** | Parser → tree: `Template`/`Fetch` elements, `[ ] ( )` as fixed elements, `'`/`&` consume-next, `:` params, the four parse errors | **done** (`engine/program.rs`) |
 | **V3** | Functions (v2's M3c): `Value::Function`, frames in a `SlotMap` **heap** (`FrameId` parent chain), `call`, `&f`, `=` binder, `=`→`==` rename, snapshot = stack + module bindings | todo |
 | **V4** | Mark-and-sweep collector over the frames-only heap, run at transaction boundaries | todo |
 | **V5** | Dicts/objects: `( )` second mark kind, `.` access, methods & receivers, `put`, per-type attribute tables (dicts are `Rc`/COW, like lists) | todo |
@@ -137,6 +142,36 @@ Grow `Element` with `Template(Rc<[Element]>)` and `Fetch(Rc<str>)`. The parser:
   crossing closer, sigil with nothing following.
 
 This retires the per-token `Element::parse` model. It is the largest single piece.
+
+**As built (V1+V2), the decisions the prose left open:**
+
+- **Syntax errors are their own type.** `parse` returns `Result<Vec<Element>,
+  ParseError>` — a `ParseErrorKind` plus the **byte `Span`** of the offending
+  text — rather than an `ErrorKind`. That is §3's "syntax errors are free;
+  semantic errors are transactional" in the types: a `ParseError` has no `Trace`
+  and never reaches the engine. `ErrorKind::UnterminatedString` moved over;
+  `UnmatchedClose` stayed behind as the *runtime* half (a `]` whose mark was
+  eaten, e.g. `[ drop ]`, until mark linearity is enforced in the primitives).
+  The TUI renders a parse error with its column and the text to blame.
+- **The tokenizer classifies nothing.** A number, a boolean, and a word are all
+  `TokenKind::Word`; the parser decides. Only the *split* is shape-sensitive (the
+  `.` between digits). Strings arrive with escapes resolved, since the lookahead
+  owns them.
+- **`.` parses now, evaluates later.** `obj.x` → `Attr`, `obj.&x` → `AttrFetch`,
+  so the whole v2 surface parses ahead of the evaluator. A parsed-but-unevaluable
+  element reports `ErrorKind::Unimplemented("functions" | "dicts" | "attribute
+  access")`, naming the milestone that retires it.
+- **`&f` landed early.** It is exactly `'f get` with a parser-owned spelling, so
+  the fetch element evaluates today rather than waiting for V3.
+- **Parameters are any run of words before a `:`.** The scan doesn't check that a
+  name looks like an identifier, matching `'3 set` being legal — `{x 3: …}` binds
+  a name `3` rather than erroring. A `:` the scan can't reach (after a non-word,
+  a second one in a body, or outside a template) is `MisplacedColon`.
+- **Two error kinds beyond the doc's four.** `MisplacedColon`, since `:` is the
+  one construct recognized by position; and `TooDeeplyNested` — `{` is the
+  parser's own recursion, so nesting is capped (256 open regions) rather than
+  letting pasted input overflow the Rust stack and abort the session. The cap is
+  an implementation bound, not a language rule.
 
 ### Memory model — chosen representation (supersedes the arena in V3/V4 below)
 

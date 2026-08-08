@@ -1,23 +1,34 @@
-//! Errors: the state-independent [`ErrorKind`], and the [`CalcError`] that pairs
-//! it with a [`Trace`] of the program that was running. [`Outcome`] is what
-//! [`Engine::apply`](super::Engine::apply) returns.
+//! Errors, split by phase (`language-v2.md` §3: "syntax errors are free;
+//! semantic errors are transactional"):
+//!
+//! - [`ParseError`] — a [`ParseErrorKind`] plus the [`Span`] of the offending
+//!   text. Raised before evaluation, so there is no state to restore: an
+//!   unbalanced `{` costs nothing.
+//! - [`ErrorKind`] — the state-independent *semantic* error, paired by
+//!   [`CalcError`] with a [`Trace`] of the program that was running.
+//!
+//! [`Outcome`] is what [`Engine::apply`](super::Engine::apply) returns.
 
-use super::{Element, Engine};
+use super::{Element, Engine, Span};
 
 /// What went wrong — the semantic error, independent of any engine state. This
-/// is what the pure parsing/index helpers produce; a failing engine op pairs it
-/// with the engine to form a [`CalcError`].
+/// is what the pure index helpers produce; a failing engine op pairs it with the
+/// engine to form a [`CalcError`]. Syntax has its own type ([`ParseError`]).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ErrorKind {
     /// An operation needed more operands than the stack held.
     StackUnderflow,
     /// Division with a zero divisor.
     DivideByZero,
-    /// A `"` string literal ran to end-of-input without a closing `"`.
-    UnterminatedString,
-    /// A `]` with no open collection to close (or, later, one whose open mark is
-    /// the wrong kind — a `]` closing a `{`).
+    /// A `]` reached with no mark on the stack. The parser already pairs the
+    /// brackets in the text, so this is the *runtime* half of the discipline:
+    /// which mark a closer consumes is settled by permutation, not by the text
+    /// (§6).
     UnmatchedClose,
+    /// A parsed construct the evaluator doesn't run yet — functions (V3), dicts
+    /// and attribute access (V5). The parser accepts the whole v2 surface ahead
+    /// of the evaluator, so this names the milestone that will retire it.
+    Unimplemented(&'static str),
     /// A list index (or `first`/`rest` on an empty list) fell outside the list.
     IndexOutOfRange,
     /// `get` on a name with no binding in the environment.
@@ -36,8 +47,8 @@ impl std::fmt::Display for ErrorKind {
         match self {
             ErrorKind::StackUnderflow => write!(f, "too few arguments"),
             ErrorKind::DivideByZero => write!(f, "divide by zero"),
-            ErrorKind::UnterminatedString => write!(f, "unterminated string"),
-            ErrorKind::UnmatchedClose => write!(f, "unmatched ]"),
+            ErrorKind::UnmatchedClose => write!(f, "no open collection to close"),
+            ErrorKind::Unimplemented(what) => write!(f, "not yet implemented: {what}"),
             ErrorKind::IndexOutOfRange => write!(f, "index out of range"),
             ErrorKind::UnboundName(n) => write!(f, "unbound name: {n}"),
             ErrorKind::TypeError { expected, found } => {
@@ -46,6 +57,77 @@ impl std::fmt::Display for ErrorKind {
         }
     }
 }
+
+/// A syntax error: what is wrong, and where. Every kind here is detectable
+/// before evaluation, and all but [`ParseErrorKind::UnclosedOpen`] are
+/// detectable *at* the offending token rather than at end of input
+/// (`language-v2.md` §3).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParseErrorKind {
+    /// A `"` literal ran to end-of-input without a closing `"`. The tokenizer's
+    /// error; every other kind is the parser's.
+    UnterminatedString,
+    /// A closer with nothing of its kind open: `1 2 ]`.
+    UnmatchedClose(char),
+    /// An opener never closed: `[ 1 2`. The one error that can only be raised at
+    /// end of input, so its span points back at the opener.
+    UnclosedOpen(char),
+    /// A closer that crosses a region opened inside another: `{ [ } ]`. Regions
+    /// must nest, so the `}` here would close across the still-open `[`.
+    CrossingClose { closer: char, crossed: char },
+    /// A sigil with nothing usable following it: a trailing `'`, or `&{`. The
+    /// ten fixed characters can't appear in a name, so only a word will do.
+    ExpectedName { after: char },
+    /// A `:` outside a template's leading parameter list — the one construct the
+    /// parser recognizes by position (§5), so `:` anywhere else is an error.
+    MisplacedColon,
+    /// Templates nested past the parser's recursion limit. Not a language rule —
+    /// an implementation bound, so that pathological input is a *diagnostic*
+    /// rather than a stack overflow that would abort the process and take the
+    /// session's stack and history with it.
+    TooDeeplyNested,
+}
+
+impl std::fmt::Display for ParseErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseErrorKind::UnterminatedString => write!(f, "unterminated string"),
+            ParseErrorKind::UnmatchedClose(c) => write!(f, "unmatched `{c}`"),
+            ParseErrorKind::UnclosedOpen(c) => write!(f, "unclosed `{c}`"),
+            ParseErrorKind::CrossingClose { closer, crossed } => {
+                write!(f, "`{closer}` crosses an open `{crossed}`")
+            }
+            ParseErrorKind::ExpectedName { after } => write!(f, "expected a name after `{after}`"),
+            ParseErrorKind::MisplacedColon => {
+                write!(f, "`:` is only valid after a template's parameter names")
+            }
+            ParseErrorKind::TooDeeplyNested => write!(f, "templates nested too deeply"),
+        }
+    }
+}
+
+/// A syntax error paired with the [`Span`] of the text to blame. The span is
+/// what lets a caller underline the offending characters; `Display` is the
+/// message alone, since the source isn't the error's to hold.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParseError {
+    pub kind: ParseErrorKind,
+    pub span: Span,
+}
+
+impl ParseError {
+    pub(crate) fn new(kind: ParseErrorKind, span: Span) -> Self {
+        Self { kind, span }
+    }
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.kind)
+    }
+}
+
+impl std::error::Error for ParseError {}
 
 /// The program that was executing when an error struck, and the index of the
 /// element that failed — "here's what was running."
@@ -64,8 +146,9 @@ pub struct CalcError {
     /// What went wrong.
     pub kind: ErrorKind,
     /// The program being run and which element failed, for a runtime error.
-    /// `None` for parse errors (whose offending token is already named in
-    /// `kind`) and for bare-op failures that carry no program.
+    /// `None` for a bare-op failure that carries no program (a TUI operator key,
+    /// a cursor edit). A syntax error never gets here — it is a [`ParseError`],
+    /// raised before there is any program to trace.
     pub trace: Option<Trace>,
 }
 
