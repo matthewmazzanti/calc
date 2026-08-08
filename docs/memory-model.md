@@ -16,7 +16,7 @@
 One arena for everything; refcounting recreated over it; tracing as the
 correctness authority.
 
-This is the full design behind [`direction-v2.md`](direction-v2.md) §V3/§V3.5. Rust
+This is the full design behind [`direction-v2.md`](direction-v2.md) §V3/§V4. Rust
 has no garbage collector, so an interpreter with first-class closures has to bring
 its own.
 
@@ -543,7 +543,7 @@ handles, the dance comes back.
 ## 7. Two independent axes for later (both deferred)
 
 The baseline — eager frame allocation, pure-trace at boundaries — is the simplest
-correct thing and what V3/V3.5 build. Two orthogonal refinements exist. They are
+correct thing and what V3/V4 build. Two orthogonal refinements exist. They are
 **different axes** and are not alternatives to each other:
 
 - **Allocation axis — *when* a frame is born.**

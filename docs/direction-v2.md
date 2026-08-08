@@ -97,11 +97,11 @@ Carrying M0–M3b forward unchanged; renumbering from the front end outward.
 | **V1** | Tokenizer: `Token` type, 10 self-delimiting chars, `#` comments, number `.` exception | todo |
 | **V2** | Parser → tree: `Template`/`Fetch` elements, `[ ] ( )` as fixed elements, `'`/`&` consume-next, `:` params, the four parse errors | todo |
 | **V3** | Functions (v2's M3c): `Value::Function`, frames in a `SlotMap` **heap** (`FrameId` parent chain), `call`, `&f`, `=` binder, `=`→`==` rename, snapshot = stack + module bindings | todo |
-| **V3.5** | Mark-and-sweep collector over the frames-only heap, run at transaction boundaries | todo |
-| **V4** | Dicts/objects: `( )` second mark kind, `.` access, methods & receivers, `put`, per-type attribute tables (dicts are `Rc`/COW, like lists) | todo |
-| **V5** | Vocabulary, mostly in-language: startup-parsed prelude, `dip keep bi`, `if when cond`, `each map filter reduce`; move derived stack words out of Rust | todo |
+| **V4** | Mark-and-sweep collector over the frames-only heap, run at transaction boundaries | todo |
+| **V5** | Dicts/objects: `( )` second mark kind, `.` access, methods & receivers, `put`, per-type attribute tables (dicts are `Rc`/COW, like lists) | todo |
+| **V6** | Vocabulary, mostly in-language: startup-parsed prelude, `dip keep bi`, `if when cond`, `each map filter reduce`; move derived stack words out of Rust | todo |
 
-V1–V3 are the spine — the point where closures run. V4–V5 build on it.
+V1–V4 are the spine — closures run at V3, their memory reclaimed at V4. V5–V6 build on it.
 
 ### V1 — split tokenize from parse
 
@@ -138,10 +138,10 @@ Grow `Element` with `Template(Rc<[Element]>)` and `Fetch(Rc<str>)`. The parser:
 
 This retires the per-token `Element::parse` model. It is the largest single piece.
 
-### Memory model — chosen representation (supersedes the arena in V3/V3.5 below)
+### Memory model — chosen representation (supersedes the arena in V3/V4 below)
 
 The frame representation converged on the **`Rc`-spine split** (`src/rc_heap.rs`;
-see `memory-model.md`'s top note), *not* the slotmap arena the V3/V3.5 prose below
+see `memory-model.md`'s top note), *not* the slotmap arena the V3/V4 prose below
 still describes. The arena reasoning — the cycle theorem, non-owning ids — remains
 correct and is kept for the record, but the representation is now:
 
@@ -160,23 +160,23 @@ correct and is kept for the record, but the representation is now:
   and uncaptured call frames — is reclaimed **promptly** by plain `Rc` drop, so the
   prompt-cleanup goal falls out for free with no counted-handle machinery.
 
-**Sub-targets (V3/V3.5 split).** The thing deferred past the collector is *reclamation*,
-not the snapshot — the snapshot rework rides in V3a because it's required for
+**V3 / V4 split — functions, then collector.** The thing deferred past the collector is *reclamation*,
+not the snapshot — the snapshot rework rides in V3 because it's required for
 error-safety anyway, and it's cheap there precisely because no collector complicates
 it yet.
 
-- **V3a — Functions.** VM call-stack loop, `Value::Function`, `{ }` templates →
+- **V3 — Functions.** VM call-stack loop, `Value::Function`, `{ }` templates →
   closures, `Rc<RefCell<Frame>>` frames + `parent` chain, `call`/`&`/`=`, TCO.
   Replace the clone-`Engine` transaction with the **target snapshot = stack + a
   value-copy of the module frame's bindings** (restore-on-rollback). This keeps
   *both* non-destructive errors and undo/redo, because **with no collector nothing
   is swept**: every history snapshot's `Function` values pin their captured frames by
-  strong `Rc`, so the timeline can't dangle — frames simply *leak*, reclaimed in V3b.
+  strong `Rc`, so the timeline can't dangle — frames simply *leak*, reclaimed in V4.
   ~15 lines, and it's the model we ship, not throwaway. *(Fallback if the
   History↔Engine restructure stalls validating functions: exit/report-fatally on
-  error and skip the snapshot until V3b — throwaway, drops undo/redo. Avoid unless
+  error and skip the snapshot until V4 — throwaway, drops undo/redo. Avoid unless
   actually blocked.)*
-- **V3b — Collector.** `Weak` registry + mark/neutralize `collect` at the `apply`
+- **V4 — Collector.** `Weak` registry + mark/neutralize `collect` at the `apply`
   boundary. Its roots must span the **whole history timeline** (current stack +
   module frame + every past/future snapshot), not just the current state, or an undo
   to a state whose bindings reference a swept cyclic frame would dangle. Acyclic
@@ -213,7 +213,7 @@ dynamic chain never needs to be an enumerable GC root.
   arm beside the existing `Builtin => run` / `data => push`.
 - **Stateful combinators** (`dip`/`while`/`each`/`bi`) go **in-language** — recursive
   definitions over `if`/`call`/`=`, run flat by TCO. No native continuation machinery
-  (this is the V5 "vocabulary in-language" direction, not a workaround).
+  (this is the V6 "vocabulary in-language" direction, not a workaround).
 - **TCO lives in the loop:** `push_call` must pop an already-exhausted top activation
   *before* pushing the callee (replace, don't stack), or tail recursion regrows the
   call stack and the VM's whole purpose is lost.
@@ -244,7 +244,7 @@ Revisit before writing any native code that invokes a callable beyond `if`/`call
   chains to it. Applying a function inserts a new frame whose parent is the
   function's captured `env`, always, even when nothing binds. Lookup walks the
   parent chain. **`FrameId` is not owning** — reachability, not refcount, keeps a
-  frame alive (V3.5), which is precisely what lets a definition-cycle be
+  frame alive (V4), which is precisely what lets a definition-cycle be
   collected. Slotmap's generational keys also mean a stale id in a swept value
   can't alias a freshly allocated frame (no ABA).
 - **Application runs a function.** `apply_value` grows a `Function` arm: insert a
@@ -262,7 +262,7 @@ Revisit before writing any native code that invokes a callable beyond `if`/`call
   HAMT for the module bindings would make even that clone a pointer copy — §8's
   deferred win.)
 
-### V3.5 — mark-and-sweep collector
+### V4 — mark-and-sweep collector
 
 **The arena holds frames only.** Why so little: **every reference cycle contains
 a frame.** Lists, dicts, and strings are immutable and built bottom-up, so their
@@ -420,7 +420,7 @@ first-class frames + workspace serialization (`language.md` §9.5, §9.7) make a
 single addressable heap pay for itself** — and if so, adopt `bacon-rajan-cc`
 rather than hand-rolling the coexistence logic.
 
-### V4 — dicts / objects
+### V5 — dicts / objects
 
 `( )` opens a **second mark kind**; its closer checks the region collected to
 pairs with a name-or-datum key. `.` is fixed syntax the parser turns into
@@ -430,7 +430,7 @@ key stores verbatim. `put` returns a new dict and refuses name keys holding
 functions. Per-type attribute tables make `lst.map` work and `'map {.map} =`
 fall out. Naturally its own milestone.
 
-### V5 — vocabulary, mostly in-language
+### V6 — vocabulary, mostly in-language
 
 A **startup-parsed prelude** bound into `base`: move the derived stack words
 (`over rot unrot nip tuck dupd 2dup 2drop`) out of the Rust table, leaving a true
@@ -463,7 +463,7 @@ Unchanged from v1 (`language.md` §11), plus what the chain adds:
   *outside* the call frame it captured. `Weak` can't rescue the definition case:
   neither edge is a demotable back edge (a closure must keep its frame alive, and a
   frame owns its bindings). This is exactly why V3 puts frames in a slotmap heap
-  and V3.5 collects them by reachability rather than refcount — the leak is
+  and V4 collects them by reachability rather than refcount — the leak is
   designed out, at the cost of a mark-sweep trace at each transaction boundary.
 - **A frame per application**, whether or not anything binds.
 - **Per-access indirection** — a value is a nullary function, so every read is an
