@@ -1,0 +1,377 @@
+# Branch direction — v2 (`concatenative-language`)
+
+**Status: the target model. Full replacement, not a selective pull-in.**
+
+[`direction.md`](direction.md) planned the v1 language ([`language.md`](language.md))
+and hedged that its pieces "may be rolled back, or pulled into the calculator
+selectively." This document supersedes that intent. [`language-v2.md`](language-v2.md)
+is now the language we are building toward, and the plan here is to **rewrite the
+implementation to match it** — the v1 model is replaced in the code, not layered
+over. `direction.md` and `language.md` are kept for history; where the two
+disagree, v2 wins.
+
+The code today sits at **M3b** (see `direction.md`'s ladder): scalar atoms,
+lists via the runtime mark discipline, a two-frame environment (`top` over an
+`Rc<base>` prelude), `set`/`get`, bare-word resolution, primitives as a dispatch
+table. That is the *v1* model, and M3c (functions) was never built — which is why
+retargeting now is cheap. Everything through M3b carries forward; v2 changes what
+comes next.
+
+## The shift that reshapes everything: a parse tree
+
+v1 was built on "**code is data, and there is no tree**" (`language.md` §4) —
+`{ }` was a *runtime* mark like `[ ]`, collection could span function boundaries,
+and leaving a bracket open was load-bearing. v2 introduces a real parse phase:
+
+```
+characters → [tokenize] → tokens → [parse] → tree → [evaluate] → values
+```
+
+**`{ }` becomes a parse-time template**, not a runtime collection. The parser
+recurses on `{`/`}` and emits a **template** — an element sequence with no
+environment — which evaluation pairs with the current frame to make a
+**function** value. This is a *deliberate reversal* of v1's central metaprogramming
+bet (`language.md` §5, §8, §13 "metaprogramming horrors"), and it is confirmed as
+one of the two defining moves of v2.
+
+The runtime mark discipline is not gone — it moves to where it belongs. Lists and
+dicts still open a mark at runtime and collect at a closer, because their contents
+are *values that come into existence during evaluation*. Functions hold *words
+that already exist at parse time*, so they need no deferral. The split is the
+point (`language-v2.md` §6):
+
+| Construct | When | Mechanism |
+|---|---|---|
+| `{ }` function | parse time | parser recursion → template; frame paired at eval |
+| `[ ]` list | runtime | mark on the data stack, collected by the closer |
+| `( )` dict | runtime | same mark discipline, closer checks for pairs |
+
+So the open-collection-across-a-call trick survives for `[ ]` / `( )` only. A `{`
+must close in the function it opened in — the parser enforces it.
+
+## What v2 changes, relative to v1
+
+| Area | v1 (current code) | v2 (target) |
+|---|---|---|
+| Front end | per-token flat pass, no tree | tokenize → **parse tree** → evaluate |
+| `{ }` | runtime mark | **parse-time template** |
+| Tokenizer | whitespace + string/sigil lookahead; brackets are words | 10 self-delimiting chars `' & . : { } [ ] ( )`; `[1 2 3]`≡`[ 1 2 3 ]` |
+| Comments | none | **`#` to end of line** (Python-style) |
+| Parse errors | unterminated string only | + unmatched close, unclosed open, crossing regions, dangling sigil |
+| Unquote `~( )` | quasiquote for computed bodies | **removed** — templates hold parse-time words, nothing to splice |
+| `=` | equality | **binder** (name-first `'sq {dup *} =`); equality becomes `==` |
+| Parameters | none | `{w h: …}` ≡ `{'h set 'w set …}`, parser-recognized by position |
+| `[ ]` `]` | prelude primitives (words) | **fixed parser elements**, never looked up |
+| `( )` | freed (rejected infix) | **dicts** — literal, `.` access, methods, `put` |
+| `.` `:` | not syntax | fixed tokenizer/parser characters |
+| Frames | two, flat (`top`/`base`) | a **parent-pointer chain** of `Rc` frames |
+
+## Confirmed decisions
+
+- **`{ }` is parse-time.** The reversal above. The parser owns nesting; a template
+  is env-less, immutable, parsed once, shared.
+- **Comments are `#` to end of line**, Python-style. Recognized in the tokenizer's
+  lookahead phase alongside strings (so a `#` inside `"…"` is text, and a comment
+  may contain any character including the 10 delimiters). No block-comment form.
+- **Frames live in a heap, collected by mark-and-sweep.** Frames are *not* `Rc`s —
+  because every function definition binds a closure into the frame it captured, a
+  frame → function → `env` self-cycle that refcounting cannot reclaim (see the
+  debts section). So frames live in a `SlotMap<FrameId, Frame>`, values reference
+  them by `FrameId` (a parent chain is `Option<FrameId>`), and a mark-and-sweep
+  pass over the reachable set collects the cycles. This is the load-bearing reason
+  the environment is a heap and not a tree of `Rc`s; the collector is specified in
+  its own section below. Str, list, and dict stay `Rc` (immutable trees that never
+  *close* a cycle — every cycle routes through a frame), kept for COW /
+  in-place-when-unique, traced during mark and reclaimed by refcount.
+- **v2 replaces v1 in the code.** The parser is rewritten, not extended; `[`/`]`
+  leave the vocabulary; `=` is repurposed. No compatibility shim with the v1
+  surface.
+
+## Milestone ladder (v2)
+
+Carrying M0–M3b forward unchanged; renumbering from the front end outward.
+
+| M | Scope | Status |
+|---|---|---|
+| **M0–M3b** | atoms, lists, `Rc`/COW, two-frame env, `set`/`get`, primitive table | **done (v1 model, carried forward)** |
+| **V1** | Tokenizer: `Token` type, 10 self-delimiting chars, `#` comments, number `.` exception | todo |
+| **V2** | Parser → tree: `Template`/`Fetch` elements, `[ ] ( )` as fixed elements, `'`/`&` consume-next, `:` params, the four parse errors | todo |
+| **V3** | Functions (v2's M3c): `Value::Function`, frames in a `SlotMap` **heap** (`FrameId` parent chain), `call`, `&f`, `=` binder, `=`→`==` rename, snapshot = stack + module bindings | todo |
+| **V3.5** | Mark-and-sweep collector over the frames-only heap, run at transaction boundaries | todo |
+| **V4** | Dicts/objects: `( )` second mark kind, `.` access, methods & receivers, `put`, per-type attribute tables (dicts are `Rc`/COW, like lists) | todo |
+| **V5** | Vocabulary, mostly in-language: startup-parsed prelude, `dip keep bi`, `if when cond`, `each map filter reduce`; move derived stack words out of Rust | todo |
+
+V1–V3 are the spine — the point where closures run. V4–V5 build on it.
+
+### V1 — split tokenize from parse
+
+Today tokens go straight to `Element` via `Element::parse`; there is no token
+type. Introduce one. The tokenizer:
+
+- runs **string and `#`-comment lookahead first**, so the 10 delimiters and
+  sigils inside `"…"` or after `#` are text;
+- treats `' & . : { } [ ] ( )` as **self-delimiting** — each its own token
+  whatever it abuts, so `[1 2 3]` and `{x *}` tokenize like their spaced forms;
+- keeps the one shape-sensitive case: a `.` **between digits** is part of the
+  number (`3.5`), not a delimiter.
+
+New `ErrorKind`s for the parse phase are unlocked here but raised in V2.
+
+### V2 — recursive parser → tree
+
+Grow `Element` with `Template(Rc<[Element]>)` and `Fetch(Rc<str>)`. The parser:
+
+- **recurses on `{` / `}`**, building a nested template; depth is its own
+  recursion, no counter;
+- **consume-next** for the sigils: `'` takes the next token as a `Name` literal,
+  `&` as a `Fetch`;
+- emits `[ ] ( )` as **fixed region elements**, not word references — the lookup
+  every other token gets, these skip. Their runtime effect (push-mark / collect)
+  stays as engine methods; only the *dispatch* moves from word-resolution to a
+  fixed element. `[`/`]` leave `ops/seq.rs`;
+- **pairs and nest-checks** all of `{} [] ()`, rejecting a closer that crosses a
+  region opened inside another (`{ [ } ]`);
+- rewrites a leading `name… :` inside a template into the `set` prefix
+  (`{w h: …}` → `'h set 'w set …`), the one construct recognized by position;
+- raises the four parse errors: closer with nothing open, opener never closed,
+  crossing closer, sigil with nothing following.
+
+This retires the per-token `Element::parse` model. It is the largest single piece.
+
+### V3 — functions, frames, `call`, `&`, `=` (v2's M3c)
+
+- **`Value::Function { template: Rc<[Element]>, env: FrameId }`.** Evaluating a
+  `Template` element instantiates one by pairing the template with the current
+  frame's id — cheap, a pointer plus a 32-bit handle.
+- **Frames in a slotmap heap.** Replace the flat `top`/`base` pair with a
+  `Heap { frames: SlotMap<FrameId, Frame> }`, where `Frame { parent:
+  Option<FrameId>, bindings }`. The prelude is the root frame; the module frame
+  chains to it. Applying a function inserts a new frame whose parent is the
+  function's captured `env`, always, even when nothing binds. Lookup walks the
+  parent chain. **`FrameId` is not owning** — reachability, not refcount, keeps a
+  frame alive (V3.5), which is precisely what lets a definition-cycle be
+  collected. Slotmap's generational keys also mean a stale id in a swept value
+  can't alias a freshly allocated frame (no ABA).
+- **Application runs a function.** `apply_value` grows a `Function` arm: insert a
+  frame, evaluate the template against it, return. Bare-word late binding still
+  resolves the name at application time, giving recursion for free.
+- **`call`** applies the function on top of the stack; **`&f`** pushes the bound
+  value unapplied (the fetch element from V2); **`=`** binds name-first.
+- **Rename equality `=` → `==`** in `compare.rs` and rewire the TUI operator key.
+  `=` is now the binder.
+- **Transaction snapshot = stack + module bindings.** The heap is shared and
+  append-mostly, so a snapshot no longer clones frames — it clones the data stack
+  and the module frame's binding list (the one frame mutated in place at the REPL
+  top level). Rollback restores those two; the failed line's call frames and any
+  orphaned closures become unreachable and are swept by the next collection. (A
+  HAMT for the module bindings would make even that clone a pointer copy — §8's
+  deferred win.)
+
+### V3.5 — mark-and-sweep collector
+
+**The arena holds frames only.** Why so little: **every reference cycle contains
+a frame.** Lists, dicts, and strings are immutable and built bottom-up, so their
+edges only ever point *backward in time* — a cycle needs a forward edge to close
+the loop, and the sole heap node that can gain one is a frame, the only thing
+mutable *while live* (you bind a closure into the very frame it captured). So
+sweeping unreachable frames breaks every cycle, and the `Rc` data they held then
+cascades away by refcount. Dicts, lists, and strings are all `Rc` — the arena
+never holds them.
+
+Representation:
+
+```rust
+new_key_type! { struct FrameId; }
+
+enum Value {
+    Int(i64), Num(f64), Bool(bool),          // inline leaves
+    Name(Rc<str>), Str(Rc<String>),          // refcount leaves
+    List(Rc<Vec<Value>>),                     // refcount aggregate — COW, traced-through
+    Dict(Rc<Dict>),                           // refcount aggregate — COW, traced-through
+    Builtin(Primitive),
+    Fn { template: Rc<[Element]>, env: FrameId },   // the ONLY edge into the arena
+    // Mark(..) is stack-only — never stored in a frame or value
+}
+
+struct Frame { parent: Option<FrameId>, bindings: Vec<(Rc<str>, Value)> }
+struct Heap  { frames: SlotMap<FrameId, Frame> }   // frames only
+```
+
+The whole tracing surface is two edges: `Fn.env` and `Frame.parent`. The
+collector marks from the roots (recursing *through* the `Rc` aggregates to reach
+frames), then sweeps the one slotmap:
+
+```rust
+impl Heap {
+    fn mark_value(&self, v: &Value, seen: &mut FrameSet) {
+        match v {
+            Value::Fn { env, .. } => self.mark_frame(*env, seen),
+            Value::List(items)    => items.iter().for_each(|v| self.mark_value(v, seen)),
+            Value::Dict(d)        => d.entries.iter().for_each(|(_, v)| self.mark_value(v, seen)),
+            _                     => {}   // leaves: no arena edges
+        }
+    }
+
+    fn mark_frame(&self, id: FrameId, seen: &mut FrameSet) {
+        if !seen.insert(id) { return }               // already visited — cycles stop here
+        let f = &self.frames[id];
+        for (_, v) in &f.bindings { self.mark_value(v, seen) }
+        if let Some(p) = f.parent { self.mark_frame(p, seen) }
+    }
+
+    fn collect(&mut self, module: FrameId, chain: &[FrameId], stack: &[Value]) {
+        let mut seen = FrameSet::default();
+        self.mark_frame(module, &mut seen);              // roots: module frame,
+        for f in chain { self.mark_frame(*f, &mut seen) }    // the live call chain,
+        for v in stack { self.mark_value(v, &mut seen) }     // and the data stack
+        self.frames.retain(|id, _| seen.contains(id));   // the only reclamation the GC does
+    }
+}
+```
+
+Chosen over `gc-arena`, whose `Gc<'gc, T>` brand-lifetime threads through every
+signature — an ugly tax for a single-threaded REPL. This is ~30 lines with
+explicit roots.
+
+**Why keep a refcount at all — in-place-when-unique.** The reason to refcount the
+data is not reclamation, it's **opportunistic mutation**: `Rc::make_mut` mutates
+in place when the strong count is 1 and clones otherwise, so `map`/`cons`/`append`/
+`put` on a uniquely-owned value run destructively — one copy (or zero), then
+in-place for the rest. This is Roc's model, and the core of Koka's **Perceus**
+(Reinking et al., PLDI 2021): a refcount as the runtime *uniqueness oracle* that
+licenses in-place update of immutable data (Clean's uniqueness types are the
+static ancestor). We get collection-granularity reuse for free via `make_mut` —
+not Perceus's precise cell-level reuse tokens, which would be a compiler pass, but
+`Vec`-in-place is the right granularity here anyway. Roc needs *no* tracer because
+its data can't cycle; we need one *only* because our interactive, late-bound,
+mutable frames create the cycles Roc's design forbids. Hence the whole shape:
+**Roc for the data, a small tracer for the frames.**
+
+**The four invariants that let tracing and refcounting coexist safely** — the
+crux being that no object is managed by both:
+
+1. **Disjoint ownership → no double-free.** A frame is freed only by the sweep's
+   `retain`; a list/dict/string only by its `Rc` reaching zero. When the sweep
+   drops a dead frame, its bindings drop, decrementing the `Rc`s it held — normal
+   Rust `Drop`, the only way the tracer ever touches the refcount side. No path
+   frees an object twice. (This disjointness is exactly what CPython / Bacon–Rajan
+   lack, and why theirs is hard — see the unified-arena note below.)
+2. **Mark must traverse `Rc` aggregates.** A closure reachable only through a list
+   on the stack (`[ &f ]`) keeps its frame alive, so `mark_value` recursing into
+   `List`/`Dict` is load-bearing — it is the one bridge from the refcount world
+   into the traced world.
+3. **Dangling `FrameId` is impossible.** A reachable `Fn` marks its `env`, so
+   every live closure has a live frame; stale ids exist only inside already-dead
+   objects, and slotmap's generational keys stop a stale id aliasing a fresh frame
+   (`get` returns `None` on version mismatch). No dangling deref, no ABA.
+4. **Runs only at transaction boundaries** (post-commit / post-rollback), never
+   mid-line — so there is exactly one live root set and the discarded snapshot is
+   never a spurious root. At the REPL prompt the chain is empty, so roots reduce
+   to module + stack. Trigger on a frame-count threshold so most commits skip
+   collection.
+
+**Caveat:** `mark_frame` recurses on the parent chain and bindings; a
+pathologically deep chain could overflow the Rust stack. Modest for a calculator;
+switch to an explicit worklist if it bites.
+
+#### Later extensions (deferred)
+
+Baseline is eager frames + pure-trace at boundaries — simplest correct thing. Its
+one weakness: a returned-but-uncaptured call frame is reclaimed at the *next*
+boundary, not when the call returns. Two optional improvements, in preference
+order:
+
+- **Lazy frame allocation — the preferred lever.** Don't allocate a call frame
+  unless the call needs one. Trigger on the first **frame-observing event**: first
+  bind (`set`/`=`/`:`/`del`) *or* first capture (instantiating a `{ }`, which
+  grabs `env`). Before any trigger the call runs against the parent frame —
+  observationally identical, since a bindless call adds nothing to the lookup
+  chain. Folding *capture* into the trigger is what makes it correct: the
+  `{ {x} … 'x set }` case breaks naive "allocate on first set", because the inner
+  closure must capture the frame the later `set` lands in. In a concatenative
+  calculator most applications (`+ * dup swap`, non-binding combinators) bind and
+  capture nothing, so they allocate **zero** frames — the cheapest frame to
+  collect is the one never born. It does *not* save binding/recursive calls, nor
+  remove the definition cycle (`'square {dup *} =` still captures the module
+  frame). Crucially it is **orthogonal to the collector** — an evaluator
+  optimization with no refcount/trace coexistence cost — which is why it beats the
+  next item. Revisits §5's "always, unconditionally" mandate, now justified by GC
+  pressure rather than raw efficiency.
+- **Refcount frames for promptness.** To reclaim an uncaptured frame the instant
+  its call returns, refcount frames *and keep the tracer* as a cycle backstop
+  (refcount alone still leaks the definition cycles). This is CPython's model
+  scoped to frames — additive machinery, and it revives the neutralize-before-free
+  coexistence problem (unified-arena note). Lazy frames largely obviate it: few
+  frames means little boundary-time garbage to be un-prompt about. Take only if
+  profiling shows it matters.
+
+**Considered: one unified refcounted arena (rejected for now).** Put *everything*
+— frames, dicts, lists, strings — in a single arena where each slot carries a
+refcount and ids are smart handles (clone increments, drop decrements, dec-to-zero
+frees). This is the CPython / PHP / Bacon–Rajan model (`bacon-rajan-cc` implements
+it): refcounts give COW and prompt reclamation, the mark-sweep runs as a cycle
+*backstop*. It works — but it is **sum-of-both, not best-of-both**. The subtle
+cost is making refcounting and cycle-collection coexist on the *same* object: the
+backstop force-freeing a cyclic frame whose refcount is still nonzero must not
+double-free or loop the recursive drop around the cycle — the exact hazard the
+Bacon–Rajan paper and CPython's `gc` module exist to handle. The split avoids this
+entirely by keeping the two mechanisms on **disjoint populations** (pure `Rc` for
+data, pure trace for frames), so no object is ever both refcounted and swept, and
+the coexistence bug can't arise. The split is therefore the cheaper best-of-both.
+The one thing unification genuinely buys is **addressability**, not GC — a single
+object table where every value has an id would make introspection (`words`,
+"workspace as a value") and serialization uniform graph-walks. **Revisit if
+first-class frames + workspace serialization (`language.md` §9.5, §9.7) make a
+single addressable heap pay for itself** — and if so, adopt `bacon-rajan-cc`
+rather than hand-rolling the coexistence logic.
+
+### V4 — dicts / objects
+
+`( )` opens a **second mark kind**; its closer checks the region collected to
+pairs with a name-or-datum key. `.` is fixed syntax the parser turns into
+dotted access: `obj.x` ≡ `obj.&x call`, staging the receiver. A name key wraps
+its value (a receiver-discarding pusher, or a verbatim function → method); a data
+key stores verbatim. `put` returns a new dict and refuses name keys holding
+functions. Per-type attribute tables make `lst.map` work and `'map {.map} =`
+fall out. Naturally its own milestone.
+
+### V5 — vocabulary, mostly in-language
+
+A **startup-parsed prelude** bound into `base`: move the derived stack words
+(`over rot unrot nip tuck dupd 2dup 2drop`) out of the Rust table, leaving a true
+primitive core. Add the combinators (`dip keep bi bi* bi@`), flow control
+(`if when unless cond`) as ordinary words over a real boolean, and iteration
+(`each map filter reduce times while until`). `apply_value` is already the single
+"run any callable" seam, so primitive-vs-function stays transparent.
+
+## Costs and debts carried into v2
+
+Unchanged from v1 (`language.md` §11), plus what the chain adds:
+
+- **GC required — and why it's mark-sweep, not `Rc`.** Captured frames outlive
+  their calls, and the cycle they form is not exotic: **every top-level function
+  definition is one.** Given
+
+  ```
+  'square { dup * } =
+  ```
+
+  the module frame binds `square` to a `Function` whose `env` is *that same frame*
+  (capture is unconditional). If a frame stored its `Value`s inline behind an `Rc`,
+  the function would sit inside the frame while holding an `Rc` back to it, and the
+  frame's strong count would never reach 0. The body is irrelevant — `'f {} =`
+  leaks just the same. The rule: a cycle forms iff a frame is reachable from its
+  own bindings through some function's `env`, and binding any function into its
+  defining frame does exactly that. Recursion (`'fac { … fac … } =`) is only the
+  case where you *wanted* the capture, so it reads as less surprising. A *returned*
+  closure is not a cycle — `'make { 'x 3 = {x} } =` stages the inner function
+  *outside* the call frame it captured. `Weak` can't rescue the definition case:
+  neither edge is a demotable back edge (a closure must keep its frame alive, and a
+  frame owns its bindings). This is exactly why V3 puts frames in a slotmap heap
+  and V3.5 collects them by reachability rather than refcount — the leak is
+  designed out, at the cost of a mark-sweep trace at each transaction boundary.
+- **A frame per application**, whether or not anything binds.
+- **Per-access indirection** — a value is a nullary function, so every read is an
+  application.
+- **No tail-call optimization** — recursion depth is bounded by memory,
+  deliberately.
