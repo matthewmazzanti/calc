@@ -138,6 +138,52 @@ Grow `Element` with `Template(Rc<[Element]>)` and `Fetch(Rc<str>)`. The parser:
 
 This retires the per-token `Element::parse` model. It is the largest single piece.
 
+### Memory model — chosen representation (supersedes the arena in V3/V3.5 below)
+
+The frame representation converged on the **`Rc`-spine split** (`src/rc_heap.rs`;
+see `memory-model.md`'s top note), *not* the slotmap arena the V3/V3.5 prose below
+still describes. The arena reasoning — the cycle theorem, non-owning ids — remains
+correct and is kept for the record, but the representation is now:
+
+- **The data half is already done.** `engine::Value` is already the Rc-spine —
+  inline leaves + `Rc<immutable>` for `Str`/`List`, `Clone` = retain / `Drop` =
+  release, COW via `Rc::make_mut`. V3's job is *only* the frame half.
+- **Frames are `Rc<RefCell<Frame>>`**, not `SlotMap<FrameId, Frame>`. A closure is
+  `Value::Function { template: Rc<[Element]>, env: Rc<RefCell<Frame>> }`; the
+  prelude stays immutable `Rc<Frame>` (no `RefCell`, no registry). Chosen for
+  whole-system representational uniformity — one counting mechanism (`Rc` RAII)
+  everywhere, the sensitive tracing quarantined in one collector — over the arena's
+  local tidiness. The sole trade: no intrinsic id-space (enumeration for
+  `words`/serialization rides a `Weak` registry, read-only, assigning ids at walk).
+- **Collector = `Weak` registry + mark/neutralize** (`Heap::collect`), not a
+  slotmap `retain`. It recovers only frame *cycles*; everything acyclic — all data,
+  and uncaptured call frames — is reclaimed **promptly** by plain `Rc` drop, so the
+  prompt-cleanup goal falls out for free with no counted-handle machinery.
+
+**Sequencing (the integration plan):**
+
+1. **Split heap ⟂ engine and rework the snapshot** — the load-bearing prerequisite.
+   Undo today clones the whole `Engine` (fine while `top` is owned value-semantics).
+   Once the module frame is a shared `Rc<RefCell<Frame>>`, a clone *shares* it, so a
+   rolled-back `set`/`=` would persist and undo breaks. The snapshot becomes **stack
+   + a value-copy of the module frame's bindings**; the heap (frame graph) is a
+   persistent shared component the snapshot does not clone. Rollback restores those
+   two and lets orphaned frames be swept.
+2. **`{ }` closures + frame chain** — `Value::Function`, capture-current-frame,
+   `parent` links, module frame as root. Top-level recursion works. *No collector
+   needed yet:* the module frame is a permanent root, so its definition-cycle is
+   never garbage.
+3. **`collect`** — add when *local* recursive closures start leaking transient
+   cyclic frames (the only garbage cycles). Runs at the `apply` boundary.
+
+**Undo/redo × the shared heap (the subtle part).** The full timeline, not just one
+rollback, interacts with the heap: a redo state's restored bindings can reference a
+frame an undone action created. Acyclic frames are safe automatically — a snapshot's
+`Function` value holds a strong `Rc` to its `env`, pinning it. For *cyclic* frames
+the collector's roots must span **every** history snapshot (past/current/future),
+not just the current one, or redo would dangle. Frames referenced by no snapshot are
+reclaimed (Rc, or the collector for cycles).
+
 ### V3 — functions, frames, `call`, `&`, `=` (v2's M3c)
 
 - **`Value::Function { template: Rc<[Element]>, env: FrameId }`.** Evaluating a
