@@ -160,29 +160,33 @@ correct and is kept for the record, but the representation is now:
   and uncaptured call frames — is reclaimed **promptly** by plain `Rc` drop, so the
   prompt-cleanup goal falls out for free with no counted-handle machinery.
 
-**Sequencing (the integration plan):**
+**Sub-targets (V3/V3.5 split).** The thing deferred past the collector is *reclamation*,
+not the snapshot — the snapshot rework rides in V3a because it's required for
+error-safety anyway, and it's cheap there precisely because no collector complicates
+it yet.
 
-1. **Split heap ⟂ engine and rework the snapshot** — the load-bearing prerequisite.
-   Undo today clones the whole `Engine` (fine while `top` is owned value-semantics).
-   Once the module frame is a shared `Rc<RefCell<Frame>>`, a clone *shares* it, so a
-   rolled-back `set`/`=` would persist and undo breaks. The snapshot becomes **stack
-   + a value-copy of the module frame's bindings**; the heap (frame graph) is a
-   persistent shared component the snapshot does not clone. Rollback restores those
-   two and lets orphaned frames be swept.
-2. **`{ }` closures + frame chain** — `Value::Function`, capture-current-frame,
-   `parent` links, module frame as root. Top-level recursion works. *No collector
-   needed yet:* the module frame is a permanent root, so its definition-cycle is
-   never garbage.
-3. **`collect`** — add when *local* recursive closures start leaking transient
-   cyclic frames (the only garbage cycles). Runs at the `apply` boundary.
+- **V3a — Functions.** VM call-stack loop, `Value::Function`, `{ }` templates →
+  closures, `Rc<RefCell<Frame>>` frames + `parent` chain, `call`/`&`/`=`, TCO.
+  Replace the clone-`Engine` transaction with the **target snapshot = stack + a
+  value-copy of the module frame's bindings** (restore-on-rollback). This keeps
+  *both* non-destructive errors and undo/redo, because **with no collector nothing
+  is swept**: every history snapshot's `Function` values pin their captured frames by
+  strong `Rc`, so the timeline can't dangle — frames simply *leak*, reclaimed in V3b.
+  ~15 lines, and it's the model we ship, not throwaway. *(Fallback if the
+  History↔Engine restructure stalls validating functions: exit/report-fatally on
+  error and skip the snapshot until V3b — throwaway, drops undo/redo. Avoid unless
+  actually blocked.)*
+- **V3b — Collector.** `Weak` registry + mark/neutralize `collect` at the `apply`
+  boundary. Its roots must span the **whole history timeline** (current stack +
+  module frame + every past/future snapshot), not just the current state, or an undo
+  to a state whose bindings reference a swept cyclic frame would dangle. Acyclic
+  frames are safe regardless (a snapshot's `Function` holds a strong `Rc`); the
+  timeline roots exist only to protect history-referenced *cycles*. Add when local
+  recursion's transient cyclic frames make the leak worth reclaiming.
 
-**Undo/redo × the shared heap (the subtle part).** The full timeline, not just one
-rollback, interacts with the heap: a redo state's restored bindings can reference a
-frame an undone action created. Acyclic frames are safe automatically — a snapshot's
-`Function` value holds a strong `Rc` to its `env`, pinning it. For *cyclic* frames
-the collector's roots must span **every** history snapshot (past/current/future),
-not just the current one, or redo would dangle. Frames referenced by no snapshot are
-reclaimed (Rc, or the collector for cycles).
+This is why the "undo/redo × shared heap" interaction isn't a separate hard step: it
+*only* exists once the collector does, and there it reduces to "root from every
+snapshot."
 
 ### Function runtime — the evaluator is an explicit VM (decided)
 
