@@ -1,3 +1,6 @@
+//! Superseded exploration — the chosen model is [`rc_heap`](super::rc_heap). Kept
+//! for the record.
+//!
 //! A standalone sketch of the *handle-based* memory model — the RAII-count
 //! alternative to the linear-`Value` heap in [`heap`](super::heap). Independent of
 //! the language: no parser, no evaluator, just the heap.

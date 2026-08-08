@@ -1,3 +1,6 @@
+//! Superseded exploration — the chosen model is [`rc_heap`](super::rc_heap). Kept
+//! for the record.
+//!
 //! A standalone sketch of the arena-first memory model (see `docs/memory-model.md`).
 //!
 //! Independent of the language: no parser, no evaluator, just the heap.

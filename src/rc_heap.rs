@@ -1,4 +1,6 @@
-//! The `Rc`-spine memory model — the direction this exploration converged on.
+//! The `Rc`-spine memory model — **the chosen direction** to build the engine on.
+//! [`heap`](super::heap) (linear/arena) and [`handle_heap`](super::handle_heap)
+//! (RAII handle over one arena) are superseded explorations, kept for the record.
 //! Independent of the language: no parser, no evaluator, just the heap.
 //!
 //! One uniform spine, one carve-out, one isolated subsystem:

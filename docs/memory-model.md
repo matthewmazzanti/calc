@@ -1,5 +1,18 @@
 # Memory model
 
+> **Update (2026-08-08): direction changed.** The implementation converged on the
+> **`Rc`-spine split**, not arena-first — see `src/rc_heap.rs`. `Rc<immutable>` for
+> all data (self-managing, prompt drop, no cycles) with a single `Rc<RefCell<Frame>>`
+> carve-out for frames and a `Weak`-registry + neutralize collector for frame
+> cycles. This is §§3–8 (the split) below, chosen over arena-first (§"The arena-first
+> direction") for whole-system representational uniformity: one counting mechanism
+> (`Rc` RAII, compiler-maintained) everywhere, with the sensitive tracing quarantined
+> in one boundary-time collector, rather than an arena + hand-rolled count + free-queue
+> as a second representational world just for frames. Sole trade given up:
+> arena-first's intrinsic id-space (enumeration now rides the `Weak` registry,
+> read-only, assigning ids at walk time). The arena-first sections remain as the
+> considered-and-declined alternative.
+
 One arena for everything; refcounting recreated over it; tracing as the
 correctness authority.
 
