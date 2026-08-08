@@ -158,8 +158,18 @@ A template may open with names and a `:`, which binds them from the stack:
 
 The names read bottom to top, so the rightmost takes the top of the stack and the list reads in the
 order a caller supplies it. This is the one construct the parser recognizes by position: `:` opens a
-template elsewhere only as an error. It emits the `set`s written out on the right, adding no binder
-of its own.
+template elsewhere only as an error. It binds exactly as the right-hand column does, adding no rule
+of its own about *where* a name lands.
+
+**But the binding is the parser's, not the word `set`'s.** `:` is fixed syntax, and fixed syntax
+cannot be broken by rebinding a word — so the list compiles to a binding element, the same way `[`
+and `]` compile to region elements rather than to lookups. The equivalence above is about behavior,
+not about resolving `set` at run time.
+
+**A parameter must be a name.** `{x 3: …}` is a parse error, because a parameter list is *syntax* and
+can be strict where a name *datum* can't: `'3 set` stays legal, since there the odd name is a value
+the program chose. Anything that resolves as a word is a name — `2dup`, `+`, `->` — and anything the
+reader would take for a literal (`3`, `2e3`, `true`) is not.
 
 ### Application creates a frame
 

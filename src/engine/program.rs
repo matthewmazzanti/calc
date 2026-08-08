@@ -8,9 +8,9 @@
 //! The parser consumes the flat token stream and **resolves everything
 //! positional**: `{` recurses into a nested [`Element::Template`], the sigils
 //! consume the token after them, `[ ] ( )` become fixed elements that skip the
-//! lookup every other token gets, and a leading `names :` run rewrites into the
-//! `set`s it abbreviates. What survives into the tree is only what evaluation
-//! still has to decide.
+//! lookup every other token gets, and a leading `names :` run becomes the binds
+//! it abbreviates. What survives into the tree is only what evaluation still has
+//! to decide.
 //!
 //! **A tree, not a flat program** — this is the reversal from v1, where `{ }`
 //! was a runtime mark and code was data. A template is parsed once, holds no
@@ -59,6 +59,16 @@ pub enum Element {
     /// `.&x` — the same lookup without applying, leaving the receiver beneath
     /// the function it found (§7).
     AttrFetch(Rc<str>),
+    /// Bind the top of the stack to a name in the current frame — what a
+    /// template's `names :` list emits, one per parameter.
+    ///
+    /// The same binding `set` performs, but as a *fixed* element rather than a
+    /// word reference. `:` is fixed syntax, so it must not be breakable by
+    /// rebinding `set`, exactly as `[`/`]` stopped being words in v2. It also
+    /// makes the parameter list recoverable from the tree — a leading run of
+    /// `Bind`s is unambiguously one, since a hand-written `'x set` parses to a
+    /// `Literal` and a `Word` — which is where arity and signatures come from.
+    Bind(Rc<str>),
     /// A `{ … }` template: an element sequence with no environment, immutable
     /// and shared. Evaluating one instantiates a function by pairing it with the
     /// current frame (§5).
@@ -100,10 +110,34 @@ impl std::fmt::Display for Element {
             Element::Fetch(name) => write!(f, "&{name}"),
             Element::Attr(name) => write!(f, ".{name}"),
             Element::AttrFetch(name) => write!(f, ".&{name}"),
+            // Only reachable outside a template's parameter list, which the
+            // parser never produces — printed as the `set` it is equivalent to,
+            // so the form stays re-parseable whatever built it.
+            Element::Bind(name) => write!(f, "'{name} set"),
             Element::Template(body) => {
+                // A leading run of `Bind`s is the parameter list, so print it
+                // back as one: `{w h: …}`, not the `set`s it compiles to. The
+                // run reads reversed, since `:` emits the names top-of-stack
+                // first.
+                let count = body
+                    .iter()
+                    .take_while(|e| matches!(e, Element::Bind(_)))
+                    .count();
                 write!(f, "{{")?;
-                for (i, element) in body.iter().enumerate() {
+                for (i, element) in body[..count].iter().rev().enumerate() {
+                    let Element::Bind(name) = element else {
+                        unreachable!("the run holds only binds")
+                    };
                     if i > 0 {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "{name}")?;
+                }
+                if count > 0 {
+                    write!(f, ":")?;
+                }
+                for (i, element) in body[count..].iter().enumerate() {
+                    if i > 0 || count > 0 {
                         write!(f, " ")?;
                     }
                     write!(f, "{element}")?;
@@ -170,7 +204,7 @@ impl<'a> Parser<'a> {
     /// body and must therefore close inside it.
     fn body(&mut self, base: usize) -> Result<Vec<Element>, ParseError> {
         // Parameters are recognized only here, at the head of a template body.
-        let mut elements = if base > 0 { self.params() } else { Vec::new() };
+        let mut elements = if base > 0 { self.params()? } else { Vec::new() };
         loop {
             let Some(token) = self.advance() else {
                 // End of input. Anything still open never closed — report the
@@ -306,39 +340,50 @@ impl<'a> Parser<'a> {
     }
 
     /// A template's parameter list: a leading run of names ended by `:`, which
-    /// binds them from the stack. `{w h: …}` ≡ `{'h set 'w set …}` — the names
-    /// read bottom to top, so the rightmost takes the top of the stack and the
-    /// list reads in the order a caller supplies it (§5).
+    /// binds them from the stack. `{w h: …}` binds as `{'h set 'w set …}` would
+    /// — the names read bottom to top, so the rightmost takes the top of the
+    /// stack and the list reads in the order a caller supplies it (§5).
     ///
-    /// Pure lookahead: a run of words *not* followed by `:` is ordinary code, so
-    /// this consumes nothing and `{1 2 3}` parses as it reads. The emitted
-    /// `set`s are the ones you would have written — the sugar adds no binder of
-    /// its own.
-    fn params(&mut self) -> Vec<Element> {
+    /// Two things the `set` spelling doesn't get. The binder is an
+    /// [`Element::Bind`], not a lookup of the word `set`, so fixed syntax can't
+    /// be broken by rebinding a word. And because the list is *syntax* rather
+    /// than a name datum, its names are checked here: `'3 set` is a legal way to
+    /// bind an odd name, but `{x 3: …}` is a typo, and a parse error costs
+    /// nothing.
+    ///
+    /// Finding the list is pure lookahead — a run of words *not* followed by `:`
+    /// is ordinary code, so `{1 2 3}` parses as it reads and nothing is
+    /// consumed. Only once the `:` confirms a parameter list do the names have
+    /// to be names.
+    fn params(&mut self) -> Result<Vec<Element>, ParseError> {
         let mut scan = self.next;
         while matches!(self.peek_at(scan), Some(TokenKind::Word(_))) {
             scan += 1;
         }
         if scan == self.next || !matches!(self.peek_at(scan), Some(TokenKind::Colon)) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        let names = self.tokens[self.next..scan]
-            .iter()
-            .map(|token| match &token.kind {
-                TokenKind::Word(name) => name.clone(),
-                _ => unreachable!("the scan stopped at the first non-word"),
-            });
-        let elements = names
-            .rev()
-            .flat_map(|name| {
-                [
-                    Element::Literal(Value::Name(name)),
-                    Element::Word(Rc::from("set")),
-                ]
-            })
-            .collect();
+        let mut elements = Vec::with_capacity(scan - self.next);
+        for token in &self.tokens[self.next..scan] {
+            let TokenKind::Word(text) = &token.kind else {
+                unreachable!("the scan stopped at the first non-word");
+            };
+            // A name is what a bare word resolves *through*; anything the parser
+            // would read as a literal is a value, and no value is a name. Read
+            // in written order, so the leftmost offender is the one reported.
+            match word(text) {
+                Element::Word(name) => elements.push(Element::Bind(name)),
+                _ => {
+                    return Err(ParseError::new(
+                        ParseErrorKind::InvalidParameter,
+                        token.span,
+                    ))
+                }
+            }
+        }
+        elements.reverse(); // the last name written takes the top of the stack
         self.next = scan + 1; // past the names and the `:`
-        elements
+        Ok(elements)
     }
 }
 
@@ -455,12 +500,63 @@ mod tests {
     }
 
     #[test]
-    fn parameters_desugar_to_the_sets_they_abbreviate() {
-        // `{w h: …}` ≡ `{'h set 'w set …}` — the names read bottom to top, so
-        // the rightmost takes the top of the stack (§5). The sugar adds no
-        // binder of its own: these are the `set`s you would have written.
-        assert_eq!(parsed("{w h: w h *}"), parsed("{'h set 'w set w h *}"));
-        assert_eq!(parsed("{n: {n *}}"), parsed("{'n set {n *}}"));
+    fn parameters_bind_bottom_to_top() {
+        // `{w h: …}` binds as `{'h set 'w set …}` would — the names read bottom
+        // to top, so the rightmost takes the top of the stack (§5).
+        assert_eq!(
+            parsed("{w h: w h *}"),
+            vec![template(vec![
+                Element::Bind(Rc::from("h")),
+                Element::Bind(Rc::from("w")),
+                word_ref("w"),
+                word_ref("h"),
+                word_ref("*"),
+            ])]
+        );
+        assert_eq!(
+            parsed("{n: {n *}}"),
+            vec![template(vec![
+                Element::Bind(Rc::from("n")),
+                template(vec![word_ref("n"), word_ref("*")]),
+            ])]
+        );
+    }
+
+    #[test]
+    fn parameters_bind_without_looking_up_a_word() {
+        // `:` is fixed syntax, so — like `[` and `]` — it must not be breakable
+        // by rebinding a word. The binder is an element, not a `set` reference.
+        let Element::Template(body) = &parsed("{w h: w h *}")[0] else {
+            panic!("expected a template");
+        };
+        assert!(
+            !body.contains(&word_ref("set")),
+            "the parameter list resolved a word: {body:?}"
+        );
+        // A hand-written `set` still parses to the word, so the two forms stay
+        // distinguishable — which is what makes a leading `Bind` run a reliable
+        // parameter list to read arity back off.
+        assert_eq!(
+            parsed("{'h set}"),
+            vec![template(vec![name("h"), word_ref("set")])]
+        );
+    }
+
+    #[test]
+    fn a_parameter_must_be_a_name() {
+        // A parameter list is syntax, so it can be strict where a name *datum*
+        // can't: `'3 set` binds an odd name on purpose, `{x 3: …}` is a typo.
+        assert_eq!(err("{x 3: x}"), ParseErrorKind::InvalidParameter);
+        assert_eq!(err("{2e3: x}"), ParseErrorKind::InvalidParameter);
+        assert_eq!(err("{true: x}"), ParseErrorKind::InvalidParameter);
+        // The leftmost offender is the one reported.
+        let source = "{a 1 2: x}";
+        assert_eq!(parse(source).unwrap_err().span.of(source), "1");
+        // Anything that resolves as a word is a name, digits and symbols alike.
+        assert!(parse("{2dup +: x}").is_ok());
+        assert!(parse("{+ -> x2: x}").is_ok());
+        // And the rule is the parameter list's alone.
+        assert!(parse("'3 set").is_ok());
     }
 
     #[test]
@@ -583,6 +679,10 @@ mod tests {
             "&f",
             "obj.x",
             "obj.&x",
+            // A parameter list prints back as one, not as the binds it holds.
+            "{w h: w h *}",
+            "{n: {n *}}",
+            "{x:}",
         ] {
             let program = parsed(source);
             let text = program

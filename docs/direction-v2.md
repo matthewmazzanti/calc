@@ -163,10 +163,18 @@ This retires the per-token `Element::parse` model. It is the largest single piec
   access")`, naming the milestone that retires it.
 - **`&f` landed early.** It is exactly `'f get` with a parser-owned spelling, so
   the fetch element evaluates today rather than waiting for V3.
-- **Parameters are any run of words before a `:`.** The scan doesn't check that a
-  name looks like an identifier, matching `'3 set` being legal — `{x 3: …}` binds
-  a name `3` rather than erroring. A `:` the scan can't reach (after a non-word,
-  a second one in a body, or outside a template) is `MisplacedColon`.
+- **Parameters compile to a binding element, and their names are checked.**
+  `{w h: …}` emits `Element::Bind` per name, not `Literal(Name) + Word("set")`.
+  `:` is fixed syntax, so it must not be breakable by rebinding `set` — the same
+  reason `[`/`]` stopped being words. Two things follow. Arity is recoverable: a
+  *leading run* of `Bind`s is unambiguously the parameter list, since a
+  hand-written `'x set` still parses to a literal and a word — which is where
+  signatures and "too few arguments for `f/2`" come from, with no `params` field
+  on the template. And because the list is now syntax rather than a name datum,
+  the parser checks it: a parameter must be a token that resolves as a *word*, so
+  `{x 3: …}` is `InvalidParameter` while `'3 set` stays legal. `2dup`, `+`, `->`
+  are names; `3`, `2e3`, `true` are not. A `:` the scan can't reach (after a
+  non-word, a second one in a body, or outside a template) is `MisplacedColon`.
 - **Two error kinds beyond the doc's four.** `MisplacedColon`, since `:` is the
   one construct recognized by position; and `TooDeeplyNested` — `{` is the
   parser's own recursion, so nesting is capped (256 open regions) rather than

@@ -81,6 +81,10 @@ pub enum ParseErrorKind {
     /// A `:` outside a template's leading parameter list — the one construct the
     /// parser recognizes by position (§5), so `:` anywhere else is an error.
     MisplacedColon,
+    /// A parameter that isn't a name: `{x 3: …}`. A parameter list is syntax, so
+    /// it can be strict where a name *datum* can't — `'3 set` stays legal, since
+    /// there the name is a value the program chose.
+    InvalidParameter,
     /// Templates nested past the parser's recursion limit. Not a language rule —
     /// an implementation bound, so that pathological input is a *diagnostic*
     /// rather than a stack overflow that would abort the process and take the
@@ -101,6 +105,7 @@ impl std::fmt::Display for ParseErrorKind {
             ParseErrorKind::MisplacedColon => {
                 write!(f, "`:` is only valid after a template's parameter names")
             }
+            ParseErrorKind::InvalidParameter => write!(f, "not a name, so not a parameter"),
             ParseErrorKind::TooDeeplyNested => write!(f, "templates nested too deeply"),
         }
     }

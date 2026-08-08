@@ -739,6 +739,24 @@ fn the_fetch_sigil_pushes_a_binding_unapplied() {
 }
 
 #[test]
+fn a_bind_element_binds_like_set() {
+    // What `{x: …}` emits. It only occurs inside a template, which doesn't run
+    // until V3, so the element is applied directly here.
+    let program = [
+        Element::Literal(Value::Int(3)),
+        Element::Bind(Rc::from("x")),
+        Element::Word(Rc::from("x")),
+    ];
+    assert_eq!(Engine::new().apply(&program).unwrap().stack(), &[3.0]);
+    // It takes the top of the stack, so an empty one underflows — the same
+    // failure `set` gives, since it is the same binding.
+    assert_eq!(
+        Engine::new().apply(&program[1..]).unwrap_err().kind,
+        ErrorKind::StackUnderflow
+    );
+}
+
+#[test]
 fn the_parsed_but_unevaluated_surface_names_its_milestone() {
     // The parser accepts all of v2; the evaluator catches up in V3 (functions)
     // and V5 (dicts, attributes). Until then these are honest about which.

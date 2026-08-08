@@ -184,6 +184,14 @@ impl Engine {
                 Ok(())
             }
             Element::Close(Region::List) => self.close_list(),
+            // A template's `names :` list. The same binding `set` performs, but
+            // reached without a lookup — so fixed syntax can't be broken by
+            // rebinding a word (§5).
+            Element::Bind(name) => {
+                let value = self.pop()?;
+                self.bind(name.clone(), value);
+                Ok(())
+            }
             Element::Template(_) => Err(ErrorKind::Unimplemented("functions")),
             Element::Open(Region::Dict) | Element::Close(Region::Dict) => {
                 Err(ErrorKind::Unimplemented("dicts"))
