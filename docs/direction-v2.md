@@ -184,6 +184,51 @@ the collector's roots must span **every** history snapshot (past/current/future)
 not just the current one, or redo would dangle. Frames referenced by no snapshot are
 reclaimed (Rc, or the collector for cycles).
 
+### Function runtime — the evaluator is an explicit VM (decided)
+
+Not a recursive tree-walk: an explicit call-stack machine. The `Engine` holds a
+`Vec<Activation>` (`{ template: Rc<[Element]>, ip, frame: FrameRef }`) and the eval
+loop advances the top activation, popping it on exhaustion. Chosen for proper tail
+calls — iteration is recursion/combinators ("no control flow"), so unbounded tail
+recursion must run flat. (RPL, the HP48 ancestor, is itself a threaded interpreter
+with a return stack — the VM is the idiomatic end state.)
+
+**Two chains, kept distinct.** The **lexical** parent chain (`frame.parent` = the
+captured env) is walked by name lookup; the **dynamic** call stack is walked by
+return. A call sets the new frame's parent to the function's captured `env`, never
+to the caller. Collection runs only at line boundaries (call stack empty), so the
+dynamic chain never needs to be an enumerable GC root.
+
+**Builtin interfacing:**
+
+- **Pure ops** (`+ dup swap …`) are unchanged — `fn(&mut Engine) -> Result<()>`,
+  called synchronously by the loop. The VM taxes the *loop*, not the ops.
+- **`if` / `call`** are the only native control primitives; both tail-position, so
+  they `engine.push_call(f)` and return — the loop descends into the callee and
+  resumes the caller after it exhausts. `apply_value` grows a `Function => push_call`
+  arm beside the existing `Builtin => run` / `data => push`.
+- **Stateful combinators** (`dip`/`while`/`each`/`bi`) go **in-language** — recursive
+  definitions over `if`/`call`/`=`, run flat by TCO. No native continuation machinery
+  (this is the V5 "vocabulary in-language" direction, not a workaround).
+- **TCO lives in the loop:** `push_call` must pop an already-exhausted top activation
+  *before* pushing the callee (replace, don't stack), or tail recursion regrows the
+  call stack and the VM's whole purpose is lost.
+
+**Deferred — `run_function`.** A re-entrant helper (`push_call` + `run_until(depth)`)
+that runs a callable to completion synchronously, for *native* post-work combinators
+if speed ever demands them. Skipped for now (combinators go in-language). Its one
+hazard, recorded for when we return: it keeps the Rust caller's frame live across the
+call, so it **cannot tail-call its callee** — it must never be used for `if`/`call`
+or any tail position, which would silently reintroduce the Rust-stack overflow the VM
+exists to avoid. Rule: tail position → `push_call`; post-work → `run_function`.
+
+**Parked conversation — Rust/callable interfacing.** The general surface where native
+Rust and language callables meet is only sketched. Open when it's needed: the
+`Primitive` signature's evolution, how a native op *schedules* vs. *runs* a callable,
+how post-work/continuations are represented, error-unwind across the boundary, and
+whether native combinators are ever worth their complexity over the in-language path.
+Revisit before writing any native code that invokes a callable beyond `if`/`call`.
+
 ### V3 — functions, frames, `call`, `&`, `=` (v2's M3c)
 
 - **`Value::Function { template: Rc<[Element]>, env: FrameId }`.** Evaluating a
