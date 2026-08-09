@@ -25,7 +25,7 @@
 
 use std::rc::Rc;
 
-use super::{ParseError, ParseErrorKind};
+use super::{ParseError, ParseErrorKind, Value};
 
 /// A byte range in the source line — `start..end`, as a `str` index. Carried by
 /// every token and by every [`ParseError`], so a diagnostic can point at the
@@ -81,15 +81,17 @@ impl Bracket {
     }
 }
 
-/// What a token is. Deliberately shallow: the fixed characters are their own
-/// variants, a `"…"` literal arrives with its escapes already resolved (the
-/// tokenizer owns the lookahead, so the parser never sees a quote), and every
-/// other run of characters is an uninterpreted [`TokenKind::Word`].
+/// What a token is: a **literal**, a **word**, or one of the fixed characters.
+/// Both literal kinds arrive decoded — a `"…"` with its escapes resolved and its
+/// quotes gone, a number already a [`Value`] — since the tokenizer owns the
+/// grammar of each.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
-    /// A run of ordinary characters: `+`, `dup`, `3.5`, `true`, `foo`. The
-    /// parser decides which of those are literals and which are word references.
+    /// A name: `+`, `dup`, `2dup`, `bi*`, `foo`, `true`. Whatever the number
+    /// grammar didn't claim — see [`number`] for why the definition is negative.
     Word(Rc<str>),
+    /// A number literal, already an `Int` or a `Num`.
+    Number(Value),
     /// A string literal's *content*, escapes resolved, quotes gone.
     Str(Rc<String>),
     /// `'` — the parser takes the next token as a name.
@@ -140,6 +142,71 @@ fn breaks_word(c: char) -> bool {
     c.is_whitespace() || delimiter(c).is_some() || c == '"' || c == '#'
 }
 
+/// The number grammar, and the only statement of it:
+///
+/// ```text
+/// number   = "-"? digit+ fraction? exponent?
+/// fraction = "." digit+
+/// exponent = ("e" | "E") ("+" | "-")? digit+
+/// ```
+///
+/// Deliberately ours and deliberately small. Names are defined *negatively* —
+/// a word is a run this grammar doesn't claim — which is forced by a vocabulary
+/// holding `2dup`, `bi*`, and `+` (no positive identifier grammar admits all
+/// three; Forth, Factor, and Common Lisp are negative for the same reason). The
+/// cost of a negative definition is that every literal shape deletes names, so
+/// the grammar must be one we chose: inheriting Rust's `f64` parser silently
+/// claimed `inf`, `nan`, `Inf`, and `infinity`, none of which are numbers here.
+///
+/// Returns the end index of the number reaching from `start`, or `None` if none
+/// starts there. Callers ask two things of it — "is this whole run a number?"
+/// ([`number`]) and "does a number continue through this `.`?" ([`read_word`]).
+fn scan_number(input: &str, start: usize) -> Option<usize> {
+    let text = &input[start..];
+    let mut at = usize::from(text.starts_with('-'));
+    match digits_end(text, at) {
+        end if end > at => at = end,
+        _ => return None, // a number leads with digits, so `.5` and `-x` aren't
+    }
+    // A fraction needs digits *after* the dot — which is exactly what leaves
+    // `obj.x` to split and `3.` a number followed by a dot.
+    if text[at..].starts_with('.') {
+        match digits_end(text, at + 1) {
+            end if end > at + 1 => at = end,
+            _ => return Some(start + at),
+        }
+    }
+    if text[at..].starts_with(['e', 'E']) {
+        let signed = at + 1 + usize::from(text[at + 1..].starts_with(['+', '-']));
+        if digits_end(text, signed) > signed {
+            at = digits_end(text, signed);
+        }
+    }
+    Some(start + at)
+}
+
+/// The index just past the digits starting at `from` — `from` itself if none.
+fn digits_end(text: &str, from: usize) -> usize {
+    from + text[from..].bytes().take_while(u8::is_ascii_digit).count()
+}
+
+/// The value of `text` if the whole of it is a number. Integer shape (no `.`,
+/// no exponent) is an `Int`, falling back to a `Num` when it overflows `i64`.
+fn number(text: &str) -> Option<Value> {
+    if scan_number(text, 0)? != text.len() {
+        return None;
+    }
+    if !text.contains(['.', 'e', 'E']) {
+        if let Ok(int) = text.parse::<i64>() {
+            return Some(Value::Int(int));
+        }
+    }
+    // The grammar is a subset of Rust's, so this converts rather than decides.
+    Some(Value::Num(
+        text.parse().expect("matched the number grammar"),
+    ))
+}
+
 /// Split `input` into tokens, or fail on an unterminated string — the one error
 /// this phase can raise. Nesting, resolution, and meaning all belong to the
 /// parser.
@@ -168,9 +235,16 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
             });
             i += width;
         } else {
+            // Run first, classify second — never the other way round. Matching
+            // a number greedily at the cursor would take `2dup` as a 2 and a
+            // `dup`; the run is what a number has to account for *all* of.
             let end = read_word(input, i);
+            let text = &input[i..end];
             tokens.push(Token {
-                kind: TokenKind::Word(Rc::from(&input[i..end])),
+                kind: match number(text) {
+                    Some(value) => TokenKind::Number(value),
+                    None => TokenKind::Word(Rc::from(text)),
+                },
                 span: Span::new(i, end),
             });
             i = end;
@@ -179,25 +253,23 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
     Ok(tokens)
 }
 
-/// The end index of the word run starting at `start`, whose first character is
-/// known not to break a word. Stops at the first breaking character — *except*
-/// that a `.` flanked by digits is taken as part of the number, the one place a
-/// token's shape decides the split. So `3.5` is one word and `obj.x` is three
-/// tokens; `3.` and `.5` split, since neither has digits on both sides.
+/// The end index of the run starting at `start`, whose first character is known
+/// not to break a word. Stops at the first breaking character — *except* inside
+/// a number, where a `.` is the fraction's rather than the attribute operator's.
+/// This is the one place a token's shape decides the split, and it asks
+/// [`scan_number`] rather than restating what a number looks like: a `.` is part
+/// of the run exactly when the number reaching from `start` covers it. So `3.5`
+/// is one run and `obj.x` is three tokens; `3.` splits, since a fraction needs
+/// digits after the dot.
 fn read_word(input: &str, start: usize) -> usize {
+    let number = scan_number(input, start).unwrap_or(start);
     let mut end = start;
-    let mut prev_digit = false;
     for (offset, c) in input[start..].char_indices() {
-        if c == '.' {
-            let next = input[start + offset + 1..].chars().next();
-            if !(prev_digit && next.is_some_and(|n| n.is_ascii_digit())) {
-                break;
-            }
-        } else if breaks_word(c) {
+        let at = start + offset;
+        if breaks_word(c) && !(c == '.' && at < number) {
             break;
         }
-        prev_digit = c.is_ascii_digit();
-        end = start + offset + c.len_utf8();
+        end = at + c.len_utf8();
     }
     end
 }
@@ -254,9 +326,17 @@ mod tests {
         TokenKind::Word(Rc::from(text))
     }
 
+    fn int(value: i64) -> TokenKind {
+        TokenKind::Number(Value::Int(value))
+    }
+
+    fn float(value: f64) -> TokenKind {
+        TokenKind::Number(Value::Num(value))
+    }
+
     #[test]
     fn splits_on_whitespace() {
-        assert_eq!(kinds("1 2 +"), vec![word("1"), word("2"), word("+")]);
+        assert_eq!(kinds("1 2 +"), vec![int(1), int(2), word("+")]);
     }
 
     #[test]
@@ -276,18 +356,57 @@ mod tests {
     }
 
     #[test]
-    fn a_dot_between_digits_belongs_to_the_number() {
-        assert_eq!(kinds("3.5"), vec![word("3.5")]);
-        assert_eq!(kinds("3.5e-2"), vec![word("3.5e-2")]);
-        // Digits on both sides is the whole rule — otherwise the dot delimits.
+    fn a_dot_inside_a_number_is_the_fraction_not_the_operator() {
+        assert_eq!(kinds("3.5"), vec![float(3.5)]);
+        assert_eq!(kinds("3.5e-2"), vec![float(3.5e-2)]);
+        // A fraction needs digits on both sides — `0.1`, never `.1` — so
+        // everywhere else the dot is the attribute operator.
+        assert_eq!(kinds("0.1"), vec![float(0.1)]);
+        assert_eq!(kinds(".1"), vec![TokenKind::Dot, int(1)]);
+        assert_eq!(kinds("3."), vec![int(3), TokenKind::Dot]);
         assert_eq!(kinds("obj.x"), vec![word("obj"), TokenKind::Dot, word("x")]);
-        assert_eq!(kinds("3."), vec![word("3"), TokenKind::Dot]);
-        assert_eq!(kinds(".5"), vec![TokenKind::Dot, word("5")]);
         assert_eq!(
             kinds("3.5.x"),
-            vec![word("3.5"), TokenKind::Dot, word("x")],
+            vec![float(3.5), TokenKind::Dot, word("x")],
             "a number is still dottable"
         );
+    }
+
+    #[test]
+    fn the_run_is_taken_before_it_is_classified() {
+        // Matching a number greedily at the cursor would split `2dup` into a 2
+        // and a `dup`. The run comes first; a number must account for all of it.
+        assert_eq!(kinds("2dup"), vec![word("2dup")]);
+        assert_eq!(
+            kinds("2drop bi* ->"),
+            vec![word("2drop"), word("bi*"), word("->")]
+        );
+        assert_eq!(kinds("2 dup"), vec![int(2), word("dup")]);
+    }
+
+    #[test]
+    fn the_number_grammar_is_ours_not_the_f64_parsers() {
+        // Rust's `f64::from_str` accepts these; our grammar does not, so they
+        // are ordinary names — which is the point of writing the grammar down.
+        for name in ["inf", "-inf", "infinity", "nan", "NaN", "Inf"] {
+            assert_eq!(kinds(name), vec![word(name)], "{name} should be a name");
+        }
+        // Nor do these shapes exist yet, so they are names too, and adding any
+        // of them later is a deliberate change to what a name can be.
+        for name in ["1/2", "0x1f", "1_000", "e", "1e", "3d5"] {
+            assert_eq!(kinds(name), vec![word(name)], "{name} should be a name");
+        }
+    }
+
+    #[test]
+    fn numbers_arrive_decoded() {
+        assert_eq!(kinds("3"), vec![int(3)]);
+        assert_eq!(kinds("-5"), vec![int(-5)]);
+        assert_eq!(kinds("2e3"), vec![float(2000.0)]);
+        assert_eq!(kinds("1e-2"), vec![float(0.01)]);
+        assert_eq!(kinds("3.0"), vec![float(3.0)]);
+        // Integer shape that overflows `i64` falls back to a float.
+        assert_eq!(kinds("99999999999999999999"), vec![float(1e20)]);
     }
 
     #[test]
@@ -313,8 +432,8 @@ mod tests {
 
     #[test]
     fn comments_run_to_end_of_line() {
-        assert_eq!(kinds("1 # 2 + [ } '"), vec![word("1")]);
-        assert_eq!(kinds("1 # a\n2"), vec![word("1"), word("2")]);
+        assert_eq!(kinds("1 # 2 + [ } '"), vec![int(1)]);
+        assert_eq!(kinds("1 # a\n2"), vec![int(1), int(2)]);
         assert_eq!(kinds("# nothing but a comment"), vec![]);
     }
 

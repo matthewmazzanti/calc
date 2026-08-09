@@ -94,13 +94,15 @@ pub struct Engine {
 /// A single environment frame: names bound to values.
 type Frame = std::collections::HashMap<Rc<str>, Value>;
 
-/// Build the prelude frame — every primitive the [`ops`] modules define, as a
-/// first-class [`Value::Builtin`] under its canonical word. Each engine holds
-/// this behind an `Rc`, so snapshots share one immutable copy.
+/// Build the prelude frame — every primitive the [`ops`] modules define as a
+/// first-class [`Value::Builtin`] under its canonical word, plus the constants
+/// (`true`, `false`), which are plain values. Each engine holds this behind an
+/// `Rc`, so snapshots share one immutable copy.
 fn prelude() -> Rc<Frame> {
     Rc::new(
         ops::primitives()
             .map(|&p| (Rc::from(p.name), Value::Builtin(p)))
+            .chain(ops::constants().map(|(word, value)| (Rc::from(word), value)))
             .collect(),
     )
 }

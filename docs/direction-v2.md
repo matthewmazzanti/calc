@@ -153,10 +153,25 @@ This retires the per-token `Element::parse` model. It is the largest single piec
   `UnmatchedClose` stayed behind as the *runtime* half (a `]` whose mark was
   eaten, e.g. `[ drop ]`, until mark linearity is enforced in the primitives).
   The TUI renders a parse error with its column and the text to blame.
-- **The tokenizer classifies nothing.** A number, a boolean, and a word are all
-  `TokenKind::Word`; the parser decides. Only the *split* is shape-sensitive (the
-  `.` between digits). Strings arrive with escapes resolved, since the lookahead
-  owns them.
+- **The tokenizer owns both literal grammars.** `TokenKind` is `Number`, `Str`,
+  `Word`, and the fixed characters — so `Word` means *word*, and `'`/`&`/`.`/`:`
+  require one by pattern match rather than by re-deriving what a number looks
+  like. The alternative (classify in the parser) left the number grammar stated
+  twice: the tokenizer needs part of it for the `.` split, and `parse::<f64>()`
+  decided the rest, which is how `inf`, `nan`, and `infinity` became numbers
+  nobody chose. The grammar is now written down (`language-v2.md` §3), and the
+  `.`-split rule is a query against it rather than a second statement of it.
+- **Run first, classify second.** Greedy number matching at the cursor — the
+  textbook lexer move — would split `2dup` into `2` and `dup`. The delimiter
+  -bounded run is taken first and is a number only if the grammar accounts for
+  all of it. This is the same fact that forces names to be defined negatively:
+  no positive identifier grammar admits `2dup`, `bi*`, and `+` together.
+- **Booleans are prelude bindings, not literals.** `true`/`false` are values in
+  the prelude frame (`ops/constant.rs`), so they are fetchable, nameable,
+  shadowable, and `del`-recoverable like any builtin — and **the language has no
+  keywords at all**: every token is a literal shape, a fixed character, or a
+  name. Costs a lookup per `true`, which §11 already accepts for every name.
+  `pi`/`e`/`tau` land in the same table.
 - **`.` parses now, evaluates later.** `obj.x` → `Attr`, `obj.&x` → `AttrFetch`,
   so the whole v2 surface parses ahead of the evaluator. A parsed-but-unevaluable
   element reports `ErrorKind::Unimplemented("functions" | "dicts" | "attribute

@@ -9,10 +9,11 @@
 //! this heads next: when functions land, the derived words leave these Rust
 //! tables for an in-language prelude, and only the true primitives remain.
 
-use super::Primitive;
+use super::{Primitive, Value};
 
 mod arith;
 mod compare;
+mod constant;
 mod env;
 mod logic;
 mod seq;
@@ -22,6 +23,12 @@ mod stack;
 // `dup`), re-exported to the engine root so `crate::engine::ADD` resolves.
 pub(crate) use arith::{ADD, DIV, MUL, SUB};
 pub(crate) use stack::DUP;
+
+/// The prelude's non-primitive bindings — values, not operations. See
+/// [`constant`].
+pub(crate) fn constants() -> impl Iterator<Item = (&'static str, Value)> {
+    constant::constants()
+}
 
 /// Every primitive across the category tables, in order — the source the prelude
 /// binds into the base frame.

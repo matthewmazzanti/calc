@@ -43,8 +43,16 @@ fn run_err(input: &str) -> ErrorKind {
 }
 
 #[test]
-fn true_and_false_are_literals() {
+fn booleans_are_prelude_bindings_not_keywords() {
+    // Applying the binding pushes its value — §1's "a value in the environment
+    // is a nullary function" — so this reads exactly like a literal.
     assert_eq!(run("true false").stack(), &[true, false]);
+    // But it *is* a binding: fetchable, nameable, and shadowable like any
+    // builtin, with `del` as the recovery path (§9). The language has no
+    // keywords, so there is nothing here the parser reserves.
+    assert_eq!(run("&true").stack(), &[true]);
+    assert_eq!(run("'true get").stack(), &[true]);
+    assert_eq!(run("1 'true set true").stack(), &[Value::Int(1)]);
 }
 
 #[test]

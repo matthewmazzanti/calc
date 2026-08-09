@@ -80,26 +80,6 @@ pub enum Element {
     Close(Region),
 }
 
-/// Classify a bare word: a number or boolean is a literal, everything else is a
-/// word reference resolved at runtime. So parsing never fails on an unknown word
-/// — that's a runtime `UnboundName`.
-fn word(text: &Rc<str>) -> Element {
-    match &**text {
-        "true" => return Element::Literal(Value::Bool(true)),
-        "false" => return Element::Literal(Value::Bool(false)),
-        _ => {}
-    }
-    // Integer first, then float: `3` is an `Int`, but `3.0`/`2e3`/`1e-2`
-    // (anything with a `.`, exponent, or out of i64 range) is a `Num`.
-    if let Ok(i) = text.parse::<i64>() {
-        Element::Literal(Value::Int(i))
-    } else if let Ok(n) = text.parse::<f64>() {
-        Element::Literal(Value::Num(n))
-    } else {
-        Element::Word(text.clone())
-    }
-}
-
 impl std::fmt::Display for Element {
     /// The canonical text of an element — re-parseable, and written in the §13
     /// style (brackets against their contents).
@@ -218,7 +198,10 @@ impl<'a> Parser<'a> {
                 };
             };
             match &token.kind {
-                TokenKind::Word(text) => elements.push(word(text)),
+                // Both literal kinds arrive decoded; a word is looked up at
+                // application time. The tokenizer settled which is which.
+                TokenKind::Word(name) => elements.push(Element::Word(name.clone())),
+                TokenKind::Number(value) => elements.push(Element::Literal(value.clone())),
                 TokenKind::Str(text) => elements.push(Element::Literal(Value::Str(text.clone()))),
                 // `'` denotes and `&` fetches — both consume the next token (§4).
                 TokenKind::Quote => {
@@ -356,8 +339,18 @@ impl<'a> Parser<'a> {
     /// consumed. Only once the `:` confirms a parameter list do the names have
     /// to be names.
     fn params(&mut self) -> Result<Vec<Element>, ParseError> {
+        // The run is of *atoms* — words and literals alike — so that `{x 3: …}`
+        // is a parameter list with a bad name rather than a stray `:`. Structure
+        // (a sigil, a bracket) still ends the scan, and a `:` after one of those
+        // is genuinely misplaced.
+        let atom = |kind: Option<&TokenKind>| {
+            matches!(
+                kind,
+                Some(TokenKind::Word(_) | TokenKind::Number(_) | TokenKind::Str(_))
+            )
+        };
         let mut scan = self.next;
-        while matches!(self.peek_at(scan), Some(TokenKind::Word(_))) {
+        while atom(self.peek_at(scan)) {
             scan += 1;
         }
         if scan == self.next || !matches!(self.peek_at(scan), Some(TokenKind::Colon)) {
@@ -365,21 +358,16 @@ impl<'a> Parser<'a> {
         }
         let mut elements = Vec::with_capacity(scan - self.next);
         for token in &self.tokens[self.next..scan] {
-            let TokenKind::Word(text) = &token.kind else {
-                unreachable!("the scan stopped at the first non-word");
+            // A parameter must be a name, and a name is what the number grammar
+            // didn't claim. Read in written order, so the leftmost offender is
+            // the one reported.
+            let TokenKind::Word(name) = &token.kind else {
+                return Err(ParseError::new(
+                    ParseErrorKind::InvalidParameter,
+                    token.span,
+                ));
             };
-            // A name is what a bare word resolves *through*; anything the parser
-            // would read as a literal is a value, and no value is a name. Read
-            // in written order, so the leftmost offender is the one reported.
-            match word(text) {
-                Element::Word(name) => elements.push(Element::Bind(name)),
-                _ => {
-                    return Err(ParseError::new(
-                        ParseErrorKind::InvalidParameter,
-                        token.span,
-                    ))
-                }
-            }
+            elements.push(Element::Bind(name.clone()));
         }
         elements.reverse(); // the last name written takes the top of the stack
         self.next = scan + 1; // past the names and the `:`
@@ -426,10 +414,19 @@ mod tests {
     }
 
     #[test]
-    fn numbers_and_booleans_are_literals_every_other_word_a_reference() {
+    fn literals_come_decoded_and_every_other_token_is_a_reference() {
+        // The tokenizer settled literal-vs-word; the parser only places them.
         assert_eq!(
-            parsed("1 2.5 true +"),
-            vec![literal(1_i64), literal(2.5), literal(true), word_ref("+"),]
+            parsed(r#"1 2.5 "s" + true"#),
+            vec![
+                literal(1_i64),
+                literal(2.5),
+                literal("s"),
+                word_ref("+"),
+                // `true` is a prelude *binding*, so it resolves like any name —
+                // the language has no keywords.
+                word_ref("true"),
+            ]
         );
         // Parsing never fails on an unknown word — that's a runtime unbound.
         assert_eq!(parsed("nope"), vec![word_ref("nope")]);
@@ -548,15 +545,15 @@ mod tests {
         // can't: `'3 set` binds an odd name on purpose, `{x 3: …}` is a typo.
         assert_eq!(err("{x 3: x}"), ParseErrorKind::InvalidParameter);
         assert_eq!(err("{2e3: x}"), ParseErrorKind::InvalidParameter);
-        assert_eq!(err("{true: x}"), ParseErrorKind::InvalidParameter);
+        assert_eq!(err(r#"{"s": x}"#), ParseErrorKind::InvalidParameter);
         // The leftmost offender is the one reported.
         let source = "{a 1 2: x}";
         assert_eq!(parse(source).unwrap_err().span.of(source), "1");
-        // Anything that resolves as a word is a name, digits and symbols alike.
+        // Anything the number grammar didn't claim is a name — digits, symbols,
+        // and `true`, which is a binding rather than a keyword.
         assert!(parse("{2dup +: x}").is_ok());
         assert!(parse("{+ -> x2: x}").is_ok());
-        // And the rule is the parameter list's alone.
-        assert!(parse("'3 set").is_ok());
+        assert!(parse("{true inf: x}").is_ok());
     }
 
     #[test]
@@ -640,6 +637,13 @@ mod tests {
         // No name may contain a fixed character, so a delimiter is no name.
         assert_eq!(err("'{}"), ParseErrorKind::ExpectedName { after: '\'' });
         assert_eq!(err(r#"&"s""#), ParseErrorKind::ExpectedName { after: '&' });
+        // Nor is a literal. One rule now covers the sigils and the parameter
+        // list: a name is what the number grammar didn't claim.
+        assert_eq!(err("'3"), ParseErrorKind::ExpectedName { after: '\'' });
+        assert_eq!(err("&2e3"), ParseErrorKind::ExpectedName { after: '&' });
+        assert_eq!(err("obj.3"), ParseErrorKind::ExpectedName { after: '.' });
+        // `true` is a binding, so it names like anything else.
+        assert!(parse("'true &true obj.true").is_ok());
     }
 
     #[test]

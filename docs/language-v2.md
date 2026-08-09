@@ -51,13 +51,32 @@ which contain spaces. Ten characters always tokenize on their own, whatever they
 ```
 
 So `[1 2 3]` yields the same tokens as `[ 1 2 3 ]`, `{x *}` the same as `{ x * }`, and `&f` yields `&`
-then `f`. A `.` between digits is part of the number, which is the one place a token's shape decides
-the split.
+then `f`.
 
-That is the whole phase: a split, a character set, and one mode. The string and comment lookahead runs
-first, so a bracket or sigil inside `"..."` or after a `#` is text. The output is a flat sequence of
-tokens, and resolution, nesting, and meaning all belong to the parser — a token is a *word* until the
-parser decides whether it is a number, a boolean, or a name to resolve.
+**This phase owns the literals**, both of them, decoded: a `"…"` arrives with its escapes resolved and
+its quotes gone, and a number arrives as a number. The rest is names.
+
+```
+number   = "-"? digit+ fraction? exponent?
+fraction = "." digit+
+exponent = ("e" | "E") ("+" | "-")? digit+
+```
+
+Small and deliberate, because **a name is defined negatively — a run this grammar doesn't claim.** That
+is forced by a vocabulary holding `2dup`, `bi*`, and `+`: no identifier grammar admits all three, which
+is why Forth, Factor, and Lisp all define names this way. The cost is that every literal shape deletes
+names, so the grammar has to be one we chose rather than one inherited — `inf`, `nan`, `1/2`, and `0x1f`
+are names here, and making any of them a number later is a deliberate change to what a name can be.
+
+Two consequences worth stating. A fraction needs digits on **both** sides, so it is `0.1`, never `.1` —
+and that is exactly what leaves `.` free to be the attribute operator, since `obj.x` has no digits
+around its dot. This is the one place a token's shape decides the split. And the run is taken **before**
+it is classified, never the other way round: matching a number greedily at the cursor would read `2dup`
+as a `2` and a `dup`, so a run is a number only if the grammar accounts for all of it.
+
+That is the whole phase: a split, a character set, two literal grammars, and one mode. The string and
+comment lookahead runs first, so a bracket or sigil inside `"..."` or after a `#` is text. The output is
+a flat sequence of tokens; nesting and resolution belong to the parser.
 
 ### Parse
 
@@ -65,9 +84,13 @@ The parser consumes the token stream and resolves everything positional:
 
 - `{` opens a template and `}` closes one. Nesting is the parser's own recursion, so depth needs no
   counter.
-- `'` takes the next token as a **name**; `&` takes the next token as a **fetch**.
-- Strings and numbers become **literals**.
+- `'` takes the next token as a **name**; `&` takes the next token as a **fetch**. Both require a
+  *word*, so `'3` is an error — a literal is not a name.
+- A literal token becomes a **literal element**; it was already decoded upstream.
 - Every other token is a **word reference**, resolved at application time (section 8).
+
+**There are no keywords.** Every token is a literal shape, a fixed character, or a name — `true` and
+`false` are ordinary prelude bindings (section 12.3), not syntax, so nothing here is reserved.
 
 `[`, `]`, `(`, and `)` pair here too. The parser matches every opener with its closer and requires
 regions to nest, so `{ [ } ]` is rejected. It emits them as fixed elements rather than word references
@@ -544,6 +567,13 @@ filter reduce times while until`.
 ### 12.3 Booleans and comparisons
 
 `== < > <= >= not and or`.
+
+**`true` and `false` are bindings, not literals** — prelude entries holding a boolean, applied like any
+other name. Section 1's rule already covers it: a value in the environment is a nullary function that
+pushes something, which is exactly what these are. So they can be fetched (`&true`), used as names
+(`'true`, `{true: …}`), shadowed, and un-shadowed with `del` (section 9), and the language needs no
+reserved words. The cost is a lookup where a literal would have been free — section 11's per-access
+indirection, which every other name already pays.
 
 ### 12.4 Numbers
 
