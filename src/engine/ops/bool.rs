@@ -1,5 +1,6 @@
-//! Logic words: `not`, `and`, `or`, `xor` — **generic over booleans and
-//! integers**, logical on the first and bitwise on the second. One name per
+//! Bool words: `not`, `and`, `or`, `xor`, plus the constants `true`/`false` —
+//! the operations **generic over booleans and integers**, logical on the first
+//! and bitwise on the second. One name per
 //! operation rather than Python's two (`and` beside `&`), which is what keeps
 //! `&`, `|`, `^`, and `~` out of the vocabulary entirely — they stay ordinary
 //! name characters, and `&` stays free to be the fetch sigil.
@@ -16,16 +17,36 @@
 //!
 //! On an integer, `not` is the bitwise complement: `!x`, which is `-x - 1` in
 //! two's complement, matching Python's `~`.
+//!
+//! **`true` and `false` live here too**, as constants rather than primitives —
+//! this is the bool module, and they are its values. They are bindings rather
+//! than parser syntax, which is what makes them ordinary names: they can be
+//! fetched (`&true`), shadowed, and un-shadowed with `del` like any other
+//! builtin (`language-v2.md` §9), and `'true` and `{true: …}` are legal because
+//! nothing about them is syntax.
+//!
+//! That costs a frame-chain walk per `true` — §1's "a value in the environment
+//! is a function too, a nullary one that consumes nothing and pushes something,"
+//! which §11 already accepts for every name. What it buys is that **the language
+//! has no keywords**: every token is a literal shape, a fixed character, or a
+//! name. `pi`, `e`, and `tau` will be constants of [`num`](super::num) for the
+//! same reason.
 
 use crate::engine::{Engine, ErrorKind, Primitive, Value};
 
 #[rustfmt::skip]
 pub(super) static PRIMITIVES: &[Primitive] = &[
-    Primitive { name: "not", run: not },   // logical or bitwise complement
-    Primitive { name: "and", run: and },
-    Primitive { name: "or",  run: or },
-    Primitive { name: "xor", run: xor },
+    Primitive { name: "not", run: not },   // a -- !a, logical or bitwise complement
+    Primitive { name: "and", run: and },   // a b -- a&b
+    Primitive { name: "or",  run: or },    // a b -- a|b
+    Primitive { name: "xor", run: xor },   // a b -- a^b
 ];
+
+/// The bool constants the prelude binds, as `(word, value)`. Not a `static`,
+/// since a [`Value`] holds `Rc`s and so isn't `Sync`.
+pub(super) fn constants() -> impl Iterator<Item = (&'static str, Value)> {
+    [("true", Value::Bool(true)), ("false", Value::Bool(false))].into_iter()
+}
 
 fn not(e: &mut Engine) -> Result<(), ErrorKind> {
     let value = match e.pop()? {

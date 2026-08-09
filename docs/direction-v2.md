@@ -180,7 +180,7 @@ This retires the per-token `Element::parse` model. It is the largest single piec
   all of it. This is the same fact that forces names to be defined negatively:
   no positive identifier grammar admits `2dup`, `bi*`, and `+` together.
 - **Booleans are prelude bindings, not literals.** `true`/`false` are values in
-  the prelude frame (`ops/constant.rs`), so they are fetchable, nameable,
+  the prelude frame (constants of `ops/bool.rs`), so they are fetchable, nameable,
   shadowable, and `del`-recoverable like any builtin — and **the language has no
   keywords at all**: every token is a literal shape, a fixed character, or a
   name. Costs a lookup per `true`, which §11 already accepts for every name.

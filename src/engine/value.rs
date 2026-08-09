@@ -103,14 +103,17 @@ impl Value {
         }
     }
 
-    /// Interpret as a 1-based stack level: a positive `Int`. A float is
-    /// rejected outright (no rounding) so `3.5 roll` errors rather than
-    /// guessing; a non-positive `Int` clamps to 0, which the range check then
-    /// reports as underflow. The indexed stack words funnel their level operand
-    /// through this.
-    pub(crate) fn as_index(&self) -> Result<usize, ErrorKind> {
+    /// The integer value, or a [`ErrorKind::TypeError`]. A float is rejected
+    /// outright (no rounding), so `3.5 roll` and `3.5 nth` error rather than
+    /// guessing.
+    ///
+    /// Only the *type* check is shared — the range policy is the caller's,
+    /// because the two indexing conventions disagree about a negative:
+    /// [`Value::as_index`] clamps it for a 1-based stack level, while `nth`
+    /// reports it as out of range.
+    pub(crate) fn as_int(&self) -> Result<i64, ErrorKind> {
         match self {
-            Value::Int(i) => Ok((*i).max(0) as usize),
+            Value::Int(i) => Ok(*i),
             Value::Num(_) => Err(ErrorKind::TypeError {
                 expected: "integer",
                 found: "float",
@@ -120,6 +123,13 @@ impl Value {
                 found: other.type_name(),
             }),
         }
+    }
+
+    /// Interpret as a 1-based stack level: a positive `Int`. A non-positive one
+    /// clamps to 0, which the range check then reports as underflow. The indexed
+    /// stack words funnel their level operand through this.
+    pub(crate) fn as_index(&self) -> Result<usize, ErrorKind> {
+        Ok(self.as_int()?.max(0) as usize)
     }
 
     /// The plain content string, no quotes — what `to_str` produces. For a

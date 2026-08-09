@@ -130,9 +130,15 @@ Rust's coherence/orphan rules and lack of HKTs make it stub its toe (you land at
 extensibility — an open word dictionary — for free.
 
 **Two tiers: machine + vocabulary.** The ops are split as *free functions over
-`&mut Engine`*, not methods, grouped by category under `engine/ops/` (arith,
-compare, logic, stack, seq, env) — each module owns its words and a `PRIMITIVES`
-table of its rows, and `ops::primitives()` chains them for the prelude. This
+`&mut Engine`*, not methods, under `engine/ops/` — each module owns its words and
+a `PRIMITIVES` table of its rows, and `ops::primitives()` chains them for the
+prelude. The modules are grouped by **the type a word is about** (`num`, `bool`,
+`list`), with three grouped by role instead because they are about the machine
+rather than any value type (`stack`, `env`, `control`), and one — `generic` — for
+the words that dispatch on their operand's type (`==`, `to_str`, `length`,
+`nth`). That axis is chosen to match V5: per-type attribute tables make a type's
+module the home of both its free words and its attributes, and `generic` is
+precisely the set that migrates into those tables. This
 draws a real line: `Engine` exposes a small `pub(crate)` **stack-machine API**
 (`pop`/`push`/`pop_num`/…, the indexed shuffles `pick_at`/`drop_at`/…,
 `close_list`, `clear`, `lookup`/`bind`), and the **word vocabulary** is a layer
