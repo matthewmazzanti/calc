@@ -326,19 +326,29 @@ fn a_failed_batch_is_rolled_back_by_the_copy_taken_first() {
 }
 
 #[test]
-fn the_module_activation_rests_holding_no_code() {
-    // A line is *loaded into* the module activation rather than pushed above
-    // it, and the module never returns — so the call stack is never empty. What
-    // makes that invisible to equality is that the module is left holding no
-    // code, whether the line succeeded or failed. Without it, two engines that
-    // differ only in which line ran last would compare unequal and every no-op
-    // would record an undo point.
+fn a_line_leaves_no_residue_of_its_execution() {
+    // An activation is what is *currently executing*, so between lines there
+    // are none — it pops when exhausted, and a failure clears what is left.
+    // That is what lets equality mean "the same state" rather than "the same
+    // state and the same last line", which the no-op check depends on: without
+    // it every command would record an undo point.
     let mut engine = Engine::new();
     let rest = engine.clone();
     engine.apply(&parse("1 drop").unwrap()).unwrap();
     assert_eq!(engine, rest, "a no-op line left the engine changed");
     assert!(engine.apply(&parse("+").unwrap()).is_err());
-    assert_eq!(engine, rest, "a failed line left code in the module");
+    assert_eq!(engine, rest, "a failed line left its activation behind");
+}
+
+#[test]
+fn the_session_frame_persists_across_evaluations() {
+    // The *frame* is the continuous thing, not the activation: each line runs
+    // in a new activation over the same session scope, so bindings accumulate.
+    let mut engine = Engine::new();
+    engine.apply(&parse("1 'x set").unwrap()).unwrap();
+    engine.apply(&parse("2 'y set").unwrap()).unwrap();
+    engine.apply(&parse("x y +").unwrap()).unwrap();
+    assert_eq!(engine.stack(), &[Value::Int(3)]);
 }
 
 #[test]

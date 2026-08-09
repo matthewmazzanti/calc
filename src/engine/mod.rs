@@ -96,12 +96,24 @@ impl std::fmt::Display for Primitive {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Engine {
     stack: Stack,
-    /// The call stack — see [`Activation`]. **Never empty**: the bottom entry is
-    /// the module activation, which every line is loaded into and which never
-    /// returns.
+    /// The call stack — see [`Activation`]. Empty between lines, because an
+    /// activation is what is *currently executing* and between lines nothing is.
     calls: Vec<Activation>,
     /// Every frame that exists, by id.
     env: Env,
+    /// The **session** frame: the interactive scope, where a top-level binding
+    /// lands and accumulates across evaluations. Its parent is the global frame
+    /// holding the prelude, so the chain from here reaches every builtin (§8).
+    ///
+    /// A *frame*, not an activation — the environment is what persists between
+    /// lines; the execution of each line does not.
+    ///
+    /// Distinct from a **module** frame, which §9 describes and which does not
+    /// exist yet: a module has a file, is loaded once, and exports. The session
+    /// has none of those. They will differ in how they are *reached* — a module
+    /// is imported from somewhere — so keeping them separate now avoids
+    /// deciding that by accident.
+    session: FrameId,
     /// The next frame id to hand out. Rewound by a snapshot like everything
     /// else, which is safe because **an id only means anything inside the
     /// environment it was minted in** — a value and the `Env` it names are
@@ -117,11 +129,11 @@ pub struct Engine {
 /// is walked by *name lookup*, following `parent` — which a call sets to the
 /// function's captured environment, never to its caller (§8).
 ///
-/// The bottom activation is the **module**, and it is special in exactly one
-/// way: it never returns. A REPL line is loaded into it rather than pushed above
-/// it, which is §9's "a module is not a call frame" made structural — a line is
-/// a call that reuses the module's frame instead of allocating one. Between
-/// lines it holds an empty template, so two engines at rest compare equal.
+/// One is pushed per evaluation, reusing the session frame rather than
+/// allocating one — which is §9's "a module is not a call frame" made
+/// structural: a line is a call whose scope already exists. It pops when its
+/// template is exhausted, so the stack is empty between lines and a line leaves
+/// no residue for the next one to compare against.
 #[derive(Debug, Clone, PartialEq)]
 struct Activation {
     template: Rc<[Element]>,
@@ -140,31 +152,23 @@ fn prelude() -> HashMap<Rc<str>, Value> {
         .collect()
 }
 
-/// An activation with nothing to run — what the module holds between lines.
-fn no_code() -> Rc<[Element]> {
-    Rc::from(Vec::new())
-}
-
 /// The global frame's id. Every chain ends here, and it is the one frame that
 /// will never be a collection candidate — reachable as a root from everywhere.
 const GLOBAL: FrameId = 0;
-/// The module frame's id — the REPL's scope, installed under the global frame.
-const MODULE: FrameId = 1;
+/// The session frame's id — the interactive scope, under the global frame.
+const SESSION: FrameId = 1;
 
 impl Default for Engine {
     fn default() -> Self {
         let mut env = Env::default();
         env.insert(GLOBAL, None, prelude());
-        env.insert(MODULE, Some(GLOBAL), Bindings::new());
+        env.insert(SESSION, Some(GLOBAL), Bindings::new());
         Self {
             stack: Stack::new(),
-            calls: vec![Activation {
-                template: no_code(),
-                ip: 0,
-                frame: MODULE,
-            }],
+            calls: Vec::new(),
             env,
-            next_frame: MODULE + 1,
+            session: SESSION,
+            next_frame: SESSION + 1,
         }
     }
 }
@@ -198,74 +202,46 @@ impl Engine {
         }
     }
 
-    /// Load a line into the module activation and run until it is exhausted.
-    /// Either way the module is left holding no code, which is the engine's
-    /// resting shape.
-    fn run(&mut self, template: Rc<[Element]>) -> Result<(), (ErrorKind, usize)> {
-        let module = self.module_mut();
-        module.template = template;
-        module.ip = 0;
-        let outcome = self.execute();
-        self.clear_calls();
-        outcome
-    }
-
-    /// The evaluation loop: advance the top activation one element at a time,
-    /// popping it when its template is exhausted, and stopping when the module
-    /// activation runs out — the module never returns, so "done" is a depth of
-    /// one rather than an empty stack.
+    /// The evaluation loop: push an activation for the line — running in the
+    /// session frame, since its scope already exists — then advance the top
+    /// activation one element at a time, popping it when its template is
+    /// exhausted, until the stack empties.
     ///
     /// **An explicit machine, not a recursive walk.** Nothing needs it yet —
-    /// with no functions there is only ever the module activation — but
-    /// iteration in this language is recursion over combinators, so calls must
-    /// run *flat* or depth is bounded by the Rust stack. Making the loop
-    /// explicit is what lets a tail call replace the top activation instead of
-    /// nesting under it (`direction-v2.md`, "the evaluator is an explicit VM").
+    /// with no functions there is only ever the one activation — but iteration
+    /// in this language is recursion over combinators, so calls must run *flat*
+    /// or depth is bounded by the Rust stack. Making the loop explicit is what
+    /// lets a tail call replace the top activation instead of nesting under it
+    /// (`direction-v2.md`, "the evaluator is an explicit VM").
     ///
     /// The element is cloned out before dispatch — an `Rc` bump for a template,
     /// a `Value` clone otherwise — because the op it runs needs `&mut self`, and
     /// the activation it came from lives in `self`.
-    fn execute(&mut self) -> Result<(), (ErrorKind, usize)> {
+    fn run(&mut self, template: Rc<[Element]>) -> Result<(), (ErrorKind, usize)> {
+        self.calls.push(Activation {
+            template,
+            ip: 0,
+            frame: self.session,
+        });
         loop {
-            let top = self.top();
+            let Some(top) = self.calls.last() else {
+                return Ok(());
+            };
             if top.ip >= top.template.len() {
-                if self.calls.len() == 1 {
-                    return Ok(()); // the module is out of code, not returning
-                }
                 self.calls.pop();
                 continue;
             }
-            let top = self.top_mut();
+            let top = self.calls.last_mut().expect("checked just above");
             let element = top.template[top.ip].clone();
             let index = top.ip;
             top.ip += 1;
             if let Err(kind) = self.apply_one(&element) {
+                // A failed line abandons whatever it was part-way through; the
+                // caller's copy puts the rest of the state back.
+                self.calls.clear();
                 return Err((kind, index));
             }
         }
-    }
-
-    /// The running activation. Never absent — the module activation is the floor.
-    fn top(&self) -> &Activation {
-        self.calls.last().expect("the module activation")
-    }
-
-    fn top_mut(&mut self) -> &mut Activation {
-        self.calls.last_mut().expect("the module activation")
-    }
-
-    fn module_mut(&mut self) -> &mut Activation {
-        self.calls.first_mut().expect("the module activation")
-    }
-
-    /// Return to the resting shape: only the module activation, holding no code.
-    /// Run after every batch, so a failed line leaves nothing half-executed and
-    /// two engines between lines differ only where their *state* differs.
-    fn clear_calls(&mut self) {
-        self.calls.truncate(1);
-        let module = self.module_mut();
-        module.template = no_code();
-        module.ip = 0;
     }
 
     /// Apply one program element: push a literal, resolve a word, fetch a
@@ -479,10 +455,11 @@ impl Engine {
     }
 
     /// The frame lookup starts from and binding lands in: the running
-    /// activation's, with no special case for top level — between lines that is
-    /// the module activation, and during a call it is the callee's.
+    /// activation's, or the session frame when nothing is running — which is
+    /// how a caller between lines (a `words` listing, a test) still has an
+    /// answer.
     fn frame(&self) -> FrameId {
-        self.top().frame
+        self.calls.last().map_or(self.session, |top| top.frame)
     }
 
     /// Allocate a frame enclosed by `parent`, and return its id. Every

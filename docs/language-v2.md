@@ -396,12 +396,13 @@ The **environment** is a chain of **frames**:
 | Frame | Allocated | Lifetime |
 |---|---|---|
 | global | once | forever — builtins |
-| module | per file, plus the REPL | session |
+| session | once | the interactive session — where a top-level binding lands |
+| module | per file | until nothing references it |
 | call | per application | until return, or longer if captured |
 
 ```
 global frame
-    module frame      ← set at module top level installs here
+    session frame     ← binding at top level installs here
         call frame    ← set inside a running function installs here
             call frame
 ```
@@ -471,9 +472,9 @@ The environment is for *definitions*. Values go on the stack:
 
 ---
 
-## 9. Modules
+## 9. Modules and the session
 
-A module is a frame. Each gets its own; the REPL is one.
+A module is a frame. Each gets its own.
 
 - binding at module top level installs into the module frame
 - Modules export everything, for now
@@ -482,17 +483,32 @@ A module is a frame. Each gets its own; the REPL is one.
 **A module is not a call frame**, so a module body *can* install definitions — a file of
 `'name { ... } =` lines works. What's excluded is a *called* function mutating the module frame.
 
+**The interactive scope is a fourth frame kind, not a module.** It behaves the same way — top-level
+binding installs there, a template instantiated there captures it, and it is not a call frame — but a
+module has a file, is loaded once, and is *reached* by importing it, and the **session** frame has
+none of that. It sits directly under the global frame and accumulates for as long as the session
+lasts.
+
+They are kept apart because the thing that will distinguish them hasn't been decided: how an imported
+module becomes visible. A frame chain is linear, so a session cannot have both the global frame and
+every imported module as parents — imports will either merge bindings into the session, or arrive as
+values that are dotted into (section 7). Calling the session a module would settle that by accident.
+
+Each *evaluation* runs in a new activation over the session frame, rather than the session being a
+suspended activation of its own: the environment is what persists between evaluations, and the
+execution of each one does not.
+
 ### `del` and un-shadowing
 
 Binding installs in the current frame without walking the chain, so `del` unbinds in the current
 frame without walking either.
 
-- At the REPL the current frame is the module frame, so `'x del` removes a module binding.
+- At the REPL the current frame is the session frame, so `'x del` removes a session binding.
 - Inside a function, `del` can only remove a local.
 - Builtins in the global frame can't be deleted from user code, since you're never *in* it.
 
 **So `del` is un-shadow, and that's the recovery path.** Rebinding a builtin at the REPL creates a
-shadow in the module frame; the original is untouched in the global frame; `del` removes the shadow.
+shadow in the session frame; the original is untouched in the global frame; `del` removes the shadow.
 
 Error messages should distinguish "not bound anywhere" from "bound, but not in this frame."
 

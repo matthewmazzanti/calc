@@ -160,7 +160,7 @@ by id rather than pointing at it.**
 
 COW on frames looks obviously wrong, and against a pointer it is:
 
-> A closure captured the module frame, so the frame is never uniquely owned, so
+> A closure captured the session frame, so the frame is never uniquely owned, so
 > the next `set` clones it — and the closure is left holding the old copy,
 > unable to see the new binding. Late binding dies.
 
@@ -238,7 +238,7 @@ all hold for the same reason. The recursive call allocates frame 3 with parent
 **A snapshot is a clone of the whole engine.** Cloning the map is one `Rc` bump
 per frame and unchanged frames stay shared, so it is cheap; undo assigns it back.
 No restore-into-a-live-frame, no identity to preserve by hand, and **every** frame
-is covered rather than just the module frame — so the guarantee doesn't rest on
+is covered rather than just the session frame — so the guarantee doesn't rest on
 §8's "only the current frame is mutable" holding forever (the debt §8 flags for
 continuations and generators).
 
@@ -291,7 +291,7 @@ than it did: a call needs a frame only if it **binds** or **captures**, so
 
 - A map lookup per frame hop, rather than a pointer deref.
 - A snapshot is O(frames) pointer bumps — cheaper than the `Rc`-spine's
-  `State`, which copied the module frame's *bindings*.
+  `State`, which copied the session frame's *bindings*.
 - A bind on a snapshotted frame clones that frame's binding map. A persistent map
   inside the frame would make it O(log n); a `HashMap` is the right starting
   point at calculator scale.
