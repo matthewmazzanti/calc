@@ -197,34 +197,40 @@ fn attached(input: &str, index: usize) -> bool {
 /// ([`number`]) and "does a number continue through this `.`?" ([`read_word`]).
 fn scan_number(input: &str, start: usize) -> Option<usize> {
     let text = &input[start..];
-    let mut at = usize::from(text.starts_with('-'));
-    // A fraction needs digits *after* the dot, whether or not any precede it —
-    // so `0.1` and `.1` are numbers, and `3.`, `.x`, `-x` are not. Whether a
-    // leading `.` is even offered to this grammar is [`attached`]'s call.
-    let integer = digits_end(text, at);
-    if integer > at {
-        at = integer;
-        if text[at..].starts_with('.') {
-            match digits_end(text, at + 1) {
-                end if end > at + 1 => at = end,
-                _ => return Some(start + at),
-            }
-        }
-    } else if text[at..].starts_with('.') {
-        match digits_end(text, at + 1) {
-            end if end > at + 1 => at = end,
-            _ => return None,
-        }
-    } else {
-        return None;
-    }
-    if text[at..].starts_with(['e', 'E']) {
-        let signed = at + 1 + usize::from(text[at + 1..].starts_with(['+', '-']));
-        if digits_end(text, signed) > signed {
-            at = digits_end(text, signed);
-        }
+    let sign = usize::from(text.starts_with('-'));
+    let integer = digits_end(text, sign);
+    // Digits, a fraction, or both — but at least one of them, which is the
+    // whole of the leading rule. So `3`, `3.5`, and `.5` are numbers, while
+    // `3.` is the number `3` with a dot after it, and `.x` and `-x` are names.
+    let mut at = match (fraction_end(text, integer), integer > sign) {
+        (Some(fraction), _) => fraction,
+        (None, true) => integer,
+        (None, false) => return None,
+    };
+    if let Some(exponent) = exponent_end(text, at) {
+        at = exponent;
     }
     Some(start + at)
+}
+
+/// The index past the fraction at `at`, if one is there. A lone `.` is not one:
+/// the digits after it are what make it a fraction rather than the attribute
+/// operator, which is the rule that lets `3.` and `obj.x` split.
+fn fraction_end(text: &str, at: usize) -> Option<usize> {
+    text[at..]
+        .starts_with('.')
+        .then(|| digits_end(text, at + 1))
+        .filter(|&end| end > at + 1)
+}
+
+/// The index past the exponent at `at`, if one is there — `e`/`E`, an optional
+/// sign, then digits. Without the digits it is part of a name (`1e`).
+fn exponent_end(text: &str, at: usize) -> Option<usize> {
+    if !text[at..].starts_with(['e', 'E']) {
+        return None;
+    }
+    let digits = at + 1 + usize::from(text[at + 1..].starts_with(['+', '-']));
+    Some(digits_end(text, digits)).filter(|&end| end > digits)
 }
 
 /// The index just past the digits starting at `from` — `from` itself if none.
@@ -249,94 +255,93 @@ fn number(text: &str) -> Option<Value> {
     ))
 }
 
-/// Split `input` into tokens, or fail on an unterminated string — the one error
-/// this phase can raise. Nesting, resolution, and meaning all belong to the
-/// parser.
+/// Split `input` into tokens, or fail on a string with no closing `"` or a
+/// sigil with no name. Nesting, resolution, and meaning belong to the parser.
+///
+/// Every arm yields one token and where it ends, so the loop pushes and advances
+/// in one place; the two that produce nothing — whitespace and comments —
+/// advance and `continue`.
 pub fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
     let mut tokens = Vec::new();
     let mut i = 0;
     while let Some(c) = input[i..].chars().next() {
-        let width = c.len_utf8();
-        if c.is_whitespace() {
-            i += width;
-        } else if c == '#' {
-            // A comment runs to end of line and vanishes here — it may contain
-            // any character, delimiters included, since this lookahead wins.
-            i = input[i..].find('\n').map_or(input.len(), |n| i + n);
-        } else if c == '"' {
-            let (text, end) = read_string(input, i)?;
-            tokens.push(Token {
-                kind: TokenKind::Str(Rc::new(text)),
-                span: Span::new(i, end),
-            });
-            i = end;
-        } else if let Some(kind) = delimiter(c) {
-            tokens.push(Token {
-                kind,
-                span: Span::new(i, i + width),
-            });
-            i += width;
-        } else if c == '\'' || c == '&' {
-            // Only reachable at a token start: a run swallows these characters,
-            // so mid-name ones are never seen here (see `breaks_word`).
-            let (name, end) = read_name(input, i, c)?;
-            tokens.push(Token {
-                kind: match c {
+        let (kind, end) = match c {
+            _ if c.is_whitespace() => {
+                i += c.len_utf8();
+                continue;
+            }
+            // A comment runs to end of line and vanishes — it may hold any
+            // character, delimiters included, since this lookahead wins.
+            '#' => {
+                i = input[i..].find('\n').map_or(input.len(), |n| i + n);
+                continue;
+            }
+            '"' => {
+                let (text, end) = read_string(input, i)?;
+                (TokenKind::Str(Rc::new(text)), end)
+            }
+            // A prefix sigil. Only reachable at a token start: a run swallows
+            // these characters, so mid-name ones are never seen here.
+            '\'' | '&' => {
+                let (name, end) = read_name(input, i, c)?;
+                let kind = match c {
                     '\'' => TokenKind::Name(name),
                     _ => TokenKind::Fetch(name),
-                },
-                span: Span::new(i, end),
-            });
-            i = end;
-        } else if c == '.' {
-            // Detached, a `.` may open a number; attached, it is the attribute
-            // operator. Either way an attribute is the fallback, so `.map`
-            // works wherever it appears.
-            let run = (!attached(input, i)).then(|| read_word(input, i));
-            match run.and_then(|end| Some((number(&input[i..end])?, end))) {
-                Some((value, end)) => {
-                    tokens.push(Token {
-                        kind: TokenKind::Number(value),
-                        span: Span::new(i, end),
-                    });
-                    i = end;
-                }
-                None => {
-                    // `.&x` fetches, `.x` applies — the `&` is at a token start
-                    // after the dot, so it is the same prefix sigil as anywhere
-                    // else, and needs no rule of its own.
-                    let fetch = input[i + 1..].starts_with('&');
-                    let (name, end) = match fetch {
-                        true => read_name(input, i + 1, '&')?,
-                        false => read_name(input, i, '.')?,
-                    };
-                    tokens.push(Token {
-                        kind: match fetch {
-                            true => TokenKind::AttrFetch(name),
-                            false => TokenKind::Attr(name),
-                        },
-                        span: Span::new(i, end),
-                    });
-                    i = end;
-                }
+                };
+                (kind, end)
             }
-        } else {
-            // Run first, classify second — never the other way round. Matching
-            // a number greedily at the cursor would take `2dup` as a 2 and a
-            // `dup`; the run is what a number has to account for *all* of.
-            let end = read_word(input, i);
-            let text = &input[i..end];
-            tokens.push(Token {
-                kind: match number(text) {
-                    Some(value) => TokenKind::Number(value),
-                    None => TokenKind::Word(Rc::from(text)),
-                },
-                span: Span::new(i, end),
-            });
-            i = end;
-        }
+            '.' => read_dot(input, i)?,
+            // A standalone character, or else a run to classify.
+            _ => match delimiter(c) {
+                Some(kind) => (kind, i + c.len_utf8()),
+                None => {
+                    let end = read_word(input, i);
+                    (classify(&input[i..end]), end)
+                }
+            },
+        };
+        tokens.push(Token {
+            kind,
+            span: Span::new(i, end),
+        });
+        i = end;
     }
     Ok(tokens)
+}
+
+/// A run is a number when the grammar accounts for **all** of it, and a name
+/// when it doesn't — the negative definition, in one line.
+fn classify(text: &str) -> TokenKind {
+    match number(text) {
+        Some(value) => TokenKind::Number(value),
+        None => TokenKind::Word(Rc::from(text)),
+    }
+}
+
+/// The token a `.` at `start` begins. Detached, it may open a number; attached,
+/// it is the attribute operator. An attribute is the fallback either way, so
+/// `.map` reads the same wherever it appears — only whether a *number* is on
+/// offer depends on what precedes the dot.
+///
+/// `.&x` fetches and `.x` applies. After the dot you are at a token start, so
+/// the `&` is the ordinary prefix sigil and needs no rule of its own.
+fn read_dot(input: &str, start: usize) -> Result<(TokenKind, usize), ParseError> {
+    if !attached(input, start) {
+        let end = read_word(input, start);
+        if let Some(value) = number(&input[start..end]) {
+            return Ok((TokenKind::Number(value), end));
+        }
+    }
+    let fetch = input[start + 1..].starts_with('&');
+    let (name, end) = match fetch {
+        true => read_name(input, start + 1, '&')?,
+        false => read_name(input, start, '.')?,
+    };
+    let kind = match fetch {
+        true => TokenKind::AttrFetch(name),
+        false => TokenKind::Attr(name),
+    };
+    Ok((kind, end))
 }
 
 /// Read the name a sigil at `start` binds to: the run just after it, which must
