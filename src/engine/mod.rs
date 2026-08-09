@@ -81,6 +81,9 @@ impl std::fmt::Display for Primitive {
 #[derive(Debug, Clone)]
 pub struct Engine {
     stack: Stack,
+    /// The call stack — see [`Activation`]. Empty except while [`Engine::run`]
+    /// is inside a batch.
+    calls: Vec<Activation>,
     /// User bindings — the mutable top frame, grown by `set` and cloned per
     /// snapshot. A lookup falls through to `base`. A single flat frame for now
     /// (the REPL/module scope); the frame *chain* arrives with functions.
@@ -93,6 +96,20 @@ pub struct Engine {
 
 /// A single environment frame: names bound to values.
 type Frame = std::collections::HashMap<Rc<str>, Value>;
+
+/// One level of the **dynamic** call stack: a template, and how far through it
+/// evaluation has got. Distinct from a [`Frame`], which is the *lexical* half —
+/// an activation is walked by returning, a frame by name lookup, and a call sets
+/// the new frame's parent to the function's captured environment rather than to
+/// its caller.
+///
+/// The stack is empty at every line boundary, which is what lets [`Engine`]'s
+/// equality and the transaction snapshot ignore it.
+#[derive(Debug, Clone)]
+struct Activation {
+    template: Rc<[Element]>,
+    ip: usize,
+}
 
 /// Build the prelude frame — every primitive the [`ops`] modules define as a
 /// first-class [`Value::Builtin`] under its canonical word, plus the constants
@@ -111,6 +128,7 @@ impl Default for Engine {
     fn default() -> Self {
         Self {
             stack: Stack::new(),
+            calls: Vec::new(),
             top: Frame::new(),
             base: prelude(),
         }
@@ -120,7 +138,8 @@ impl Default for Engine {
 /// Two engines are equal when their stacks and user bindings match. The prelude
 /// (`base`) is invariant — every engine shares the same immutable vocabulary —
 /// so excluding it keeps the per-keystroke change check (in `update`) off the
-/// prelude map entirely.
+/// prelude map entirely. The call stack is excluded because it is empty
+/// wherever equality is asked: between lines, never mid-batch.
 impl PartialEq for Engine {
     fn eq(&self, other: &Self) -> bool {
         self.stack == other.stack && self.top == other.top
@@ -137,24 +156,54 @@ impl Engine {
         &self.stack
     }
 
-    /// Apply a program (a slice of elements) in order, threading one engine
-    /// through the whole batch (this is the consuming boundary). The first failure
-    /// short-circuits and is wrapped with a [`Trace`] of the batch plus the
-    /// index that failed — "here's what was running." A partially-applied engine
-    /// is simply dropped; the caller kept its own copy (see the module docs).
+    /// Apply a program, threading one engine through the whole batch (this is
+    /// the consuming boundary). The first failure short-circuits and is wrapped
+    /// with a [`Trace`] of the batch plus the index that failed — "here's what
+    /// was running." A partially-applied engine is simply dropped; the caller
+    /// kept its own copy (see the module docs).
     pub fn apply(mut self, program: &[Element]) -> Outcome {
-        for (index, element) in program.iter().enumerate() {
-            if let Err(kind) = self.apply_one(element) {
-                return Err(CalcError {
-                    kind,
-                    trace: Some(Trace {
-                        program: program.to_vec(),
-                        index,
-                    }),
-                });
+        match self.run(Rc::from(program)) {
+            Ok(()) => Ok(self),
+            Err((kind, index)) => Err(CalcError {
+                kind,
+                trace: Some(Trace {
+                    program: program.to_vec(),
+                    index,
+                }),
+            }),
+        }
+    }
+
+    /// The evaluation loop: advance the top activation one element at a time,
+    /// popping it when its template is exhausted, until the call stack empties.
+    ///
+    /// **An explicit machine, not a recursive walk.** Nothing needs it yet —
+    /// with no functions there is only ever one activation — but iteration in
+    /// this language is recursion over combinators, so calls must run *flat* or
+    /// depth is bounded by the Rust stack. Making the loop explicit is what lets
+    /// a tail call replace the top activation instead of nesting under it
+    /// (`direction-v2.md`, "the evaluator is an explicit VM").
+    ///
+    /// The element is cloned out before dispatch — an `Rc` bump for a template,
+    /// a `Value` clone otherwise — because the op it runs needs `&mut self`, and
+    /// the activation it came from lives in `self`.
+    fn run(&mut self, template: Rc<[Element]>) -> Result<(), (ErrorKind, usize)> {
+        self.calls.push(Activation { template, ip: 0 });
+        loop {
+            let Some(activation) = self.calls.last_mut() else {
+                return Ok(());
+            };
+            let Some(element) = activation.template.get(activation.ip).cloned() else {
+                self.calls.pop();
+                continue;
+            };
+            let index = activation.ip;
+            activation.ip += 1;
+            if let Err(kind) = self.apply_one(&element) {
+                self.calls.clear();
+                return Err((kind, index));
             }
         }
-        Ok(self)
     }
 
     /// Apply one program element: push a literal, resolve a word, fetch a
