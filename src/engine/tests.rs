@@ -4,9 +4,11 @@
 
 use super::*;
 
-/// Parse and run `input` from a fresh engine and return the result.
+/// Parse and run `input` on a fresh engine, and return it.
 fn run(input: &str) -> Engine {
-    Engine::new().apply(&parse(input).unwrap()).unwrap()
+    let mut engine = Engine::new();
+    engine.apply(&parse(input).unwrap()).unwrap();
+    engine
 }
 
 #[test]
@@ -301,19 +303,41 @@ fn errors_carry_the_trace_of_the_failing_command() {
 }
 
 #[test]
-fn an_error_leaves_the_callers_engine_untouched() {
-    // Family-C atomicity: run against a *copy*; on error the original is
-    // intact simply because it was never moved into `apply`.
-    let original = run("1");
+fn a_failed_batch_is_rolled_back_from_a_state() {
+    // Atomicity is the caller's: a failed batch leaves the engine part-way
+    // through, and the `State` taken beforehand puts it back. The engine is
+    // *not* copied — its frames are shared handles, so restoring assigns values
+    // into the live ones and a closure's captured frame keeps its identity.
+    let mut engine = run("1 'x set");
+    let before = engine.state();
     assert_eq!(
-        original
-            .clone()
-            .apply(&parse("+").unwrap())
+        engine
+            .apply(&parse("2 'y set +").unwrap())
             .unwrap_err()
             .kind,
         ErrorKind::StackUnderflow
     );
-    assert_eq!(original.stack(), &[1.0]);
+    // Mid-failure the damage is real — `y` was bound before `+` failed.
+    assert_eq!(engine.lookup("y"), Some(Value::Int(2)));
+    engine.restore(&before);
+    assert_eq!(engine.stack(), &[] as &[Value]);
+    assert_eq!(engine.lookup("x"), Some(Value::Int(1)));
+    assert_eq!(engine.lookup("y"), None);
+}
+
+#[test]
+fn a_restore_keeps_the_frame_it_restores_into() {
+    // The identity that rollback must preserve: same frame, new contents.
+    let mut engine = Engine::new();
+    let before = engine.state();
+    engine.apply(&parse("1 'x set").unwrap()).unwrap();
+    let frame = engine.module_frame();
+    engine.restore(&before);
+    assert!(
+        Rc::ptr_eq(&frame, &engine.module_frame()),
+        "restore replaced the frame instead of its bindings"
+    );
+    assert_eq!(engine.lookup("x"), None);
 }
 
 #[test]
@@ -378,7 +402,8 @@ fn clear_empties_the_stack() {
 fn apply_runs_a_batch_of_commands() {
     // The TUI path: push literal elements, then run an operator directly on
     // the engine (as the operator keys do) rather than as a program word.
-    let mut engine = Engine::new()
+    let mut engine = Engine::new();
+    engine
         .apply(&[
             Element::Literal(Value::Num(2.0)),
             Element::Literal(Value::Num(3.0)),
@@ -779,7 +804,9 @@ fn a_bind_element_binds_like_set() {
         Element::Bind(Rc::from("x")),
         Element::Word(Rc::from("x")),
     ];
-    assert_eq!(Engine::new().apply(&program).unwrap().stack(), &[3.0]);
+    let mut engine = Engine::new();
+    engine.apply(&program).unwrap();
+    assert_eq!(engine.stack(), &[3.0]);
     // It takes the top of the stack, so an empty one underflows — the same
     // failure `set` gives, since it is the same binding.
     assert_eq!(

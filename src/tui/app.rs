@@ -6,7 +6,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::engine::{
-    self, CalcError, Element, Engine, ErrorKind, Outcome, Primitive, Value, ADD, DIV, DUP, MUL, SUB,
+    self, CalcError, Element, Engine, ErrorKind, Outcome, Primitive, State, Value, ADD, DIV, DUP,
+    MUL, SUB,
 };
 use crate::history::History;
 
@@ -149,18 +150,25 @@ impl LineEditor {
 }
 
 /// A calculator state paired with the command that produced it. This is the
-/// unit of history, so undo/redo restore the engine *and* the info-bar label
-/// together — each state remembers how it was reached.
+/// unit of history, so undo/redo restore the state *and* the info-bar label
+/// together — each one remembers how it was reached.
+///
+/// It holds a [`State`] — a value copy of the stack and bindings — rather than
+/// an `Engine`, because the engine is a live thing now: its frames are shared
+/// handles, so a copy of one would share what it was supposed to preserve.
+/// Undo puts values *back into* the live engine instead of swapping it out.
 #[derive(Debug)]
 struct Snapshot {
-    engine: Engine,
-    /// The command that produced `engine` (empty for the initial state).
+    state: State,
+    /// The command that produced `state` (empty for the initial state).
     cmd: String,
 }
 
-/// The whole UI state. `history` owns the live snapshot and the surrounding
-/// undo/redo states — the non-empty `(past…, current, future…)` list.
+/// The whole UI state. The engine is the live calculator; `history` holds value
+/// copies of it — the non-empty `(past…, current, future…)` list — whose current
+/// entry always matches the engine.
 pub(super) struct App {
+    engine: Engine,
     history: History<Snapshot>,
     mode: Mode,
     /// The command-line buffer and caret, edited in insert and quote modes.
@@ -175,11 +183,13 @@ pub(super) struct App {
 
 impl App {
     pub(super) fn new() -> Self {
+        let engine = Engine::new();
         Self {
             history: History::new(Snapshot {
-                engine: Engine::new(),
+                state: engine.state(),
                 cmd: String::new(),
             }),
+            engine,
             mode: Mode::Insert,
             input: LineEditor::default(),
             cursor: 1,
@@ -260,7 +270,7 @@ impl App {
 
     /// The live engine (history's current snapshot).
     fn engine(&self) -> &Engine {
-        &self.history.current().engine
+        &self.engine
     }
 
     /// Keep the cursor on a real level (or 1 when the stack is empty).
@@ -422,7 +432,7 @@ impl App {
                 return false;
             }
         };
-        if self.update(describe(&program), |e| e.apply(&program)) {
+        if self.update(describe(&program), |engine| engine.apply(&program)) {
             self.input.clear();
             true
         } else {
@@ -451,10 +461,9 @@ impl App {
         } else {
             format!("{entry} {op}")
         };
-        if self.update(cmd, |e| {
-            let mut e = e.apply(&program)?;
-            e.run_builtin(op)?;
-            Ok(e)
+        if self.update(cmd, |engine| {
+            engine.apply(&program)?;
+            engine.run_builtin(op).map_err(CalcError::from)
         }) {
             self.input.clear();
         }
@@ -464,42 +473,52 @@ impl App {
     /// adapting the `&mut` op into the consuming transform `update` expects. A
     /// bare `ErrorKind` becomes a trace-less `CalcError`.
     fn edit(&mut self, cmd: String, f: impl FnOnce(&mut Engine) -> Result<(), ErrorKind>) {
-        self.update(cmd, |mut e| f(&mut e).map(|()| e).map_err(CalcError::from));
+        self.update(cmd, |engine| f(engine).map_err(CalcError::from));
     }
 
-    /// Run a transform on a copy of the current engine and adopt the result as
-    /// the new live state. On success — if the state actually changed — the full
-    /// snapshot (engine + `cmd`) is committed as an undo point. On failure the
-    /// engine is left untouched (the copy is discarded) and the error shown, so
-    /// an operation is atomic. Returns success.
-    fn update(&mut self, cmd: String, f: impl FnOnce(Engine) -> Outcome) -> bool {
-        match f(self.engine().clone()) {
-            Ok(next) => {
+    /// Run a transform against the live engine as one transaction: take a
+    /// [`State`] first, and on failure put it back. On success — if the state
+    /// actually changed — commit it with its `cmd` as an undo point. Returns
+    /// success.
+    ///
+    /// The engine is mutated in place rather than copied, because its frames are
+    /// shared handles; rollback restores *values into* the live frames, which is
+    /// what keeps a closure's captured environment intact across a failed line.
+    fn update(&mut self, cmd: String, f: impl FnOnce(&mut Engine) -> Outcome) -> bool {
+        let before = self.engine.state();
+        match f(&mut self.engine) {
+            Ok(()) => {
+                let after = self.engine.state();
                 // Commit only if the state actually changed — a no-op command
                 // is not a new state, so it neither records history nor relabels
                 // the current one.
-                if &next != self.engine() {
-                    self.history.commit(Snapshot { engine: next, cmd });
+                if after != before {
+                    self.history.commit(Snapshot { state: after, cmd });
                 }
                 true
             }
             Err(e) => {
+                self.engine.restore(&before);
                 self.notice = Some(Notice::Error(e));
                 false
             }
         }
     }
 
-    /// Restore the previous snapshot (engine and its `cmd`) as the live state.
+    /// Restore the previous snapshot (state and its `cmd`) into the engine.
     fn undo(&mut self) {
-        if !self.history.undo() {
+        if self.history.undo() {
+            self.engine.restore(&self.history.current().state);
+        } else {
             self.notice = Some(Notice::Note("nothing to undo".to_string()));
         }
     }
 
     /// Re-apply the most recently undone snapshot.
     fn redo(&mut self) {
-        if !self.history.redo() {
+        if self.history.redo() {
+            self.engine.restore(&self.history.current().state);
+        } else {
             self.notice = Some(Notice::Note("nothing to redo".to_string()));
         }
     }
@@ -823,6 +842,40 @@ mod tests {
         assert_eq!(app.stack(), &[1.0, 2.0, 3.0, 4.0]);
         press(&mut app, KeyCode::Esc);
         ch(&mut app, 'u');
+        assert!(app.stack().is_empty());
+    }
+
+    #[test]
+    fn undo_reverts_bindings_not_just_the_stack() {
+        // The environment is part of the state a line changes, so undo has to
+        // put it back too — and it does so by restoring values *into* the live
+        // module frame rather than swapping the engine out.
+        let mut app = App::new();
+        typ(&mut app, "1 'x set");
+        press(&mut app, KeyCode::Enter);
+        typ(&mut app, "2 'x set");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.engine().lookup("x"), Some(Value::Int(2)));
+
+        press(&mut app, KeyCode::Esc);
+        ch(&mut app, 'u');
+        assert_eq!(app.engine().lookup("x"), Some(Value::Int(1)));
+        ch(&mut app, 'u');
+        assert_eq!(app.engine().lookup("x"), None);
+        ctrl(&mut app, 'r');
+        assert_eq!(app.engine().lookup("x"), Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn a_failed_line_leaves_no_bindings_behind() {
+        // §10: "if a line does `'f {…} =` and then errors, `f` does not exist
+        // afterward." The binding happens, then the line fails, then the state
+        // taken beforehand goes back.
+        let mut app = App::new();
+        typ(&mut app, "1 'x set nope");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.notice, Some(Notice::Error(_))));
+        assert_eq!(app.engine().lookup("x"), None);
         assert!(app.stack().is_empty());
     }
 

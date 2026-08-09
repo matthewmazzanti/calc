@@ -8,21 +8,29 @@
 //! handled by [`parse`].
 //!
 //! **Atomicity is the caller's, not the op's.** An op may leave the stack
-//! half-consumed when it fails (it pops before it type-checks), so there is no
-//! "operands intact on error" guarantee. That doesn't matter, because every
-//! caller applies to a *copy* and commits only on `Ok` (see the `history`
-//! module) — a failed batch's damage is confined to a discarded clone, and the
-//! caller's own engine is untouched. This is the standard transactional model.
+//! half-consumed when it fails (it pops before it type-checks), and a batch may
+//! have bound names before failing, so there is no "operands intact on error"
+//! guarantee. Instead the caller takes a [`State`] before applying and puts it
+//! back on failure — a value copy of the stack and the module frame's bindings.
+//!
+//! **Not a copy of the engine.** Frames are shared handles, so a clone would
+//! share the very thing a rollback has to preserve; `Engine` is deliberately not
+//! `Clone`. Restoring assigns values *into* the live frame, which keeps its
+//! identity — and identity is what late binding rests on, since a closure that
+//! captured the module frame must go on seeing the live one (§8).
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
 mod error;
+mod frame;
 mod ops;
 mod program;
 mod token;
 mod value;
 
 pub use error::{CalcError, ErrorKind, Outcome, ParseError, ParseErrorKind, Trace};
+pub use frame::{Frame, FrameRef, State};
 pub use program::{parse, Element, Region};
 pub use token::Span;
 pub use value::{MarkKind, Value};
@@ -78,24 +86,21 @@ impl std::fmt::Display for Primitive {
 /// [`Engine::apply`] consumes `self` and threads it through the batch;
 /// individual ops take `&mut self` and mutate in place. The caller keeps its own
 /// copy for undo and commits the result only on `Ok` — see the `history` module.
-#[derive(Debug, Clone)]
+/// Deliberately **not `Clone`**: cloning would share the module frame rather
+/// than copy it, so "apply to a copy and keep it on success" cannot work. The
+/// transaction is [`Engine::state`] / [`Engine::restore`] instead — see
+/// [`State`] for why the frame's *identity* has to survive a rollback.
+#[derive(Debug)]
 pub struct Engine {
     stack: Stack,
     /// The call stack — see [`Activation`]. Empty except while [`Engine::run`]
     /// is inside a batch.
     calls: Vec<Activation>,
-    /// User bindings — the mutable top frame, grown by `set` and cloned per
-    /// snapshot. A lookup falls through to `base`. A single flat frame for now
-    /// (the REPL/module scope); the frame *chain* arrives with functions.
-    top: Frame,
-    /// The prelude: the builtin vocabulary as first-class [`Value::Builtin`]s.
-    /// Shared and immutable, so a clone is one refcount bump rather than a copy
-    /// of the whole map — and it never enters equality (see [`PartialEq`]).
-    base: Rc<Frame>,
+    /// The module frame: the REPL's own scope, where top-level binding lands.
+    /// Its parent is the global frame holding the prelude, so the chain from
+    /// here reaches every builtin (§8).
+    module: FrameRef,
 }
-
-/// A single environment frame: names bound to values.
-type Frame = std::collections::HashMap<Rc<str>, Value>;
 
 /// One level of the **dynamic** call stack: a template, and how far through it
 /// evaluation has got. Distinct from a [`Frame`], which is the *lexical* half —
@@ -111,38 +116,25 @@ struct Activation {
     ip: usize,
 }
 
-/// Build the prelude frame — every primitive the [`ops`] modules define as a
+/// The prelude's bindings — every primitive the [`ops`] modules define as a
 /// first-class [`Value::Builtin`] under its canonical word, plus the constants
-/// (`true`, `false`), which are plain values. Each engine holds this behind an
-/// `Rc`, so snapshots share one immutable copy.
-fn prelude() -> Rc<Frame> {
-    Rc::new(
-        ops::primitives()
-            .map(|&p| (Rc::from(p.name), Value::Builtin(p)))
-            .chain(ops::constants().map(|(word, value)| (Rc::from(word), value)))
-            .collect(),
-    )
+/// (`true`, `false`), which are plain values. These fill the **global frame**,
+/// the root of every chain (§8).
+fn prelude() -> HashMap<Rc<str>, Value> {
+    ops::primitives()
+        .map(|&p| (Rc::from(p.name), Value::Builtin(p)))
+        .chain(ops::constants().map(|(word, value)| (Rc::from(word), value)))
+        .collect()
 }
 
 impl Default for Engine {
     fn default() -> Self {
+        let global = Frame::root(prelude());
         Self {
             stack: Stack::new(),
             calls: Vec::new(),
-            top: Frame::new(),
-            base: prelude(),
+            module: Frame::child(&global),
         }
-    }
-}
-
-/// Two engines are equal when their stacks and user bindings match. The prelude
-/// (`base`) is invariant — every engine shares the same immutable vocabulary —
-/// so excluding it keeps the per-keystroke change check (in `update`) off the
-/// prelude map entirely. The call stack is excluded because it is empty
-/// wherever equality is asked: between lines, never mid-batch.
-impl PartialEq for Engine {
-    fn eq(&self, other: &Self) -> bool {
-        self.stack == other.stack && self.top == other.top
     }
 }
 
@@ -156,14 +148,15 @@ impl Engine {
         &self.stack
     }
 
-    /// Apply a program, threading one engine through the whole batch (this is
-    /// the consuming boundary). The first failure short-circuits and is wrapped
-    /// with a [`Trace`] of the batch plus the index that failed — "here's what
-    /// was running." A partially-applied engine is simply dropped; the caller
-    /// kept its own copy (see the module docs).
-    pub fn apply(mut self, program: &[Element]) -> Outcome {
+    /// Apply a program, mutating the engine in place. The first failure
+    /// short-circuits and is wrapped with a [`Trace`] of the batch plus the
+    /// index that failed — "here's what was running."
+    ///
+    /// A failed batch leaves the engine part-way through: the caller took a
+    /// [`State`] first and puts it back (see the module docs).
+    pub fn apply(&mut self, program: &[Element]) -> Outcome {
         match self.run(Rc::from(program)) {
-            Ok(()) => Ok(self),
+            Ok(()) => Ok(()),
             Err((kind, index)) => Err(CalcError {
                 kind,
                 trace: Some(Trace {
@@ -408,11 +401,41 @@ impl Engine {
         }
     }
 
-    /// Look up a name — the user frame shadows the prelude. Returns a clone (an
-    /// `Rc` bump for heap values), leaving the binding in place. `get` reaches
-    /// the prelude through this too.
+    /// Look up a name, walking the chain outward from the current frame — a
+    /// nearer binding shadows a further one, and the global frame's prelude is
+    /// the floor. Returns a clone (an `Rc` bump for heap values), leaving the
+    /// binding in place. `get` and `&f` reach builtins through this too.
     pub(crate) fn lookup(&self, name: &str) -> Option<Value> {
-        self.top.get(name).or_else(|| self.base.get(name)).cloned()
+        frame::lookup(self.frame(), name)
+    }
+
+    /// The frame lookup starts from and binding lands in. Always the module
+    /// frame today; once a call allocates a frame it becomes the running
+    /// activation's, which is the whole of what "current" will mean.
+    fn frame(&self) -> &FrameRef {
+        &self.module
+    }
+
+    /// The module frame — the REPL's scope. Exposed for the test that pins
+    /// rollback's identity guarantee; nothing else needs a frame directly.
+    #[cfg(test)]
+    pub(crate) fn module_frame(&self) -> FrameRef {
+        Rc::clone(&self.module)
+    }
+
+    /// Everything a line can change, copied by value — take one before applying
+    /// a batch, put it back if the batch fails.
+    pub fn state(&self) -> State {
+        State::of(&self.stack, &self.module)
+    }
+
+    /// Undo a failed (or undone) line: put the stack and bindings back, and drop
+    /// any half-run call stack. The module frame keeps its identity, so closures
+    /// that captured it are unaffected — see [`State`].
+    pub fn restore(&mut self, state: &State) {
+        self.stack.clone_from(&state.stack);
+        state.restore_into(&self.module);
+        self.calls.clear();
     }
 
     /// Apply a looked-up value: a callable (a builtin, later a function) runs;
@@ -428,11 +451,11 @@ impl Engine {
         }
     }
 
-    /// Bind `name` to `value` in the user frame, shadowing any prior binding
-    /// (including a prelude builtin). `set` funnels through this; the shared
-    /// prelude is never touched.
+    /// Bind `name` to `value` in the *current* frame, shadowing any binding
+    /// further out (including a prelude builtin). Binding never walks the chain,
+    /// so a shadowed builtin is still there to fall back to.
     pub(crate) fn bind(&mut self, name: Rc<str>, value: Value) {
-        self.top.insert(name, value);
+        self.frame().borrow_mut().bind(name, value);
     }
 }
 

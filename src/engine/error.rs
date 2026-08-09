@@ -9,7 +9,7 @@
 //!
 //! [`Outcome`] is what [`Engine::apply`](super::Engine::apply) returns.
 
-use super::{Element, Engine, Span};
+use super::{Element, Span};
 
 /// What went wrong — the semantic error, independent of any engine state. This
 /// is what the pure index helpers produce; a failing engine op pairs it with the
@@ -188,6 +188,8 @@ impl std::fmt::Display for CalcError {
 
 impl std::error::Error for CalcError {}
 
-/// The result of [`Engine::apply`]: the engine threaded through the whole batch,
-/// or a [`CalcError`] naming what failed.
-pub type Outcome = Result<Engine, CalcError>;
+/// The result of [`Engine::apply`]: the engine mutated in place, or a
+/// [`CalcError`] naming what failed. A failure leaves the engine part-way
+/// through the batch — the caller restores the [`State`](super::State) it took
+/// beforehand.
+pub type Outcome = Result<(), CalcError>;
