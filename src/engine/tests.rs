@@ -281,6 +281,161 @@ fn divide_by_zero_is_an_error() {
 }
 
 #[test]
+fn abs_and_inv() {
+    assert_eq!(run("5 abs").stack(), &[Value::Int(5)]);
+    assert_eq!(run("-5 abs").stack(), &[Value::Int(5)]);
+    assert_eq!(run("-2.5 abs").stack(), &[Value::Num(2.5)]);
+    assert_eq!(run("4 inv").stack(), &[Value::Num(0.25)]);
+    // The reciprocal of zero is the division it is, not a generic `Undefined`.
+    assert_eq!(run_err("0 inv"), ErrorKind::DivideByZero);
+}
+
+#[test]
+fn power_preserves_integers_where_it_can() {
+    assert_eq!(run("2 10 ^").stack(), &[Value::Int(1024)]);
+    // A negative exponent has no integer answer, so it promotes rather than
+    // truncating to zero.
+    assert_eq!(run("2 -1 ^").stack(), &[Value::Num(0.5)]);
+    assert_eq!(
+        run("2 0.5 ^").stack(),
+        &[Value::Num(std::f64::consts::SQRT_2)]
+    );
+    // Overflowing the `i64` promotes rather than wrapping.
+    assert!(matches!(run("2 200 ^").stack(), [Value::Num(_)]));
+}
+
+#[test]
+fn power_is_an_ordinary_word_named_with_an_operator() {
+    // `^` is a name, not syntax — so it is fetchable and rebindable like any
+    // other word, which is what keeps the vocabulary uniform.
+    assert_eq!(run("3 4 '^ get 'p set p").stack(), &[Value::Int(81)]);
+}
+
+#[test]
+fn rounding_yields_integers() {
+    // Not `3.0` — a rounded value can feed `nth` or `pickn` directly.
+    assert_eq!(run("3.7 floor").stack(), &[Value::Int(3)]);
+    assert_eq!(run("-3.2 floor").stack(), &[Value::Int(-4)]);
+    assert_eq!(run("3.2 ceil").stack(), &[Value::Int(4)]);
+    assert_eq!(run("2.5 round").stack(), &[Value::Int(3)]);
+    assert_eq!(run("-2.7 trunc").stack(), &[Value::Int(-2)]);
+    // An `Int` is already integral.
+    assert_eq!(run("7 floor").stack(), &[Value::Int(7)]);
+    assert_eq!(run("[ 1 2 3 ] 2.7 floor nth").stack(), &[Value::Int(3)]);
+}
+
+#[test]
+fn rounding_a_float_too_large_for_an_integer_stays_a_float() {
+    // `as` would saturate to `i64::MAX`, which is a wrong answer rather than a
+    // lossy one.
+    assert_eq!(run("1e30 floor").stack(), &[Value::Num(1e30)]);
+}
+
+#[test]
+fn log_to_an_arbitrary_base() {
+    assert_eq!(run("81 3 logb").stack(), &[Value::Num(4.0)]);
+    assert_eq!(run("8 2 logb").stack(), &[Value::Num(3.0)]);
+    assert_eq!(run("3.7 log2").stack(), &[Value::Num(3.7f64.log2())]);
+}
+
+#[test]
+fn logb_dispatches_the_exact_bases() {
+    // `ln x / ln b` rounds twice and drifts off exact answers — it computes
+    // 2.9999999999999996 here. Visible at any display precision, so bases 10
+    // and 2 go to the dedicated kernels instead.
+    assert_eq!(run("1000 10 logb").stack(), &[Value::Num(3.0)]);
+    assert_eq!(run("0.001 10 logb").stack(), &[Value::Num(-3.0)]);
+    assert_eq!(run("1024 2 logb").stack(), &[Value::Num(10.0)]);
+    assert_ne!(
+        1000f64.ln() / 10f64.ln(),
+        3.0,
+        "the general form really does drift"
+    );
+}
+
+#[test]
+fn logb_rejects_bases_and_arguments_with_no_logarithm() {
+    assert_eq!(run_err("0 10 logb"), ErrorKind::Undefined);
+    assert_eq!(run_err("-1 10 logb"), ErrorKind::Undefined);
+    // Base 1 divides by `ln 1 == 0`.
+    assert_eq!(run_err("10 1 logb"), ErrorKind::Undefined);
+    // Base 0 is the case a finiteness check alone would miss: `ln x / -inf` is
+    // a finite `-0`, so it looks defined when the operation is not.
+    assert_eq!(run_err("10 0 logb"), ErrorKind::Undefined);
+    assert_eq!(run_err("10 -2 logb"), ErrorKind::Undefined);
+}
+
+#[test]
+fn transcendentals_and_constants() {
+    assert_eq!(run("16 sqrt").stack(), &[Value::Num(4.0)]);
+    assert_eq!(run("100 log").stack(), &[Value::Num(2.0)]);
+    assert_eq!(run("e ln").stack(), &[Value::Num(1.0)]);
+    assert_eq!(run("0 sin").stack(), &[Value::Num(0.0)]);
+    assert_eq!(run("pi cos").stack(), &[Value::Num(-1.0)]);
+    assert_eq!(run("tau").stack(), &[Value::Num(std::f64::consts::TAU)]);
+    assert_eq!(
+        run("1 1 atan2").stack(),
+        &[Value::Num(std::f64::consts::FRAC_PI_4)]
+    );
+}
+
+#[test]
+fn log_is_base_ten_and_ln_is_natural() {
+    // The calculator convention, not C's `log`-means-natural — the two names
+    // are only worth having if they differ.
+    assert_eq!(run("1000 log").stack(), &[Value::Num(3.0)]);
+    assert_eq!(run("1 ln").stack(), &[Value::Num(0.0)]);
+}
+
+#[test]
+fn trig_is_radians_with_explicit_conversion() {
+    // No angle mode: `to_rad`/`to_deg` are ordinary words, so what `sin` means
+    // never depends on hidden state.
+    assert_eq!(
+        run("180 to_rad").stack(),
+        &[Value::Num(std::f64::consts::PI)]
+    );
+    assert_eq!(run("pi to_deg").stack(), &[Value::Num(180.0)]);
+    let engine = run("30 to_rad sin");
+    let [Value::Num(x)] = engine.stack() else {
+        panic!("expected one float")
+    };
+    assert!((x - 0.5).abs() < 1e-12, "{x} should be about 0.5");
+}
+
+#[test]
+fn leaving_a_functions_domain_is_an_error_not_a_nan() {
+    // A NaN is worse than a wrong answer because it is a silent one: it would
+    // propagate through every later op, surfacing far from the word at fault.
+    assert_eq!(run_err("-1 sqrt"), ErrorKind::Undefined);
+    assert_eq!(run_err("0 ln"), ErrorKind::Undefined);
+    assert_eq!(run_err("-1 log"), ErrorKind::Undefined);
+    assert_eq!(run_err("2 asin"), ErrorKind::Undefined);
+    assert_eq!(run_err("2 acos"), ErrorKind::Undefined);
+    // Overflow out of the float range is refused on the same grounds.
+    assert_eq!(run_err("1000 exp"), ErrorKind::Undefined);
+    assert_eq!(run_err("-1 0.5 ^"), ErrorKind::Undefined);
+}
+
+#[test]
+fn math_words_reject_non_numbers() {
+    assert_eq!(
+        run_err("true sqrt"),
+        ErrorKind::TypeError {
+            expected: "number",
+            found: "bool",
+        }
+    );
+    assert_eq!(
+        run_err(r#""x" floor"#),
+        ErrorKind::TypeError {
+            expected: "number",
+            found: "string",
+        }
+    );
+}
+
+#[test]
 fn underflow_is_an_error() {
     assert_eq!(run_err("1 +"), ErrorKind::StackUnderflow);
 }

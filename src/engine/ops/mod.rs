@@ -48,8 +48,8 @@ pub(crate) fn primitives() -> impl Iterator<Item = &'static Primitive> {
     .flatten()
 }
 
-/// The prelude's non-primitive bindings — values rather than operations. Only
-/// [`mod@bool`]'s `true`/`false` so far; `pi`/`e`/`tau` join from [`num`].
+/// The prelude's non-primitive bindings — values rather than operations:
+/// [`mod@bool`]'s `true`/`false` and [`num`]'s `pi`/`e`/`tau`.
 pub(crate) fn constants() -> impl Iterator<Item = (&'static str, Value)> {
-    bool::constants()
+    bool::constants().chain(num::constants())
 }

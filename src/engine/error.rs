@@ -20,6 +20,17 @@ pub enum ErrorKind {
     StackUnderflow,
     /// Division with a zero divisor.
     DivideByZero,
+    /// A math word applied outside its domain (`-1 sqrt`, `0 ln`, `2 asin`) or
+    /// overflowing the float range (`1000 exp`) — anything that would put a NaN
+    /// or an infinity on the stack from finite operands.
+    ///
+    /// **An error rather than a NaN**, following [`ErrorKind::DivideByZero`],
+    /// which already refuses to answer `1 0 /` with `inf`. A NaN is worse than a
+    /// wrong answer because it is a *silent* one: it propagates through every
+    /// subsequent op, so the failure surfaces far from the word that caused it,
+    /// with nothing left to say which. Python draws the line in the same place
+    /// (`ValueError` for `log(0)`, `OverflowError` for `exp(1000)`).
+    Undefined,
     /// A `]` reached with no mark on the stack. The parser already pairs the
     /// brackets in the text, so this is the *runtime* half of the discipline:
     /// which mark a closer consumes is settled by permutation, not by the text
@@ -47,6 +58,7 @@ impl std::fmt::Display for ErrorKind {
         match self {
             ErrorKind::StackUnderflow => write!(f, "too few arguments"),
             ErrorKind::DivideByZero => write!(f, "divide by zero"),
+            ErrorKind::Undefined => write!(f, "undefined result"),
             ErrorKind::UnmatchedClose => write!(f, "no open collection to close"),
             ErrorKind::Unimplemented(what) => write!(f, "not yet implemented: {what}"),
             ErrorKind::IndexOutOfRange => write!(f, "index out of range"),
