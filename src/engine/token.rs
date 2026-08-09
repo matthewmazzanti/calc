@@ -4,21 +4,32 @@
 //! characters → [tokenize] → tokens → [parse] → tree → [evaluate] → values
 //! ```
 //!
-//! This phase is a split, a character set, and one mode. String and `#`-comment
-//! **lookahead runs first**, so a delimiter or sigil inside `"…"` or after `#` is
-//! text. Then ten characters are **self-delimiting** — each its own token
-//! whatever it abuts — so `[1 2 3]` tokenizes exactly like `[ 1 2 3 ]` and `&f`
-//! like `& f`:
+//! String and `#`-comment **lookahead runs first**, so anything inside `"…"` or
+//! after a `#` is text. What remains is three kinds of character:
 //!
 //! ```text
-//! '  &  .  :  {  }  [  ]  (  )
+//! {  }  [  ]  (  )  :     standalone — a token whatever they abut
+//! '  &                    prefix sigils — bind to the run on their right
+//! .                       postfix operator — binds to what is on its left
 //! ```
 //!
-//! Everything else is a whitespace-delimited run, emitted as a
-//! [`TokenKind::Word`] with **no interpretation** — whether a word is a number, a
-//! boolean, or a name to resolve is the parser's call. The one exception, and the
-//! only place a token's *shape* decides the split, is a `.` **between digits**:
-//! `3.5` stays one word, while `obj.x` splits on the dot.
+//! **Adjacency is this phase's, not the parser's.** `'x`, `&x`, `.x`, and `.&x`
+//! are single tokens, so there is no bare sigil in the stream and no
+//! consume-next rule downstream. Which in turn is why the two sigil kinds have
+//! mirror-image rules, and why neither needs stating twice:
+//!
+//! - A **prefix** is a sigil when nothing precedes it in the same token. That
+//!   falls out of [`breaks_word`] rather than being checked: a run swallows `'`
+//!   and `&` (`x'`, `a&b`, `don't`), so the scanner can only *land* on one where
+//!   a token begins.
+//! - A **postfix** attaches to whatever is on its left, so `.` is the attribute
+//!   operator unless nothing is there ([`attached`]) — `obj.1` reads as an
+//!   attribute and fails, while `obj .1` is a number.
+//!
+//! This phase also owns **both literal grammars**, decoded: a `"…"` arrives with
+//! its escapes resolved, a number as a [`Value`] (see [`number`]). Everything
+//! else is a name, which is what makes the number grammar load-bearing — names
+//! are defined as what it doesn't claim.
 //!
 //! The tokenizer owns the input: there is no input-stream register, so no word
 //! can read ahead (`language-v2.md` §10).
@@ -94,12 +105,15 @@ pub enum TokenKind {
     Number(Value),
     /// A string literal's *content*, escapes resolved, quotes gone.
     Str(Rc<String>),
-    /// `'` — the parser takes the next token as a name.
-    Quote,
-    /// `&` — the parser takes the next token as a fetch.
-    Amp,
-    /// `.` — attribute access, which stages the receiver (§7).
-    Dot,
+    /// `'x` — a name. The sigil binds to the run after it, so this is one
+    /// lexical unit and there is no such thing as a bare `'` in the stream.
+    Name(Rc<str>),
+    /// `&x` — a fetch: the binding, unapplied (§4).
+    Fetch(Rc<str>),
+    /// `.x` — attribute access, which stages the receiver (§7).
+    Attr(Rc<str>),
+    /// `.&x` — the same lookup without applying.
+    AttrFetch(Rc<str>),
     /// `:` — closes a template's parameter list (§5).
     Colon,
     /// `{`, `[`, or `(`.
@@ -115,15 +129,12 @@ pub struct Token {
     pub span: Span,
 }
 
-/// The fixed character a token is, if it is one of the ten self-delimiting
-/// characters. `"` and `#` are fixed too, but they open a *region* of text
-/// (a string, a comment) rather than standing alone, so they're handled by the
-/// lookahead in [`tokenize`] instead.
+/// The token a character is when it stands alone: the brackets and the `:`.
+/// `"` and `#` are fixed too, but they open a *region* of text (a string, a
+/// comment) that the lookahead in [`tokenize`] handles instead. The sigils are
+/// not here — they are prefixes, and bind to the run after them.
 fn delimiter(c: char) -> Option<TokenKind> {
     Some(match c {
-        '\'' => TokenKind::Quote,
-        '&' => TokenKind::Amp,
-        '.' => TokenKind::Dot,
         ':' => TokenKind::Colon,
         '{' => TokenKind::Open(Bracket::Brace),
         '}' => TokenKind::Close(Bracket::Brace),
@@ -135,17 +146,40 @@ fn delimiter(c: char) -> Option<TokenKind> {
     })
 }
 
-/// Whether `c` ends a word run: whitespace, one of the ten self-delimiting
-/// characters, or the `"`/`#` that open a string or a comment. Equivalently:
-/// the characters no name may contain.
+/// Whether `c` ends a run — equivalently, the characters no name may contain:
+/// whitespace, a standalone fixed character, the `.` that is the attribute
+/// operator, and the `"`/`#` that open a string or a comment.
+///
+/// **`'` and `&` are absent**, and that is what makes them position-sensitive
+/// without a rule saying so. A run swallows them (`x'`, `a&b`, `don't`), so the
+/// scanner only ever *lands* on one where a token genuinely begins — after
+/// whitespace, after a delimiter, or at the start of input. There they are the
+/// prefix sigils; nowhere else can they be reached.
 fn breaks_word(c: char) -> bool {
-    c.is_whitespace() || delimiter(c).is_some() || c == '"' || c == '#'
+    c.is_whitespace() || delimiter(c).is_some() || c == '.' || c == '"' || c == '#'
+}
+
+/// Whether a `.` at `index` has anything on its left to attach to. `.` is a
+/// *postfix* operator — the mirror of the prefix sigils — so it reads as the
+/// attribute operator whenever it abuts what precedes it, and may begin a
+/// number only when nothing does:
+///
+/// ```text
+/// obj.1     attached   → attribute `1` → not a name, an error
+/// [1 2].1   attached   → the same, for the same reason
+/// obj .1    detached   → obj, then 0.1
+/// ```
+fn attached(input: &str, index: usize) -> bool {
+    input[..index]
+        .chars()
+        .next_back()
+        .is_some_and(|c| !c.is_whitespace())
 }
 
 /// The number grammar, and the only statement of it:
 ///
 /// ```text
-/// number   = "-"? digit+ fraction? exponent?
+/// number   = "-"? ( digit+ fraction? | fraction ) exponent?
 /// fraction = "." digit+
 /// exponent = ("e" | "E") ("+" | "-")? digit+
 /// ```
@@ -164,17 +198,25 @@ fn breaks_word(c: char) -> bool {
 fn scan_number(input: &str, start: usize) -> Option<usize> {
     let text = &input[start..];
     let mut at = usize::from(text.starts_with('-'));
-    match digits_end(text, at) {
-        end if end > at => at = end,
-        _ => return None, // a number leads with digits, so `.5` and `-x` aren't
-    }
-    // A fraction needs digits *after* the dot — which is exactly what leaves
-    // `obj.x` to split and `3.` a number followed by a dot.
-    if text[at..].starts_with('.') {
+    // A fraction needs digits *after* the dot, whether or not any precede it —
+    // so `0.1` and `.1` are numbers, and `3.`, `.x`, `-x` are not. Whether a
+    // leading `.` is even offered to this grammar is [`attached`]'s call.
+    let integer = digits_end(text, at);
+    if integer > at {
+        at = integer;
+        if text[at..].starts_with('.') {
+            match digits_end(text, at + 1) {
+                end if end > at + 1 => at = end,
+                _ => return Some(start + at),
+            }
+        }
+    } else if text[at..].starts_with('.') {
         match digits_end(text, at + 1) {
             end if end > at + 1 => at = end,
-            _ => return Some(start + at),
+            _ => return None,
         }
+    } else {
+        return None;
     }
     if text[at..].starts_with(['e', 'E']) {
         let signed = at + 1 + usize::from(text[at + 1..].starts_with(['+', '-']));
@@ -234,6 +276,50 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                 span: Span::new(i, i + width),
             });
             i += width;
+        } else if c == '\'' || c == '&' {
+            // Only reachable at a token start: a run swallows these characters,
+            // so mid-name ones are never seen here (see `breaks_word`).
+            let (name, end) = read_name(input, i, c)?;
+            tokens.push(Token {
+                kind: match c {
+                    '\'' => TokenKind::Name(name),
+                    _ => TokenKind::Fetch(name),
+                },
+                span: Span::new(i, end),
+            });
+            i = end;
+        } else if c == '.' {
+            // Detached, a `.` may open a number; attached, it is the attribute
+            // operator. Either way an attribute is the fallback, so `.map`
+            // works wherever it appears.
+            let run = (!attached(input, i)).then(|| read_word(input, i));
+            match run.and_then(|end| Some((number(&input[i..end])?, end))) {
+                Some((value, end)) => {
+                    tokens.push(Token {
+                        kind: TokenKind::Number(value),
+                        span: Span::new(i, end),
+                    });
+                    i = end;
+                }
+                None => {
+                    // `.&x` fetches, `.x` applies — the `&` is at a token start
+                    // after the dot, so it is the same prefix sigil as anywhere
+                    // else, and needs no rule of its own.
+                    let fetch = input[i + 1..].starts_with('&');
+                    let (name, end) = match fetch {
+                        true => read_name(input, i + 1, '&')?,
+                        false => read_name(input, i, '.')?,
+                    };
+                    tokens.push(Token {
+                        kind: match fetch {
+                            true => TokenKind::AttrFetch(name),
+                            false => TokenKind::Attr(name),
+                        },
+                        span: Span::new(i, end),
+                    });
+                    i = end;
+                }
+            }
         } else {
             // Run first, classify second — never the other way round. Matching
             // a number greedily at the cursor would take `2dup` as a 2 and a
@@ -251,6 +337,29 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
         }
     }
     Ok(tokens)
+}
+
+/// Read the name a sigil at `start` binds to: the run just after it, which must
+/// be a word. A literal is no name, and neither is an empty run — so `'3`, `&`,
+/// and `. x` all fail here, at the sigil, rather than reaching the parser. This
+/// is the whole of the consume-next rule, and it is lexical because adjacency is.
+fn read_name(input: &str, start: usize, sigil: char) -> Result<(Rc<str>, usize), ParseError> {
+    let expected = || {
+        ParseError::new(
+            ParseErrorKind::ExpectedName { after: sigil },
+            Span::new(start, start + sigil.len_utf8()),
+        )
+    };
+    let at = start + sigil.len_utf8();
+    let end = match input[at..].chars().next() {
+        Some(c) if !breaks_word(c) => read_word(input, at),
+        _ => return Err(expected()),
+    };
+    let text = &input[at..end];
+    match number(text) {
+        Some(_) => Err(expected()),
+        None => Ok((Rc::from(text), end)),
+    }
 }
 
 /// The end index of the run starting at `start`, whose first character is known
@@ -339,35 +448,105 @@ mod tests {
         assert_eq!(kinds("1 2 +"), vec![int(1), int(2), word("+")]);
     }
 
+    fn name(text: &str) -> TokenKind {
+        TokenKind::Name(Rc::from(text))
+    }
+
+    fn fetch(text: &str) -> TokenKind {
+        TokenKind::Fetch(Rc::from(text))
+    }
+
+    fn attr(text: &str) -> TokenKind {
+        TokenKind::Attr(Rc::from(text))
+    }
+
     #[test]
-    fn the_ten_characters_are_self_delimiting() {
-        // The whole point: a spaced form and a tight form tokenize identically.
+    fn the_brackets_are_self_delimiting() {
+        // A spaced form and a tight form give the same tokens, so a bracket may
+        // bunch up against whatever it abuts.
         assert_eq!(kinds("[1 2 3]"), kinds("[ 1 2 3 ]"));
         assert_eq!(kinds("{x *}"), kinds("{ x * }"));
-        assert_eq!(kinds("&f"), kinds("& f"));
-        assert_eq!(kinds("'f"), kinds("' f"));
-        assert_eq!(kinds("obj.x"), kinds("obj . x"));
         assert_eq!(kinds("{w h: w}"), kinds("{ w h : w }"));
         assert_eq!(
-            kinds("&f"),
-            vec![TokenKind::Amp, word("f")],
-            "the sigil is its own token, not a prefix on the word"
+            kinds("word[word"),
+            vec![word("word"), TokenKind::Open(Bracket::Square), word("word")]
         );
     }
 
     #[test]
+    fn the_sigils_are_prefixes_that_bind_to_a_run() {
+        // One lexical unit, so there is no bare `'` in the stream — and the
+        // spaced form is *not* the same thing.
+        assert_eq!(kinds("'f &g"), vec![name("f"), fetch("g")]);
+        assert!(
+            tokenize("' f").is_err(),
+            "a sigil binds tightly or not at all"
+        );
+        assert!(tokenize("obj . x").is_err());
+        // A sigil is a sigil only where a token begins — which needs no rule of
+        // its own, since a run swallows the character everywhere else.
+        assert_eq!(kinds("x'"), vec![word("x'")]);
+        assert_eq!(kinds("don't"), vec![word("don't")]);
+        assert_eq!(kinds("a&b"), vec![word("a&b")]);
+        assert_eq!(kinds("'x'"), vec![name("x'")]);
+        // A token begins after a delimiter too, not only after whitespace.
+        assert_eq!(
+            kinds("[&f]"),
+            vec![
+                TokenKind::Open(Bracket::Square),
+                fetch("f"),
+                TokenKind::Close(Bracket::Square)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_dot_is_a_postfix_so_adjacency_decides_it() {
+        // Attached, `.` is the attribute operator — there is something on its
+        // left to stage. Detached, it may open a number.
+        assert_eq!(kinds("obj.x"), vec![word("obj"), attr("x")]);
+        assert_eq!(
+            kinds("obj.&x"),
+            vec![word("obj"), TokenKind::AttrFetch(Rc::from("x"))]
+        );
+        assert_eq!(kinds("obj .1"), vec![word("obj"), float(0.1)]);
+        assert_eq!(kinds(".1"), vec![float(0.1)]);
+        // So a numeric attribute is an error rather than a silent float, and it
+        // reads the same after a `]` as after a word.
+        assert!(tokenize("obj.1").is_err());
+        assert!(tokenize("[1 2].1").is_err());
+        // An attribute is always the fallback, so `.map` works anywhere.
+        assert_eq!(
+            kinds("{.map}"),
+            vec![
+                TokenKind::Open(Bracket::Brace),
+                attr("map"),
+                TokenKind::Close(Bracket::Brace)
+            ]
+        );
+        assert_eq!(kinds(".map"), vec![attr("map")]);
+        assert_eq!(kinds("obj.2dup"), vec![word("obj"), attr("2dup")]);
+        // The `&` after a dot is the ordinary prefix sigil, so an attribute
+        // named `&x` is unwritable exactly as a word named `&x` is.
+        assert_eq!(kinds(".foo&bar"), vec![attr("foo&bar")]);
+    }
+
+    #[test]
     fn a_dot_inside_a_number_is_the_fraction_not_the_operator() {
+        assert_eq!(kinds(".1"), vec![float(0.1)]);
+        assert_eq!(kinds("-.5"), vec![float(-0.5)]);
         assert_eq!(kinds("3.5"), vec![float(3.5)]);
         assert_eq!(kinds("3.5e-2"), vec![float(3.5e-2)]);
         // A fraction needs digits on both sides — `0.1`, never `.1` — so
         // everywhere else the dot is the attribute operator.
         assert_eq!(kinds("0.1"), vec![float(0.1)]);
-        assert_eq!(kinds(".1"), vec![TokenKind::Dot, int(1)]);
-        assert_eq!(kinds("3."), vec![int(3), TokenKind::Dot]);
-        assert_eq!(kinds("obj.x"), vec![word("obj"), TokenKind::Dot, word("x")]);
+        assert_eq!(kinds("obj.x"), vec![word("obj"), attr("x")]);
+        // A trailing dot has no digits after it, so it is an attribute operator
+        // with no name — an error, not a number.
+        assert!(tokenize("3.").is_err());
         assert_eq!(
             kinds("3.5.x"),
-            vec![float(3.5), TokenKind::Dot, word("x")],
+            vec![float(3.5), attr("x")],
             "a number is still dottable"
         );
     }
@@ -461,6 +640,8 @@ mod tests {
     fn multibyte_text_spans_bytes_not_chars() {
         let source = "'héllo";
         let tokens = tokenize(source).unwrap();
-        assert_eq!(tokens[1].span.of(source), "héllo");
+        // The span covers the sigil and its name together — one lexical unit.
+        assert_eq!(tokens[0].kind, name("héllo"));
+        assert_eq!(tokens[0].span.of(source), "'héllo");
     }
 }

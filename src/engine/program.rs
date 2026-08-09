@@ -6,22 +6,26 @@
 //! ```
 //!
 //! The parser consumes the flat token stream and **resolves everything
-//! positional**: `{` recurses into a nested [`Element::Template`], the sigils
-//! consume the token after them, `[ ] ( )` become fixed elements that skip the
-//! lookup every other token gets, and a leading `names :` run becomes the binds
-//! it abbreviates. What survives into the tree is only what evaluation still has
-//! to decide.
+//! positional**: `{` recurses into a nested [`Element::Template`], `[ ] ( )`
+//! become fixed elements that skip the lookup every other token gets, and a
+//! leading `names :` run becomes the binds it abbreviates. What survives into
+//! the tree is only what evaluation still has to decide.
+//!
+//! Positional here means *structural*. Adjacency — that `'x` is a name and
+//! `obj.x` an attribute — is lexical, so the sigils arrive already bound to
+//! their names and this phase only places them.
 //!
 //! **A tree, not a flat program** — this is the reversal from v1, where `{ }`
 //! was a runtime mark and code was data. A template is parsed once, holds no
 //! environment, and is immutable and shared; evaluation pairs it with the
 //! current frame to make a function (`direction-v2.md`).
 //!
-//! Four errors belong to this phase — a closer with nothing open, an opener
-//! never closed, a closer crossing a region opened inside another, and a sigil
-//! with nothing following it — plus the misplaced `:` the parameter rule
-//! implies, and one implementation bound ([`MAX_NESTING`]). All are free: they
-//! occur before evaluation, so there is no state to restore.
+//! Three of the phase's four errors belong here — a closer with nothing open,
+//! an opener never closed, and a closer crossing a region opened inside another
+//! — plus the misplaced `:` the parameter rule implies, and one implementation
+//! bound ([`MAX_NESTING`]). The fourth, a sigil with no name after it, is the
+//! tokenizer's. All are free: they occur before evaluation, so there is no state
+//! to restore.
 
 use std::rc::Rc;
 
@@ -165,10 +169,6 @@ struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    fn peek(&self) -> Option<&'a TokenKind> {
-        self.peek_at(self.next)
-    }
-
     fn peek_at(&self, index: usize) -> Option<&'a TokenKind> {
         self.tokens.get(index).map(|t| &t.kind)
     }
@@ -203,28 +203,12 @@ impl<'a> Parser<'a> {
                 TokenKind::Word(name) => elements.push(Element::Word(name.clone())),
                 TokenKind::Number(value) => elements.push(Element::Literal(value.clone())),
                 TokenKind::Str(text) => elements.push(Element::Literal(Value::Str(text.clone()))),
-                // `'` denotes and `&` fetches — both consume the next token (§4).
-                TokenKind::Quote => {
-                    let name = self.name_after(token)?;
-                    elements.push(Element::Literal(Value::Name(name)));
-                }
-                TokenKind::Amp => {
-                    let name = self.name_after(token)?;
-                    elements.push(Element::Fetch(name));
-                }
-                // `.x` applies what it finds, `.&x` leaves it unapplied (§7).
-                TokenKind::Dot => {
-                    let fetch = matches!(self.peek(), Some(TokenKind::Amp));
-                    if fetch {
-                        self.advance();
-                    }
-                    let name = self.name_after(token)?;
-                    elements.push(if fetch {
-                        Element::AttrFetch(name)
-                    } else {
-                        Element::Attr(name)
-                    });
-                }
+                // The sigils arrive already bound to their names: adjacency is
+                // lexical, so consume-next is the tokenizer's rule, not ours.
+                TokenKind::Name(name) => elements.push(Element::Literal(Value::Name(name.clone()))),
+                TokenKind::Fetch(name) => elements.push(Element::Fetch(name.clone())),
+                TokenKind::Attr(name) => elements.push(Element::Attr(name.clone())),
+                TokenKind::AttrFetch(name) => elements.push(Element::AttrFetch(name.clone())),
                 // A `:` the parameter scan didn't consume is out of position.
                 TokenKind::Colon => {
                     return Err(ParseError::new(ParseErrorKind::MisplacedColon, token.span))
@@ -295,29 +279,6 @@ impl<'a> Parser<'a> {
             _ => Err(ParseError::new(
                 ParseErrorKind::UnmatchedClose(bracket.close()),
                 token.span,
-            )),
-        }
-    }
-
-    /// The name a sigil takes: the next token, which must be a word — no name
-    /// contains one of the fixed characters, and a string or end-of-input is no
-    /// name either. Blamed on the sigil, since that's what's left dangling.
-    fn name_after(&mut self, sigil: &Token) -> Result<Rc<str>, ParseError> {
-        match self.peek() {
-            Some(TokenKind::Word(name)) => {
-                let name = name.clone();
-                self.advance();
-                Ok(name)
-            }
-            _ => Err(ParseError::new(
-                ParseErrorKind::ExpectedName {
-                    after: match sigil.kind {
-                        TokenKind::Quote => '\'',
-                        TokenKind::Amp => '&',
-                        _ => '.', // only the three sigils reach here
-                    },
-                },
-                sigil.span,
             )),
         }
     }
@@ -433,17 +394,18 @@ mod tests {
     }
 
     #[test]
-    fn the_sigils_consume_the_token_after_them() {
+    fn the_sigils_arrive_bound_to_their_names() {
         assert_eq!(parsed("'x"), vec![name("x")]);
         assert_eq!(parsed("&x"), vec![Element::Fetch(Rc::from("x"))]);
-        // Self-delimiting, so the spaced form is the same program.
-        assert_eq!(parsed("' x"), parsed("'x"));
-        assert_eq!(parsed("& x"), parsed("&x"));
         // `'` denotes and so works on an unbound name; `&` fetches.
         assert_eq!(
             parsed("'sq &sq"),
             vec![name("sq"), Element::Fetch(Rc::from("sq"))]
         );
+        // A sigil is a lexical prefix, not a token of its own, so the spaced
+        // form is no longer the same program — it is not a program at all.
+        assert_eq!(err("' x"), ParseErrorKind::ExpectedName { after: '\'' });
+        assert_eq!(err("& x"), ParseErrorKind::ExpectedName { after: '&' });
     }
 
     #[test]

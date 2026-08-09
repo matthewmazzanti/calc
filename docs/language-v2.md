@@ -43,21 +43,39 @@ characters → [tokenize] → tokens → [parse] → tree → [evaluate] → val
 
 ### Tokenize
 
-Split on whitespace, with lookahead for **strings** (`"…"`) and **comments** (`#` to end of line),
-which contain spaces. Ten characters always tokenize on their own, whatever they are adjacent to:
+Lookahead for **strings** (`"…"`) and **comments** (`#` to end of line) runs first, so anything inside
+either is text. What remains is three kinds of character, and their whole behavior is *adjacency*:
 
 ```
-'  &  .  :  {  }  [  ]  (  )
+{  }  [  ]  (  )  :     standalone — a token whatever they abut
+'  &                    prefix sigils — bind to the run on their right
+.                       postfix operator — binds to what is on its left
 ```
 
-So `[1 2 3]` yields the same tokens as `[ 1 2 3 ]`, `{x *}` the same as `{ x * }`, and `&f` yields `&`
-then `f`.
+**The standalone characters bunch up freely.** `[1 2 3]` gives the same tokens as `[ 1 2 3 ]`, `{x *}`
+the same as `{ x * }`, and `word[word` is three tokens.
+
+**The sigils are lexical, not structural.** `'x`, `&x`, `.x`, and `.&x` are each *one* token, so
+`' x` is not a name — a sigil binds tightly or not at all. This is why the two kinds have mirror-image
+rules:
+
+- A **prefix** is a sigil only where a token begins — after whitespace, after a standalone character,
+  or at the start of input. Everywhere else it is an ordinary name character, so `x'`, `don't`, and
+  `a&b` are names, and `'` and `&` are the only fixed characters a name may *contain*.
+- A **postfix** attaches to what is on its left, so `.` is the attribute operator whenever something
+  is there. It may begin a number only when nothing is: `obj.1` reads as attribute `1` and fails,
+  while `obj .1` is `obj` then `0.1`. An attribute is always the fallback, so `.map` works wherever
+  it appears.
+
+Because the prefix rule is positional, an attribute named `&x` is unwritable exactly as a word named
+`&x` is — after a `.` you are at a token start, so `.&x` is the fetch sigil, and no rule about dots is
+needed to say so. A name may not *begin* with a sigil; it may contain one.
 
 **This phase owns the literals**, both of them, decoded: a `"…"` arrives with its escapes resolved and
-its quotes gone, and a number arrives as a number. The rest is names.
+its quotes gone, and a number arrives as a number.
 
 ```
-number   = "-"? digit+ fraction? exponent?
+number   = "-"? ( digit+ fraction? | fraction ) exponent?
 fraction = "." digit+
 exponent = ("e" | "E") ("+" | "-")? digit+
 ```
@@ -68,15 +86,13 @@ is why Forth, Factor, and Lisp all define names this way. The cost is that every
 names, so the grammar has to be one we chose rather than one inherited — `inf`, `nan`, `1/2`, and `0x1f`
 are names here, and making any of them a number later is a deliberate change to what a name can be.
 
-Two consequences worth stating. A fraction needs digits on **both** sides, so it is `0.1`, never `.1` —
-and that is exactly what leaves `.` free to be the attribute operator, since `obj.x` has no digits
-around its dot. This is the one place a token's shape decides the split. And the run is taken **before**
-it is classified, never the other way round: matching a number greedily at the cursor would read `2dup`
-as a `2` and a `dup`, so a run is a number only if the grammar accounts for all of it.
+One consequence to state, since it is the rule people expect to be different: the run is taken **before**
+it is classified, never the other way round. Matching a number greedily at the cursor would read `2dup`
+as a `2` and a `dup`, so a run is a number only if the grammar accounts for all of it. Every language
+whose words include operators lexes this way, for this reason.
 
-That is the whole phase: a split, a character set, two literal grammars, and one mode. The string and
-comment lookahead runs first, so a bracket or sigil inside `"..."` or after a `#` is text. The output is
-a flat sequence of tokens; nesting and resolution belong to the parser.
+That is the whole phase: a split, three adjacency rules, two literal grammars, and one mode. The output
+is a flat sequence of tokens; nesting and resolution belong to the parser.
 
 ### Parse
 
@@ -84,9 +100,8 @@ The parser consumes the token stream and resolves everything positional:
 
 - `{` opens a template and `}` closes one. Nesting is the parser's own recursion, so depth needs no
   counter.
-- `'` takes the next token as a **name**; `&` takes the next token as a **fetch**. Both require a
-  *word*, so `'3` is an error — a literal is not a name.
-- A literal token becomes a **literal element**; it was already decoded upstream.
+- A literal token becomes a **literal element**, and a name, fetch, or attribute token the matching
+  element. All four arrived whole: adjacency was settled upstream.
 - Every other token is a **word reference**, resolved at application time (section 8).
 
 **There are no keywords.** Every token is a literal shape, a fixed character, or a name — `true` and
@@ -97,8 +112,9 @@ regions to nest, so `{ [ } ]` is rejected. It emits them as fixed elements rathe
 — the lookup that every other token gets, these skip — and what they do when reached is runtime: the
 opener pushes a mark, the closer collects (sections 6 and 7).
 
-Four errors belong to this phase: a closer with nothing open, an opener never closed, a closer that
-crosses a region opened inside another, and a sigil with nothing following it. All but the second are
+Four errors belong to the front end. Three are the parser's — a closer with nothing open, an opener
+never closed, and a closer that crosses a region opened inside another. The fourth, a sigil with no
+name after it, is the tokenizer's, because adjacency is. All but "an opener never closed" are
 detectable at the offending token rather than at end of input.
 
 ### Evaluate
@@ -129,10 +145,18 @@ call   apply the function on top of the stack
 ( ... )   dict          " ... "   string
 ```
 
-**All twelve of `{`, `}`, `[`, `]`, `(`, `)`, `'`, `&`, `.`, `:`, `"`, and `#` are fixed.** They
+**Twelve characters are fixed** — `{`, `}`, `[`, `]`, `(`, `)`, `:`, `.`, `"`, `#`, `'`, and `&`. They
 belong to the tokenizer and parser, they are never looked up, and they cannot be rebound or shadowed.
-No name may contain one. The last two are the lookahead's — a `"` opens a string and a `#` a comment,
-so neither stands alone as a token the way the ten do. All three bracket pairs are matched at parse time; `{ }` resolves there, while
+They divide by how much of a name they exclude:
+
+```
+never in a name:      .  :  {  }  [  ]  (  )  "  #
+name-initial only:    '  &
+```
+
+`'` and `&` are the exception because they are *prefixes* (section 3): they are sigils only where a
+token begins, so `x'` and `a&b` are ordinary names. `"` and `#` open a region of text rather than
+standing alone as tokens. All three bracket pairs are matched at parse time; `{ }` resolves there, while
 `[ ]` and `( )` take effect at runtime (sections 6 and 7).
 
 **Two sigils, because the requirements are opposite.** `&f` fetches, and requires `f` to be bound.

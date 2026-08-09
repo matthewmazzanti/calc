@@ -86,18 +86,6 @@ impl Value {
         }
     }
 
-    /// Extract a boolean, or a [`ErrorKind::TypeError`]. The boolean words
-    /// (`not`/`and`/`or`) funnel their operands through this.
-    pub(crate) fn as_bool(&self) -> Result<bool, ErrorKind> {
-        match self {
-            Value::Bool(b) => Ok(*b),
-            other => Err(ErrorKind::TypeError {
-                expected: "bool",
-                found: other.type_name(),
-            }),
-        }
-    }
-
     /// Interpret as a 1-based stack level: a positive `Int`. A float is
     /// rejected outright (no rounding) so `3.5 roll` errors rather than
     /// guessing; a non-positive `Int` clamps to 0, which the range check then

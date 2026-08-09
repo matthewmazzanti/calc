@@ -234,11 +234,6 @@ impl Engine {
         self.pop()?.as_num()
     }
 
-    /// Pop a boolean, or underflow / type error.
-    pub(crate) fn pop_bool(&mut self) -> Result<bool, ErrorKind> {
-        self.pop()?.as_bool()
-    }
-
     /// Pop a list (the shared `Rc` handle), or underflow / type error. Callers
     /// that mutate use `Rc::make_mut` for copy-on-write.
     pub(crate) fn pop_list(&mut self) -> Result<Rc<Vec<Value>>, ErrorKind> {
@@ -392,5 +387,7 @@ impl Engine {
     }
 }
 
+#[cfg(test)]
+mod conformance;
 #[cfg(test)]
 mod tests;

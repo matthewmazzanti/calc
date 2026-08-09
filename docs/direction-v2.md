@@ -60,12 +60,12 @@ text; which mark a given closer consumes stays dynamic.
 |---|---|---|
 | Front end | per-token flat pass, no tree | tokenize → **parse tree** → evaluate |
 | `{ }` | runtime mark | **parse-time template** |
-| Tokenizer | whitespace + string/sigil lookahead; brackets are words | 10 self-delimiting chars `' & . : { } [ ] ( )`; `[1 2 3]`≡`[ 1 2 3 ]` |
+| Tokenizer | whitespace + string/sigil lookahead; brackets are words | 7 standalone chars `{ } [ ] ( ) :`; `'`/`&` prefix and `.` postfix sigils; owns both literal grammars |
 | Comments | none | **`#` to end of line** (Python-style) |
-| Parse errors | unterminated string only | + unmatched close, unclosed open, crossing regions, dangling sigil |
+| Parse errors | unterminated string only | + unmatched close, unclosed open, crossing regions, dangling sigil (the last is the *tokenizer's*) |
 | Unquote `~( )` | quasiquote for computed bodies | **removed** — templates hold parse-time words, nothing to splice |
 | `=` | equality | **binder** (name-first `'sq {dup *} =`); equality becomes `==` |
-| Parameters | none | `{w h: …}` ≡ `{'h set 'w set …}`, parser-recognized by position |
+| Parameters | none | `{w h: …}` binds as `{'h set 'w set …}` would, via `Element::Bind`; names checked |
 | `[ ]` `]` | prelude primitives (words) | **fixed parser elements**, never looked up |
 | `( )` | freed (rejected infix) | **dicts** — literal, `.` access, methods, `put` |
 | `.` `:` | not syntax | fixed tokenizer/parser characters |
@@ -113,12 +113,13 @@ V1–V4 are the spine — closures run at V3, their memory reclaimed at V4. V5�
 Today tokens go straight to `Element` via `Element::parse`; there is no token
 type. Introduce one. The tokenizer:
 
-- runs **string and `#`-comment lookahead first**, so the 10 delimiters and
-  sigils inside `"…"` or after `#` are text;
-- treats `' & . : { } [ ] ( )` as **self-delimiting** — each its own token
-  whatever it abuts, so `[1 2 3]` and `{x *}` tokenize like their spaced forms;
-- keeps the one shape-sensitive case: a `.` **between digits** is part of the
-  number (`3.5`), not a delimiter.
+- runs **string and `#`-comment lookahead first**, so delimiters and sigils
+  inside `"…"` or after `#` are text;
+- treats `{ } [ ] ( ) :` as **standalone** — each its own token whatever it
+  abuts, so `[1 2 3]` and `{x *}` tokenize like their spaced forms;
+- binds the **sigils** to their names (`'x`, `&x`, `.x`, `.&x` are single
+  tokens), by the mirror-image prefix/postfix adjacency rules below;
+- **classifies** each run against the number grammar it owns.
 
 New `ErrorKind`s for the parse phase are unlocked here but raised in V2.
 
@@ -128,8 +129,8 @@ Grow `Element` with `Template(Rc<[Element]>)` and `Fetch(Rc<str>)`. The parser:
 
 - **recurses on `{` / `}`**, building a nested template; depth is its own
   recursion, no counter;
-- **consume-next** for the sigils: `'` takes the next token as a `Name` literal,
-  `&` as a `Fetch`;
+- maps the sigil tokens straight to their elements — consume-next is lexical, so
+  this phase never sees a bare `'`;
 - emits `[ ] ( )` as **fixed region elements**, not word references — the lookup
   every other token gets, these skip. Their runtime effect (push-mark / collect)
   stays as engine methods; only the *dispatch* moves from word-resolution to a
@@ -153,6 +154,18 @@ This retires the per-token `Element::parse` model. It is the largest single piec
   `UnmatchedClose` stayed behind as the *runtime* half (a `]` whose mark was
   eaten, e.g. `[ drop ]`, until mark linearity is enforced in the primitives).
   The TUI renders a parse error with its column and the text to blame.
+- **Sigils are lexical, not structural.** `'x`, `&x`, `.x`, `.&x` are single
+  tokens, so consume-next leaves the parser entirely and `ExpectedName` becomes
+  a tokenizer error. The two sigil kinds get mirror-image adjacency rules, each
+  free: a **prefix** (`'`, `&`) is a sigil only where a token begins, which falls
+  out of dropping them from the run-breaking set (a run swallows them, so the
+  scanner can only *land* on one at a token start) — hence `x'`, `don't`, `a&b`
+  are names. A **postfix** (`.`) binds to what is on its left, so it is the
+  attribute operator whenever something is there and may open a number only when
+  nothing is. That last rule is what makes `obj.1` an error rather than a silent
+  `obj 0.1`, while `obj .1` is the float; it also answers `.&x` with no clause
+  about dots, since after a `.` you are at a token start and the prefix rule
+  applies unchanged. A name may not *begin* with a sigil; it may contain one.
 - **The tokenizer owns both literal grammars.** `TokenKind` is `Number`, `Str`,
   `Word`, and the fixed characters — so `Word` means *word*, and `'`/`&`/`.`/`:`
   require one by pattern match rather than by re-deriving what a number looks
@@ -188,8 +201,18 @@ This retires the per-token `Element::parse` model. It is the largest single piec
   on the template. And because the list is now syntax rather than a name datum,
   the parser checks it: a parameter must be a token that resolves as a *word*, so
   `{x 3: …}` is `InvalidParameter` while `'3 set` stays legal. `2dup`, `+`, `->`
-  are names; `3`, `2e3`, `true` are not. A `:` the scan can't reach (after a
-  non-word, a second one in a body, or outside a template) is `MisplacedColon`.
+  are names; `3` and `2e3` are not. A `:` the scan can't reach (after a non-word,
+  a second one in a body, or outside a template) is `MisplacedColon`.
+- **Logic words are generic over bools and integers.** `and or xor not` are
+  logical on booleans and bitwise on integers — one name per operation rather
+  than Python's two, which keeps `& | ^ ~` out of the vocabulary entirely and so
+  leaves `&` free to be the fetch sigil. Strict, so they are Python's `& | ^ ~`
+  rather than its short-circuiting `and`/`or`; a lazy form would take templates
+  and need its own spelling.
+- **The lexical surface is a golden test** (`engine/conformance.rs`): source →
+  tokens → program, as one table. Its *diff* is the review surface when a rule
+  moves — a new numeric literal shape shows up as rows leaving the `WORDS` group,
+  which is the question "which names does this take?" answered mechanically.
 - **Two error kinds beyond the doc's four.** `MisplacedColon`, since `:` is the
   one construct recognized by position; and `TooDeeplyNested` — `{` is the
   parser's own recursion, so nesting is capped (256 open regions) rather than

@@ -94,20 +94,44 @@ fn arithmetic_on_a_bool_is_a_type_error() {
 }
 
 #[test]
-fn boolean_words_reject_numbers() {
-    // No truthiness rule: `and`/`or`/`not` are bool-only.
+fn logic_words_are_generic_over_bools_and_integers() {
+    // One name per operation, logical on bools and bitwise on ints — which is
+    // what keeps `& | ^ ~` out of the vocabulary, leaving `&` free to be the
+    // fetch sigil.
+    assert_eq!(run("6 3 and").stack(), &[Value::Int(2)]);
+    assert_eq!(run("6 3 or").stack(), &[Value::Int(7)]);
+    assert_eq!(run("6 3 xor").stack(), &[Value::Int(5)]);
+    assert_eq!(run("true false xor").stack(), &[true]);
+    assert_eq!(run("true true xor").stack(), &[false]);
+    // `not` on an integer is the bitwise complement, as Python's `~` is.
+    assert_eq!(run("5 not").stack(), &[Value::Int(-6)]);
+    assert_eq!(run("true not").stack(), &[false]);
+}
+
+#[test]
+fn logic_words_reject_floats_and_mixed_operands() {
+    // No truthiness rule, and no mixing: the pair decides which reading applies,
+    // so one of each is as much an error as a float (bitwise on an
+    // approximation would be meaningless).
     assert_eq!(
-        run_err("1 not"),
+        run_err("1.5 not"),
         ErrorKind::TypeError {
-            expected: "bool",
+            expected: "bool or integer",
             found: "number"
         }
     );
     assert_eq!(
-        run_err("1 2 and"),
+        run_err("true 1 and"),
         ErrorKind::TypeError {
-            expected: "bool",
+            expected: "bool or integer",
             found: "number"
+        }
+    );
+    assert_eq!(
+        run_err(r#""s" 1 or"#),
+        ErrorKind::TypeError {
+            expected: "bool or integer",
+            found: "string"
         }
     );
 }

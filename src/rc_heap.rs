@@ -227,7 +227,10 @@ impl Heap {
 
     #[cfg(test)]
     fn live_frames(&self) -> usize {
-        self.registry.iter().filter(|w| w.strong_count() > 0).count()
+        self.registry
+            .iter()
+            .filter(|w| w.strong_count() > 0)
+            .count()
     }
 }
 
@@ -273,7 +276,11 @@ mod tests {
     }
 
     fn as_ints(v: &Value) -> Vec<i64> {
-        as_list(v).unwrap().iter().map(|e| as_int(e).unwrap()).collect()
+        as_list(v)
+            .unwrap()
+            .iter()
+            .map(|e| as_int(e).unwrap())
+            .collect()
     }
 
     fn strong(v: &Value) -> usize {
