@@ -22,12 +22,12 @@ Some examples to try:
 'square {dup *} =     # Stack based operations, same as above
 7 square
 
-[ 1 2 3 4 ]           # Create a list on the stack
-'lst set              # Bind to a variable
-[lst {dup *} each]    # Apply function to each element, collect into list (map)
-[lst {dup} each]      # Can expand or contract (flatmap, filter)
-0 lst {+} each        # Accumulate on the stack
-[ lst &square each ]  # Refer to a function by name
+[1 2 3 4]           # Create a list on the stack
+'lst set            # Bind to a variable
+[lst {dup *} each]  # Apply function to each element, collect into list (map)
+[lst {dup} each]    # Can expand a list
+0 lst {+} each      # Accumulate on the stack
+[lst &square each]  # Refer to a function by name
 ```
 
 
