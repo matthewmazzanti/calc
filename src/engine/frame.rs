@@ -51,7 +51,7 @@ pub type FrameId = u32;
 pub struct Frame {
     /// The frame this one closes over — `None` only for the global frame.
     parent: Option<FrameId>,
-    bindings: HashMap<Rc<str>, Value>,
+    bindings: Bindings,
 }
 
 /// Every frame that exists, by id. Cloning one is a pointer bump per frame and
@@ -159,8 +159,136 @@ fn mark(value: &Value, pending: &mut Vec<FrameId>) {
     }
 }
 
-/// A frame's bindings before it is installed — the prelude arrives this way.
-pub type Bindings = HashMap<Rc<str>, Value>;
+/// Above this many entries a frame stops being scanned and starts being hashed.
+const PROMOTE_AT: usize = 8;
+
+/// What a frame binds.
+///
+/// **Small frames are a flat list, scanned.** Almost every frame is a call's,
+/// holding nought to two parameters, and for those a linear scan beats hashing:
+/// the *miss* is what dominates, since resolving a name walks a chain and misses
+/// at every level but the last, and a miss against an empty `Vec` is a length
+/// check where a miss against a `HashMap` is a full string hash.
+///
+/// Large ones — the prelude, and a session that has accumulated definitions —
+/// promote to a map, because a linear scan of forty-odd entries on every builtin
+/// lookup would be worse than the hash it replaced. The map is **boxed**: an
+/// unboxed `HashMap` is 48 bytes, which would make this enum wider than the map
+/// it was meant to shrink, and the extra indirection is paid only by the handful
+/// of frames big enough to want it.
+#[derive(Debug, Clone, Default)]
+pub struct Bindings(Repr);
+
+#[derive(Debug, Clone)]
+enum Repr {
+    Few(Vec<(Rc<str>, Value)>),
+    // Boxed on purpose, against clippy's advice: an inline `HashMap` is 48 bytes
+    // and would make this enum wider than the map it replaces, which is the
+    // opposite of the point.
+    #[allow(clippy::box_collection)]
+    Many(Box<HashMap<Rc<str>, Value>>),
+}
+
+impl Default for Repr {
+    fn default() -> Self {
+        Repr::Few(Vec::new()) // empty, and allocates nothing
+    }
+}
+
+impl Bindings {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self, name: &str) -> Option<&Value> {
+        match &self.0 {
+            Repr::Few(entries) => entries
+                .iter()
+                .find(|(bound, _)| &**bound == name)
+                .map(|(_, value)| value),
+            Repr::Many(entries) => entries.get(name),
+        }
+    }
+
+    /// Bind `name`, replacing any binding already here. Promotes to a map once
+    /// the scan would start costing more than a hash.
+    pub fn insert(&mut self, name: Rc<str>, value: Value) {
+        match &mut self.0 {
+            Repr::Few(entries) => {
+                if let Some(slot) = entries.iter_mut().find(|(bound, _)| *bound == name) {
+                    slot.1 = value;
+                } else if entries.len() < PROMOTE_AT {
+                    entries.push((name, value));
+                } else {
+                    let mut map: HashMap<_, _> = entries.drain(..).collect();
+                    map.insert(name, value);
+                    self.0 = Repr::Many(Box::new(map));
+                }
+            }
+            Repr::Many(entries) => {
+                entries.insert(name, value);
+            }
+        }
+    }
+
+    pub fn iter(&self) -> Iter<'_> {
+        match &self.0 {
+            Repr::Few(entries) => Iter::Few(entries.iter()),
+            Repr::Many(entries) => Iter::Many(entries.iter()),
+        }
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &Value> {
+        self.iter().map(|(_, value)| value)
+    }
+
+    fn len(&self) -> usize {
+        match &self.0 {
+            Repr::Few(entries) => entries.len(),
+            Repr::Many(entries) => entries.len(),
+        }
+    }
+}
+
+/// Equality is **by content, not representation**: a `Few` and a `Many` holding
+/// the same bindings are the same environment, and so are two `Few`s that were
+/// filled in different orders. Deriving it would compare a `Vec`'s order and
+/// call two equal frames different.
+impl PartialEq for Bindings {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len()
+            && self
+                .iter()
+                .all(|(name, value)| other.get(name) == Some(value))
+    }
+}
+
+impl FromIterator<(Rc<str>, Value)> for Bindings {
+    fn from_iter<T: IntoIterator<Item = (Rc<str>, Value)>>(entries: T) -> Self {
+        let mut bindings = Bindings::new();
+        for (name, value) in entries {
+            bindings.insert(name, value);
+        }
+        bindings
+    }
+}
+
+/// Iterator over a frame's bindings, whichever shape it is in.
+pub enum Iter<'a> {
+    Few(std::slice::Iter<'a, (Rc<str>, Value)>),
+    Many(std::collections::hash_map::Iter<'a, Rc<str>, Value>),
+}
+
+impl<'a> Iterator for Iter<'a> {
+    type Item = (&'a Rc<str>, &'a Value);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Iter::Few(entries) => entries.next().map(|(name, value)| (name, value)),
+            Iter::Many(entries) => entries.next(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -199,6 +327,37 @@ mod tests {
         drop(unique);
         env.bind(module, Rc::from("y"), Value::Int(2));
         assert_eq!(address, Rc::as_ptr(env.frame(module).unwrap()));
+    }
+
+    #[test]
+    fn bindings_promote_and_stay_equal_across_shapes() {
+        // Equality is by content: the same bindings compare equal whether they
+        // are being scanned or hashed, and whichever order they went in.
+        let entry = |n: u32| (Rc::from(format!("x{n}").as_str()), Value::Int(n.into()));
+        let few: Bindings = (0..3).map(entry).collect();
+        let mut reversed = Bindings::new();
+        for (name, value) in (0..3).rev().map(entry) {
+            reversed.insert(name, value);
+        }
+        assert_eq!(few, reversed);
+
+        let many: Bindings = (0..PROMOTE_AT as u32 + 5).map(entry).collect();
+        assert!(matches!(many.0, Repr::Many(_)), "did not promote");
+        let same: Bindings = (0..PROMOTE_AT as u32 + 5).rev().map(entry).collect();
+        assert_eq!(many, same);
+        // And every binding is still reachable after the promotion.
+        for n in 0..PROMOTE_AT as u32 + 5 {
+            assert_eq!(many.get(&format!("x{n}")), Some(&Value::Int(n.into())));
+        }
+    }
+
+    #[test]
+    fn rebinding_replaces_rather_than_appends() {
+        let mut bindings = Bindings::new();
+        bindings.insert(Rc::from("x"), Value::Int(1));
+        bindings.insert(Rc::from("x"), Value::Int(2));
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings.get("x"), Some(&Value::Int(2)));
     }
 
     #[test]

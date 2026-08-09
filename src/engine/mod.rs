@@ -20,7 +20,6 @@
 //! only *within* the environment it was minted in, a whole-engine copy is
 //! internally consistent with nothing left to reconcile.
 
-use std::collections::HashMap;
 use std::rc::Rc;
 
 mod error;
@@ -155,7 +154,7 @@ struct Activation {
 /// first-class [`Value::Builtin`] under its canonical word, plus the constants
 /// (`true`, `false`), which are plain values. These fill the **global frame**,
 /// the root of every chain (§8).
-fn prelude() -> HashMap<Rc<str>, Value> {
+fn prelude() -> Bindings {
     ops::primitives()
         .map(|p| (Rc::from(p.name), Value::Builtin(p)))
         .chain(ops::constants().map(|(word, value)| (Rc::from(word), value)))
