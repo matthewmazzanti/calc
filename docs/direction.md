@@ -132,7 +132,7 @@ extensibility — an open word dictionary — for free.
 **Two tiers: machine + vocabulary.** The ops are split as *free functions over
 `&mut Engine`*, not methods, under `engine/ops/` — each module owns its words and
 a `PRIMITIVES` table of its rows, and `ops::primitives()` chains them for the
-prelude. The modules are grouped by **the type a word is about** (`num`, `bool`,
+prelude. The modules are grouped by **the type a word is about** (`number`, `bool`,
 `list`), with three grouped by role instead because they are about the machine
 rather than any value type (`stack`, `env`, `control`), and one — `generic` — for
 the words that dispatch on their operand's type (`==`, `to_str`, `length`,

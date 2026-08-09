@@ -27,7 +27,8 @@
 //! mode arrives later it rides in the [`Engine`] and is snapshotted with
 //! everything else, so nothing here has to change to allow it.
 //!
-//! **Integer-preserving where it can be**: `+ - * neg abs` on two `Int`s, `^`
+//! **Integer-preserving where it can be**: `+ - * neg abs %` on two `Int`s,
+//! `min`/`max` (which return the winning operand, not a recomputed float), `^`
 //! with a non-negative `Int` exponent, and `floor ceil round trunc`, which
 //! *produce* an `Int` so a rounded value can go straight into `nth` or `pickn`.
 //! Every transcendental yields a float; `/` and `inv` always do.
@@ -46,10 +47,13 @@ pub(super) static PRIMITIVES: &[Primitive] = &[
     Primitive { name: "abs",    run: abs },                          // a -- |a|
     Primitive { name: "inv",    run: inv },                          // a -- 1/a
     Primitive { name: "^",      run: pow },                          // a b -- a^b
+    Primitive { name: "%",      run: modulo },                       // a b -- a mod b, sign of b
     Primitive { name: "<",      run: lt },                           // a b -- bool
     Primitive { name: ">",      run: gt },                           // a b -- bool
     Primitive { name: "<=",     run: le },                           // a b -- bool
     Primitive { name: ">=",     run: ge },                           // a b -- bool
+    Primitive { name: "min",    run: min },                          // a b -- the smaller
+    Primitive { name: "max",    run: max },                          // a b -- the larger
     // Rounding, each yielding an `Int` where the result fits in one.
     Primitive { name: "floor",  run: |e| round_with(e, f64::floor) },   // toward -inf
     Primitive { name: "ceil",   run: |e| round_with(e, f64::ceil) },    // toward +inf
@@ -193,12 +197,100 @@ fn pow(e: &mut Engine) -> Result<(), ErrorKind> {
     Ok(())
 }
 
+/// `%` ( a b -- a mod b ): the remainder, **floored** — the result takes the
+/// sign of the *divisor*, so `-7 3 %` is `2`, not `-1`.
+///
+/// Spelled `%` for the reason `^` is: it is an operator alongside `+ - * /`.
+/// That also lands it exactly on **Python's** meaning, whose `%` is floored too
+/// — not C's and Rust's, where `%` truncates. The common use in a calculator is
+/// cycling a value into a range (clock arithmetic, indexing backward into a
+/// list), and floored is the one that keeps `a b %` inside `0..b` for a positive
+/// `b` whatever the sign of `a`; the truncated form hands back a negative index
+/// that then has to be corrected by hand.
+///
+/// Distinct from Rust's `rem_euclid`, which forces the result non-negative and
+/// so disagrees when the *divisor* is negative (`7 -3 %` is `-2` here, where
+/// `rem_euclid` gives `1`). Floored keeps the identity `a == b * (a/b).floor() + (a % b)`.
+///
+/// Integer-preserving, and a zero divisor is [`ErrorKind::DivideByZero`] — it is
+/// the same division `/` and `inv` refuse.
+fn modulo(e: &mut Engine) -> Result<(), ErrorKind> {
+    let b = e.pop()?;
+    let a = e.pop()?;
+    let v = match (&a, &b) {
+        (Value::Int(a), Value::Int(b)) => Value::Int(floored_rem_i64(*a, *b)?),
+        _ => {
+            let (a, b) = (a.as_num()?, b.as_num()?);
+            if b == 0.0 {
+                return Err(ErrorKind::DivideByZero);
+            }
+            let r = a % b;
+            // `%` is truncated, so a remainder disagreeing in sign with the
+            // divisor is one divisor away from the floored answer.
+            Value::Num(if r != 0.0 && (r < 0.0) != (b < 0.0) {
+                r + b
+            } else {
+                r
+            })
+        }
+    };
+    e.push(v);
+    Ok(())
+}
+
+/// The floored remainder of two integers — see [`modulo`].
+fn floored_rem_i64(a: i64, b: i64) -> Result<i64, ErrorKind> {
+    match b {
+        0 => Err(ErrorKind::DivideByZero),
+        // `a % -1` is 0 for every `a`, and is the one case `%` would overflow on
+        // (`i64::MIN % -1`).
+        -1 => Ok(0),
+        _ => {
+            let r = a % b;
+            // `r` is smaller in magnitude than `b` and of opposite sign here, so
+            // `r + b` cannot overflow.
+            Ok(if r != 0 && (r < 0) != (b < 0) {
+                r + b
+            } else {
+                r
+            })
+        }
+    }
+}
+
+/// `min` ( a b -- the smaller ): the lesser of the top two numbers.
+///
+/// Returns the winning *operand* rather than a recomputed float, so an `Int`
+/// stays an `Int` even when compared against a float: `2 3.5 min` is `2`.
+fn min(e: &mut Engine) -> Result<(), ErrorKind> {
+    extremum(e, true)
+}
+
+/// `max` ( a b -- the larger ): the greater of the top two numbers.
+fn max(e: &mut Engine) -> Result<(), ErrorKind> {
+    extremum(e, false)
+}
+
+/// Pick one of the top two numbers by comparing them as floats, pushing back the
+/// operand that won so its `Int`-ness survives. Ties keep `a`, the deeper one,
+/// which only matters for `2 2.0 min` — where the two are equal as numbers but
+/// not as values, and preferring the deeper one makes the choice stated rather
+/// than incidental.
+fn extremum(e: &mut Engine, want_smaller: bool) -> Result<(), ErrorKind> {
+    let b = e.pop()?;
+    let a = e.pop()?;
+    let (x, y) = (a.as_num()?, b.as_num()?);
+    let take_a = if want_smaller { x <= y } else { x >= y };
+    e.push(if take_a { a } else { b });
+    Ok(())
+}
+
 /// `logb` ( x b -- log_b x ): the logarithm of `x` to base `b`, with the base on
 /// top so it reads as a parameter to the word below it, like `nth`'s index.
 ///
 /// **Bases 10 and 2 dispatch to the dedicated kernels.** The general form is
 /// `ln x / ln b`, which rounds twice and drifts off exact answers: `1000 10 logb`
-/// computes 2.9999999999999996 rather than 3. Unlike [`exp`] versus `^` — a
+/// computes 2.9999999999999996 rather than 3. Unlike `exp` versus `^` — a
 /// 15th-digit difference no display would show — this one is visible at any
 /// precision a calculator would use, so the special case earns its place here
 /// where it did not there.

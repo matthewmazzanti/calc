@@ -332,6 +332,47 @@ fn rounding_a_float_too_large_for_an_integer_stays_a_float() {
 }
 
 #[test]
+fn percent_is_floored_not_truncated() {
+    // The result takes the sign of the divisor, so a value cycles into `0..b`
+    // for a positive `b` whatever the sign of `a` — Rust's `%` would hand back
+    // `-1` for the second case, a negative index needing correction by hand.
+    assert_eq!(run("7 3 %").stack(), &[Value::Int(1)]);
+    assert_eq!(run("-7 3 %").stack(), &[Value::Int(2)]);
+    // A negative divisor is where floored parts company with `rem_euclid`,
+    // which would give `1` here.
+    assert_eq!(run("7 -3 %").stack(), &[Value::Int(-2)]);
+    assert_eq!(run("-7 -3 %").stack(), &[Value::Int(-1)]);
+    assert_eq!(run("7.5 2 %").stack(), &[Value::Num(1.5)]);
+    assert_eq!(run("-7.5 2 %").stack(), &[Value::Num(0.5)]);
+}
+
+#[test]
+fn percent_by_zero_is_the_division_it_is() {
+    assert_eq!(run_err("7 0 %"), ErrorKind::DivideByZero);
+    assert_eq!(run_err("7.0 0.0 %"), ErrorKind::DivideByZero);
+}
+
+#[test]
+fn percent_survives_the_overflowing_divisor() {
+    // `i64::MIN % -1` overflows the `%` operator; every value mod -1 is 0.
+    assert_eq!(run("7 -1 %").stack(), &[Value::Int(0)]);
+    assert_eq!(run("-9223372036854775808 -1 %").stack(), &[Value::Int(0)]);
+}
+
+#[test]
+fn min_and_max_return_the_winning_operand() {
+    assert_eq!(run("2 3 min").stack(), &[Value::Int(2)]);
+    assert_eq!(run("2 3 max").stack(), &[Value::Int(3)]);
+    assert_eq!(run("-1 -2 min").stack(), &[Value::Int(-2)]);
+    // The operand comes back rather than a recomputed float, so comparing an
+    // `Int` against a float leaves the `Int` an `Int`.
+    assert_eq!(run("2 3.5 min").stack(), &[Value::Int(2)]);
+    assert_eq!(run("3.5 2 max").stack(), &[Value::Num(3.5)]);
+    // Equal as numbers but not as values: the deeper operand wins, by choice.
+    assert_eq!(run("2 2.0 min").stack(), &[Value::Int(2)]);
+}
+
+#[test]
 fn log_to_an_arbitrary_base() {
     assert_eq!(run("81 3 logb").stack(), &[Value::Num(4.0)]);
     assert_eq!(run("8 2 logb").stack(), &[Value::Num(3.0)]);

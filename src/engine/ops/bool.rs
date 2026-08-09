@@ -29,7 +29,7 @@
 //! is a function too, a nullary one that consumes nothing and pushes something,"
 //! which §11 already accepts for every name. What it buys is that **the language
 //! has no keywords**: every token is a literal shape, a fixed character, or a
-//! name. `pi`, `e`, and `tau` will be constants of [`num`](super::num) for the
+//! name. `pi`, `e`, and `tau` will be constants of [`number`](super::number) for the
 //! same reason.
 
 use crate::engine::{Engine, ErrorKind, Primitive, Value};

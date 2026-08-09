@@ -7,7 +7,7 @@
 //! [`primitives`] and [`constants`] chain them for the prelude.
 //!
 //! **The grouping is by type — the type a word is *about***, not by the kind of
-//! operation it performs ([`num`], [`mod@bool`], [`list`]). Three modules are about
+//! operation it performs ([`number`], [`mod@bool`], [`list`]). Three modules are about
 //! the machine rather than any value type and stay grouped by role: [`stack`],
 //! [`mod@env`], [`control`]. A word that dispatches on its operand's type belongs to
 //! neither and lives in [`generic`].
@@ -26,7 +26,7 @@ mod control;
 mod env;
 mod generic;
 mod list;
-mod num;
+mod number;
 mod stack;
 
 // `dup`, which the TUI's empty-Enter dispatches directly.
@@ -36,7 +36,7 @@ pub(crate) use stack::DUP;
 /// binds into the global frame. Adding a module is one row.
 pub(crate) fn primitives() -> impl Iterator<Item = &'static Primitive> {
     [
-        num::PRIMITIVES,
+        number::PRIMITIVES,
         bool::PRIMITIVES,
         control::PRIMITIVES,
         stack::PRIMITIVES,
@@ -49,7 +49,7 @@ pub(crate) fn primitives() -> impl Iterator<Item = &'static Primitive> {
 }
 
 /// The prelude's non-primitive bindings — values rather than operations:
-/// [`mod@bool`]'s `true`/`false` and [`num`]'s `pi`/`e`/`tau`.
+/// [`mod@bool`]'s `true`/`false` and [`number`]'s `pi`/`e`/`tau`.
 pub(crate) fn constants() -> impl Iterator<Item = (&'static str, Value)> {
-    bool::constants().chain(num::constants())
+    bool::constants().chain(number::constants())
 }
