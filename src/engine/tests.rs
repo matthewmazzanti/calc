@@ -1039,6 +1039,59 @@ fn capture_allocates_the_frame_a_later_bind_lands_in() {
 }
 
 #[test]
+fn dead_frames_are_collected_mid_line() {
+    // The whole point of collecting mid-line rather than at a boundary: a
+    // loop's frames are born and die *within* one evaluation, so waiting for
+    // the boundary would leave the peak untouched.
+    let mut engine = Engine::new();
+    let source = "'go {n: n 0 <= {0} {n 1 - go} if} =  20000 go";
+    engine.apply(&parse(source).unwrap()).unwrap();
+    assert_eq!(engine.stack(), &[Value::Int(0)]);
+    assert!(
+        engine.env.len() <= MIN_FRAMES,
+        "20000 calls left {} frames behind",
+        engine.env.len()
+    );
+}
+
+#[test]
+fn a_closure_on_the_stack_keeps_its_frame() {
+    // The stack is a root, and it has to be: this closure is the only thing
+    // naming the frame that holds `n`.
+    let mut engine = Engine::new();
+    engine
+        .apply(&parse("'make {n: {n}} =  5 make").unwrap())
+        .unwrap();
+    engine.collect();
+    engine.apply(&parse("call").unwrap()).unwrap();
+    assert_eq!(engine.stack(), &[Value::Int(5)]);
+}
+
+#[test]
+fn marking_reaches_closures_inside_aggregates() {
+    // `memory-model.md` §4.1's invariant 2 — the bridge from the refcounted
+    // world into the traced one. A list is an `Rc` the collector doesn't own,
+    // and a closure inside one is reachable *only* through it.
+    let mut engine = Engine::new();
+    engine
+        .apply(&parse("'make {n: {n}} =  [ 7 make ]").unwrap())
+        .unwrap();
+    engine.collect();
+    engine.apply(&parse("first call").unwrap()).unwrap();
+    assert_eq!(engine.stack(), &[Value::Int(7)]);
+}
+
+#[test]
+fn a_live_call_chains_frames_are_roots() {
+    // Deep recursion holds every frame at once — nothing here is garbage, and
+    // a collection mid-way must not decide otherwise.
+    let mut engine = Engine::new();
+    let source = "'deep {n: n 0 <= {0} {n 1 - deep 0 +} if} =  3000 deep";
+    engine.apply(&parse(source).unwrap()).unwrap();
+    assert_eq!(engine.stack(), &[Value::Int(0)]);
+}
+
+#[test]
 fn a_tail_call_replaces_an_exhausted_activation() {
     // The mechanism, directly: a call made when the caller has nothing left to
     // run takes its place rather than stacking on it. Iteration here is

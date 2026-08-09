@@ -102,7 +102,7 @@ Carrying M0–M3b forward unchanged; renumbering from the front end outward.
 | **V1** | Tokenizer: `Token` type, 10 self-delimiting chars, `#` comments, number `.` exception | **done** (`engine/token.rs`) |
 | **V2** | Parser → tree: `Template`/`Fetch` elements, `[ ] ( )` as fixed elements, `'`/`&` consume-next, `:` params, the four parse errors | **done** (`engine/program.rs`) |
 | **V3** | Functions: `Value::Function { template, env: FrameId }`, a frame per application, `call`/`if`, `&f`, `=` binder, `=`→`==`, TCO, `Trace` as a call chain | **done** — the memory model it rests on is `memory-model.md` §0 |
-| **V4** | An optional `retain(reachable)` filter over the frame map, run at transaction boundaries. *Not* a cycle collector — see `memory-model.md` §0.2 | todo |
+| **V4** | A `retain(reachable)` filter over the frame map, run *mid-line* on a growth threshold. *Not* a cycle collector — see `memory-model.md` §0.2 | **done** (`Env::retain`, `Engine::collect`) |
 | **V5** | Dicts/objects: `( )` second mark kind, `.` access, methods & receivers, `put`, per-type attribute tables (dicts are `Rc`/COW, like lists) | todo |
 | **V6** | Vocabulary, mostly in-language: startup-parsed prelude, `dip keep bi`, `if when cond`, `each map filter reduce`; move derived stack words out of Rust | todo |
 

@@ -34,7 +34,7 @@
 //!
 //! [`memory-model.md`]: ../../../docs/memory-model.md
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use super::Value;
@@ -97,10 +97,65 @@ impl Env {
         }
     }
 
-    /// The bindings of one frame, for a caller that needs to read them whole.
+    /// How many frames exist — what the collector's trigger watches.
+    pub fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// Drop every frame unreachable from `roots` and `values`.
+    ///
+    /// A mark and a sweep, and deliberately nothing more: there are no cycles to
+    /// be careful about (`memory-model.md` §0.2), so this is `retain` rather than
+    /// the hold/clear/release dance a refcount-plus-cycle collector needs. It
+    /// cannot dangle either — a value naming frame 42 is only reachable from a
+    /// version whose map holds 42, and marking starts from everything reachable.
+    ///
+    /// **Marking must traverse the `Rc` aggregates.** A closure reachable only
+    /// through a list on the stack — `[&f]` — is the sole thing keeping its
+    /// frame alive, so a `List` that isn't walked would take a live frame with
+    /// it. That is the one bridge from the refcounted world into this one.
+    ///
+    /// Iterative rather than recursive: a chain of frames or a nest of lists is
+    /// user-controlled depth, and the Rust stack is not.
+    pub fn retain(&mut self, roots: impl IntoIterator<Item = FrameId>, values: &[Value]) {
+        let mut live = HashSet::new();
+        let mut pending: Vec<FrameId> = roots.into_iter().collect();
+        for value in values {
+            mark(value, &mut pending);
+        }
+        while let Some(id) = pending.pop() {
+            if !live.insert(id) {
+                continue; // already marked
+            }
+            let Some(frame) = self.frames.get(&id) else {
+                continue;
+            };
+            pending.extend(frame.parent);
+            for value in frame.bindings.values() {
+                mark(value, &mut pending);
+            }
+        }
+        self.frames.retain(|id, _| live.contains(id));
+    }
+}
+
+impl Env {
+    /// One frame, for the tests that check copy-on-write by pointer identity.
     #[cfg(test)]
     pub fn frame(&self, id: FrameId) -> Option<&Rc<Frame>> {
         self.frames.get(&id)
+    }
+}
+
+/// Queue every frame `value` names, following into aggregates.
+fn mark(value: &Value, pending: &mut Vec<FrameId>) {
+    let mut values = vec![value];
+    while let Some(value) = values.pop() {
+        match value {
+            Value::Function { env, .. } => pending.push(*env),
+            Value::List(items) => values.extend(items.iter()),
+            _ => {} // leaves name no frame
+        }
     }
 }
 

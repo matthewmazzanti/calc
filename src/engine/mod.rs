@@ -114,6 +114,11 @@ pub struct Engine {
     /// is imported from somewhere — so keeping them separate now avoids
     /// deciding that by accident.
     session: FrameId,
+    /// Collect once the environment reaches this many frames. Adaptive: see
+    /// [`Engine::collect`]. Tuning rather than state, but it rides along in a
+    /// snapshot like everything else, where rewinding it is harmless — it
+    /// re-adapts within one collection.
+    collect_at: usize,
     /// The next frame id to hand out. Rewound by a snapshot like everything
     /// else, which is safe because **an id only means anything inside the
     /// environment it was minted in** — a value and the `Env` it names are
@@ -157,6 +162,22 @@ fn prelude() -> HashMap<Rc<str>, Value> {
         .collect()
 }
 
+/// How many frames may exist before a collection is worth running. Also the
+/// floor the adaptive threshold never drops below, so an ordinary session —
+/// which lives in a handful of frames — never collects at all.
+const MIN_FRAMES: usize = 1024;
+
+/// How much room a collection leaves before the next one: the threshold becomes
+/// this multiple of what survived. Bounds memory at about `GROWTH ×` the live
+/// set and makes the amortized cost per allocation constant.
+///
+/// Measured rather than assumed. Where little survives, [`MIN_FRAMES`] is the
+/// binding constraint and this factor costs nothing; where *everything*
+/// survives — a deep recursion holding every frame at once — collection is pure
+/// overhead, and 2 spent 40% more time than 4 re-marking frames it could never
+/// free. Beyond 4 it stops helping.
+const GROWTH: usize = 4;
+
 /// The global frame's id. Every chain ends here, and it is the one frame that
 /// will never be a collection candidate — reachable as a root from everywhere.
 const GLOBAL: FrameId = 0;
@@ -173,6 +194,7 @@ impl Default for Engine {
             calls: Vec::new(),
             env,
             session: SESSION,
+            collect_at: MIN_FRAMES,
             next_frame: SESSION + 1,
         }
     }
@@ -221,6 +243,13 @@ impl Engine {
             owns_frame: true,
         });
         loop {
+            // A safepoint. Deliberately *not* inside `new_frame`: there, the id
+            // has been minted but not yet recorded on the activation, so a
+            // collection would sweep the frame about to be used. Here every id
+            // is reachable from a root and no op is part-way through.
+            if self.env.len() >= self.collect_at {
+                self.collect();
+            }
             let Some(top) = self.calls.last() else {
                 return Ok(());
             };
@@ -248,6 +277,33 @@ impl Engine {
     /// activation's `ip` has already advanced past the element it dispatched, so
     /// `ip - 1` is what was running at that level — the failing element at the
     /// innermost, and the call that led inward at every other.
+    /// Drop every frame nothing can reach, and pick the next threshold.
+    ///
+    /// **Roots**: the session frame (which must persist, and reaches the global
+    /// frame through its parent), every running activation's frame, and every
+    /// value on the data stack — a closure there, or inside a list there, may be
+    /// the only thing keeping a frame alive.
+    ///
+    /// **The threshold doubles the live set**, floored at [`MIN_FRAMES`]. That
+    /// bounds memory at about twice what is live *and* makes the amortized cost
+    /// per allocation constant: each collection either frees at least half, or
+    /// the live set genuinely grew and the threshold rises to match rather than
+    /// re-marking the same frames on every allocation.
+    ///
+    /// Safe to run **mid-line**, which the old design forbade and which is the
+    /// whole point: a loop's peak memory happens *during* a line, so collecting
+    /// only at boundaries would move nothing. It is safe because every history
+    /// snapshot is a separate engine holding its own map and its own strong
+    /// `Rc`s — collecting here cannot reach them, so the roots are this engine's
+    /// alone rather than the whole timeline's.
+    fn collect(&mut self) {
+        let roots: Vec<FrameId> = std::iter::once(self.session)
+            .chain(self.calls.iter().map(|activation| activation.frame))
+            .collect();
+        self.env.retain(roots, &self.stack);
+        self.collect_at = MIN_FRAMES.max(self.env.len() * GROWTH);
+    }
+
     fn trace(&self) -> Trace {
         Trace {
             calls: self

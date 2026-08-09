@@ -267,8 +267,27 @@ Three mechanisms, and one of them is a correction to the obvious reading:
    a cleared redo future), its map drops, and any frame no surviving version
    references is freed by refcount. This is what bounds undo's memory with no
    collector involvement at all.
-3. **A reachability filter on the current version** — mark from `stack + module +
-   calls`, retain what's reachable, run before commit.
+3. **A reachability filter on the current version** — mark from `stack + session
+   + calls`, retain what's reachable. **Built** (`Env::retain`), and it runs
+   *mid-line* rather than at boundaries, which §4.1's invariant 4 forbade for the
+   old design. That invariant does not apply here: every history snapshot is a
+   separate engine holding its own map and its own strong `Rc`s, so collecting
+   the live engine cannot reach one. And mid-line is not a refinement but the
+   requirement — a loop's peak happens *during* a line, so a boundary-only sweep
+   would move nothing.
+
+   The trigger is a **growth threshold**: collect at `frames.len() >= collect_at`,
+   then set `collect_at = max(1024, live × 4)`. Each collection either frees most
+   of the map or the live set genuinely grew and the threshold rises to match,
+   so the cost per allocation is constant. Checked at a safepoint at the top of
+   the evaluation loop — *not* inside frame allocation, where the id has been
+   minted but not yet recorded and the new frame would be swept.
+
+Measured, on a loop that allocates a frame per iteration: **1862ms / 309MB →
+618ms / 9.9MB**, and naive `fib 25` **353ms / 77MB → 166ms / 9.9MB**. Memory
+becoming flat is the expected part; the *time* halving was not, and is worth
+recording — a map that stays under a few thousand entries beats one grown to a
+million on rehashing and cache locality alone. Collecting made it faster.
 
 **Frames are not promptly reclaimed, and dropping a `Function` frees nothing but
 its template.** The id is not counted, so nothing local can tell the frame it lost
