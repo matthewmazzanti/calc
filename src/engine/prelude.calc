@@ -1,0 +1,49 @@
+# The in-language prelude: words written in this language rather than as Rust
+# primitives, parsed and evaluated into the global frame when an engine starts.
+#
+# This is V6's "vocabulary, mostly in-language" (`direction-v2.md`). What lands
+# here is everything *definable* over the primitive core — so the Rust tables
+# shrink to the words that genuinely cannot be written down: the ones that touch
+# the stack machine, the environment, or the float unit. The derived stack
+# shuffles (`over rot nip tuck dupd 2dup 2drop`), the combinators (`dip keep bi`),
+# and the flow words (`when unless cond`) all belong here eventually.
+
+# `each` ( lst f -- ... ) — apply `f` to each element of `lst`, in order.
+#
+# **The one iteration word.** `map`, `flatMap`, and `reduce` are not separate
+# words but calling conventions on this one, because a function may leave any
+# number of values and `[ ]` is an ordinary runtime mark:
+#
+#     lst &f each              forEach     f : 1 -> 0
+#     [ lst &f each ]          map         f : 1 -> 1
+#     [ lst &f each ]          flatMap     f : 1 -> n    — the same code
+#     seed lst &f each         reduce      f : 2 -> 1    — the stack accumulates
+#
+# Map and flatMap coincide because there is no intermediate container to
+# flatten. Reduce needs no accumulator parameter because the seed simply sits
+# below the working area. A `map` that opened its own region would be strictly
+# *less* expressive than `[ … each ]`, which is why it is absent: welding
+# collection to iteration gives up the mark's defining property, that it is an
+# ordinary stack value you can reach back over.
+#
+# **Written over `length`/`nth`, not `first`/`rest`.** `rest` is O(n) here — the
+# list is bound, so `Rc::make_mut` clones it every step — which makes the obvious
+# cons-style definition quadratic: measured 160 ms -> 2.8 s going from n=2000 to
+# n=16000, against 52 ms -> 201 ms for this index form. It is also what makes
+# `each` generic the moment V5 gives strings and dicts those two attributes,
+# where a native version would need an arm per type.
+#
+# **`step` recurses in tail position**, so the evaluation loop replaces its
+# activation instead of nesting: iteration depth is bounded by memory, not by
+# the Rust stack, and a list of any length runs flat. `f` is applied *before*
+# the tail call, so it gets an ordinary nested activation and may itself be
+# anything callable — a function, a builtin, or a plain value.
+'each { lst f:
+    'step { i:
+        i lst length <
+        { lst i nth f   i 1 + step }
+        { }
+        if
+    } =
+    0 step
+} =

@@ -7,6 +7,12 @@
 //! into per-type attributes — so they live with the [generic](super::generic)
 //! words.
 //!
+//! **`each` is not here either, and not in Rust at all** — it is defined in the
+//! language, in `prelude.calc`, over `length`/`nth`. That is not a stopgap: a
+//! native one is 3–5× faster but needs an arm per type, where the in-language
+//! definition becomes generic for free the moment V5 gives strings and dicts
+//! those two attributes (`memory-model.md` §9, `direction-v2.md` V6).
+//!
 //! `[` and `]` are not here either. They were prelude words under v1; in v2 they
 //! are fixed parser elements, paired in the text and never looked up, so their
 //! dispatch lives in `Engine::apply_one` (`language-v2.md` §§3–4). The mark

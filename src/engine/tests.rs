@@ -1310,6 +1310,111 @@ fn a_live_call_chains_frames_are_roots() {
 }
 
 #[test]
+fn each_is_defined_in_the_language_not_in_rust() {
+    // The half of the prelude that is source rather than a fn pointer. Nothing
+    // downstream can tell: `apply_value` is the one seam everything callable is
+    // reached through, so a word can migrate between the halves unnoticed.
+    assert!(matches!(
+        Engine::new().lookup("each"),
+        Some(Value::Function { .. })
+    ));
+    assert!(!ops::primitives().any(|p| p.name == "each"));
+}
+
+#[test]
+fn each_applies_a_function_to_every_element() {
+    assert_eq!(
+        run("[ 1 2 3 ] {2 *} each").stack(),
+        &[Value::Int(2), Value::Int(4), Value::Int(6)]
+    );
+    // Anything callable will do — a builtin as readily as a function.
+    assert_eq!(
+        run("[ 1 2 3 ] &neg each").stack(),
+        &[Value::Int(-1), Value::Int(-2), Value::Int(-3)]
+    );
+    // An empty list is not a special case.
+    assert_eq!(run("[ ] {2 *} each").stack(), &[] as &[Value]);
+}
+
+#[test]
+fn map_flatmap_and_reduce_are_calling_conventions_on_each() {
+    // Not four words. A function may leave any number of values and `[ ]` is an
+    // ordinary runtime mark, so the rest fall out of how `each` is called.
+    assert_eq!(
+        run("[ [ 1 2 3 ] {2 *} each ]").stack(),
+        &[list(&[Value::Int(2), Value::Int(4), Value::Int(6)])]
+    );
+    // flatMap is the *same code* — there is no intermediate container to
+    // flatten, so `f` leaving two values is indistinguishable from two
+    // iterations leaving one.
+    assert_eq!(
+        run("[ [ 1 2 ] {dup} each ]").stack(),
+        &[list(&[
+            Value::Int(1),
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(2)
+        ])]
+    );
+    // reduce needs no accumulator parameter: the seed sits below the working
+    // area and the stack does the accumulating.
+    assert_eq!(run("0 [ 1 2 3 4 ] &+ each").stack(), &[Value::Int(10)]);
+    assert_eq!(run("1 [ 1 2 3 4 5 ] &* each").stack(), &[Value::Int(120)]);
+    // filter, unfolded — the reason a `keep_if` adapter is wanted eventually.
+    assert_eq!(
+        run("[ [ 1 2 3 ] {dup 1 > { } {drop} if} each ]").stack(),
+        &[list(&[Value::Int(2), Value::Int(3)])]
+    );
+}
+
+#[test]
+fn each_reaches_back_over_values_that_predate_the_region() {
+    // The mark is an ordinary stack value, so a produced list can hold literals
+    // beside the iteration's output. A `map` that opened its own region would
+    // give this up — which is the argument against having one.
+    assert_eq!(
+        run("[ 0 [ 1 2 ] {10 *} each 99 ]").stack(),
+        &[list(&[
+            Value::Int(0),
+            Value::Int(10),
+            Value::Int(20),
+            Value::Int(99)
+        ])]
+    );
+    // No region at all is the other legitimate use: results just land.
+    assert_eq!(run("[ 1 2 ] {10 *} each").stack().len(), 2);
+}
+
+#[test]
+fn each_nests() {
+    assert_eq!(
+        run("[ [ 1 2 ] { 'a set [ [ 10 20 ] {a *} each ] } each ]").stack(),
+        &[list(&[
+            list(&[Value::Int(10), Value::Int(20)]),
+            list(&[Value::Int(20), Value::Int(40)]),
+        ])]
+    );
+}
+
+#[test]
+fn each_runs_flat_over_a_long_list() {
+    // `step` recurses in tail position, so the loop replaces its activation
+    // rather than nesting: iteration depth is bounded by memory, not by the
+    // Rust stack. Without the tail call this overflows and aborts the process.
+    let items = (1..=20_000).map(|i| i.to_string()).collect::<Vec<_>>();
+    let source = format!("0 [ {} ] &+ each", items.join(" "));
+    let engine = run(&source);
+    assert_eq!(engine.stack(), &[Value::Int(20_000 * 20_001 / 2)]);
+}
+
+#[test]
+fn a_prelude_word_is_shadowable_like_any_builtin() {
+    // It binds in the global frame, not the session, so a user binding shadows
+    // it exactly as it would shadow `+`.
+    assert_eq!(run("42 'each set each").stack(), &[Value::Int(42)]);
+}
+
+#[test]
 fn a_tail_call_replaces_an_exhausted_activation() {
     // The mechanism, directly: a call made when the caller has nothing left to
     // run takes its place rather than stacking on it. Iteration here is

@@ -107,7 +107,12 @@
 
 ## Iteration and the native boundary (designed, not merged)
 
-- [ ] **`each` in the in-language prelude** (V6). One iteration word; `map`,
+- [x] **`each` in the in-language prelude** (V6). Done: `src/engine/prelude.calc`
+  is parsed and evaluated into the global frame at startup by
+  `Engine::load_prelude`, which is the startup-parsed prelude V6 asked for — the
+  derived shuffles, combinators, and flow words move there next. `each` recurses
+  flat by TCO and measures linear (10 ms → 27 ms from n=2000 to n=16000, against
+  the cons form's 160 ms → 2.8 s). One iteration word; `map`,
   `flatMap`, `filter`, and `reduce` are calling conventions on it, not separate
   words — `direction-v2.md` V6 and `language-v2.md` §12.2. Define it over
   `length`/`nth`, **not** `first`/`rest`: `rest` clones the list each step

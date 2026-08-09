@@ -155,6 +155,20 @@ fn prelude() -> Bindings {
         .collect()
 }
 
+/// The **in-language half of the prelude** — words written in this language
+/// rather than as Rust primitives, parsed and evaluated into the global frame at
+/// startup. See `prelude.calc` for what and why.
+///
+/// Two halves rather than one because they are reached differently, not because
+/// the split is aesthetic: a [`Primitive`] is a fn pointer bound before anything
+/// runs, while these are ordinary definitions that need an evaluator to exist
+/// first. Once bound, nothing downstream can tell them apart — [`Engine::
+/// apply_value`] is the single seam through which everything callable is
+/// reached, so a word can move from one half to the other without any caller
+/// noticing. That is what makes V6's plan (shrink the Rust tables to the true
+/// primitives) a migration rather than a rewrite.
+const PRELUDE_SOURCE: &str = include_str!("prelude.calc");
+
 /// How many frames may exist before a collection is worth running. Also the
 /// floor the adaptive threshold never drops below, so an ordinary session —
 /// which lives in a handful of frames — never collects at all.
@@ -179,13 +193,15 @@ impl Default for Engine {
         // the session is a root and the global is its parent.
         let global = env.create(None, prelude());
         let session = env.create(Some(global), Bindings::new());
-        Self {
+        let mut engine = Self {
             stack: Stack::new(),
             calls: Vec::new(),
             env,
             session,
             collect_at: MIN_FRAMES,
-        }
+        };
+        engine.load_prelude(global);
+        engine
     }
 }
 
@@ -225,10 +241,36 @@ impl Engine {
     /// a `Value` clone otherwise — because the op it runs needs `&mut self`, and
     /// the activation it came from lives in `self`.
     fn run(&mut self, template: Template) -> Outcome {
+        self.run_in(template, self.session)
+    }
+
+    /// Parse and evaluate [`PRELUDE_SOURCE`] into the **global** frame, so its
+    /// definitions sit beside the primitives at the root of every chain rather
+    /// than in the session — which is what makes them shadowable, `del`-able,
+    /// and survivors of a session-frame reset like any builtin.
+    ///
+    /// **Panics on failure, deliberately.** This is source we ship, so a syntax
+    /// error or a failing definition is a bug in `prelude.calc`, not something a
+    /// caller did — and there is no useful engine to hand back with the
+    /// vocabulary half-loaded. It fails on the first `Engine::new()`, which is
+    /// every test.
+    fn load_prelude(&mut self, global: FrameId) {
+        let program = parse(PRELUDE_SOURCE).expect("the shipped prelude parses");
+        self.run_in(Rc::new(program), global)
+            .expect("the shipped prelude evaluates");
+        debug_assert!(
+            self.stack.is_empty(),
+            "the prelude binds; it should leave nothing on the stack"
+        );
+    }
+
+    /// The evaluation loop proper, over a named starting frame — the session for
+    /// a user's line, the global frame for the prelude.
+    fn run_in(&mut self, template: Template, frame: FrameId) -> Outcome {
         self.calls.push(Activation {
             template,
             ip: 0,
-            frame: self.session,
+            frame,
             owns_frame: true,
         });
         loop {
