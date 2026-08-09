@@ -32,7 +32,7 @@ mod value;
 
 pub use error::{CalcError, Call, ErrorKind, Outcome, ParseError, ParseErrorKind, Trace};
 pub use frame::{Bindings, Env, FrameId};
-pub use program::{parse, Element, Region};
+pub use program::{parse, Element, Region, Template};
 pub use token::Span;
 pub use value::{MarkKind, Value};
 
@@ -136,9 +136,14 @@ pub struct Engine {
 /// no residue for the next one to compare against.
 #[derive(Debug, Clone, PartialEq)]
 struct Activation {
-    template: Rc<[Element]>,
+    template: Template,
     ip: usize,
+    /// Where this code binds and resolves. **Until it binds or captures, this is
+    /// the frame it *inherited*** — the function's captured environment — and no
+    /// frame of its own exists. See [`Engine::binding_frame`].
     frame: FrameId,
+    /// Whether `frame` is this activation's own, or one it is borrowing.
+    owns_frame: bool,
 }
 
 /// The prelude's bindings — every primitive the [`ops`] modules define as a
@@ -147,7 +152,7 @@ struct Activation {
 /// the root of every chain (§8).
 fn prelude() -> HashMap<Rc<str>, Value> {
     ops::primitives()
-        .map(|&p| (Rc::from(p.name), Value::Builtin(p)))
+        .map(|p| (Rc::from(p.name), Value::Builtin(p)))
         .chain(ops::constants().map(|(word, value)| (Rc::from(word), value)))
         .collect()
 }
@@ -190,7 +195,7 @@ impl Engine {
     /// A failed batch leaves the engine part-way through: the caller took a
     /// [`State`] first and puts it back (see the module docs).
     pub fn apply(&mut self, program: &[Element]) -> Outcome {
-        self.run(Rc::from(program))
+        self.run(Rc::new(program.to_vec()))
     }
 
     /// The evaluation loop: push an activation for the line — running in the
@@ -208,11 +213,12 @@ impl Engine {
     /// The element is cloned out before dispatch — an `Rc` bump for a template,
     /// a `Value` clone otherwise — because the op it runs needs `&mut self`, and
     /// the activation it came from lives in `self`.
-    fn run(&mut self, template: Rc<[Element]>) -> Outcome {
+    fn run(&mut self, template: Template) -> Outcome {
         self.calls.push(Activation {
             template,
             ip: 0,
             frame: self.session,
+            owns_frame: true,
         });
         loop {
             let Some(top) = self.calls.last() else {
@@ -290,7 +296,7 @@ impl Engine {
             Element::Template(template) => {
                 let function = Value::Function {
                     template: Rc::clone(template),
-                    env: self.frame(),
+                    env: self.binding_frame(),
                 };
                 self.stack.push(function);
                 Ok(())
@@ -314,9 +320,9 @@ impl Engine {
 
     /// Run a primitive — invoke its dispatch target. Reached by
     /// [`Engine::resolve_word`] (bare-word application), or called directly by
-    /// the TUI for its operator keys. The behavior lives in the [`ops`] modules,
-    /// not here.
-    pub(crate) fn run_builtin(&mut self, primitive: Primitive) -> Result<(), ErrorKind> {
+    /// the TUI for its empty-Enter `dup`. The behavior lives in the [`ops`]
+    /// modules, not here.
+    pub(crate) fn run_builtin(&mut self, primitive: &Primitive) -> Result<(), ErrorKind> {
         (primitive.run)(self)
     }
 
@@ -529,8 +535,7 @@ impl Engine {
     /// call runs flat — which iteration in this language depends on, since loops
     /// are recursion over combinators. The line's own activation is exempt, so
     /// it stays at the bottom of the stack for the trace to index against.
-    fn push_call(&mut self, template: Rc<[Element]>, env: FrameId) {
-        let frame = self.new_frame(Some(env));
+    fn push_call(&mut self, template: Template, env: FrameId) {
         let exhausted = self
             .calls
             .last()
@@ -538,18 +543,47 @@ impl Engine {
         if exhausted && self.calls.len() > 1 {
             self.calls.pop();
         }
+        // No frame yet — the call inherits the environment it captured, and
+        // allocates its own only if it binds or captures ([`binding_frame`]).
         self.calls.push(Activation {
             template,
             ip: 0,
-            frame,
+            frame: env,
+            owns_frame: false,
         });
+    }
+
+    /// The frame this activation binds into, **allocating one if it hasn't
+    /// yet** — the lazy half of `memory-model.md` §7.2.
+    ///
+    /// A call that neither binds nor captures needs no frame: it resolves
+    /// against the environment it inherited, which is observationally identical
+    /// to an empty child, since an empty frame adds nothing to a lookup chain.
+    /// So the frame is born on the first *frame-observing* event instead.
+    ///
+    /// **Capture has to be one of those events**, not just binding. The case
+    /// that proves it is `{ {x} … 'x set }`: the inner closure must capture the
+    /// frame the later `set` lands in, so if instantiation borrowed the parent
+    /// and the `set` then allocated, the closure would be looking at the wrong
+    /// environment. Allocating on capture keeps them the same frame.
+    fn binding_frame(&mut self) -> FrameId {
+        let top = self.calls.last().expect("a running activation");
+        if top.owns_frame {
+            return top.frame;
+        }
+        let frame = self.new_frame(Some(top.frame));
+        let top = self.calls.last_mut().expect("a running activation");
+        top.frame = frame;
+        top.owns_frame = true;
+        frame
     }
 
     /// Bind `name` to `value` in the *current* frame, shadowing any binding
     /// further out (including a prelude builtin). Binding never walks the chain,
     /// so a shadowed builtin is still there to fall back to.
     pub(crate) fn bind(&mut self, name: Rc<str>, value: Value) {
-        self.env.bind(self.frame(), name, value);
+        let frame = self.binding_frame();
+        self.env.bind(frame, name, value);
     }
 }
 

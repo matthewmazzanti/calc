@@ -32,6 +32,12 @@ use std::rc::Rc;
 use super::token::{tokenize, Bracket, Token, TokenKind};
 use super::{ParseError, ParseErrorKind, Span, Value};
 
+/// A parsed element sequence, shared and immutable — a function's body, or a
+/// whole line. Behind an `Rc<Vec<_>>` rather than an `Rc<[_]>` because the
+/// latter is a *fat* pointer: 16 bytes against 8, which is the difference
+/// between [`Value`] being 32 bytes wide and 24, on every value in the system.
+pub type Template = Rc<Vec<Element>>;
+
 /// A runtime region: the pair that opens a mark on the data stack and collects
 /// at its closer. Unlike `{ }`, these hold *values that come into existence
 /// during evaluation*, so the mark, the contents, and the collection are all
@@ -45,8 +51,8 @@ pub enum Region {
 }
 
 /// A program element — a member of a template's sequence (§14). The parser
-/// produces a `Vec<Element>` per parse unit and an `Rc<[Element]>` per nested
-/// template; evaluation walks it.
+/// produces a `Vec<Element>` per parse unit and a [`Template`] per nested one;
+/// evaluation walks it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Element {
     /// A literal value: a number, string, name, or boolean. `'x` lands here as a
@@ -76,7 +82,7 @@ pub enum Element {
     /// A `{ … }` template: an element sequence with no environment, immutable
     /// and shared. Evaluating one instantiates a function by pairing it with the
     /// current frame (§5).
-    Template(Rc<[Element]>),
+    Template(Template),
     /// `[` or `(` — push a mark, opening a region. A *fixed* element: the parser
     /// pairs it, and it is never looked up, so it can't be rebound or shadowed.
     Open(Region),

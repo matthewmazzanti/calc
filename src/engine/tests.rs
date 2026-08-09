@@ -1003,12 +1003,48 @@ fn binding_is_late_so_recursion_needs_no_declaration() {
 }
 
 #[test]
+fn a_call_that_neither_binds_nor_captures_allocates_no_frame() {
+    // Most calls in a concatenative language touch the environment only to
+    // *read* it, and a frame that stays empty adds nothing to a lookup chain —
+    // so the call runs against the one it inherited (`memory-model.md` §7.2).
+    let mut engine = Engine::new();
+    engine.apply(&parse("'inc {1 +} =").unwrap()).unwrap();
+    let before = engine.next_frame;
+    engine.apply(&parse("1 inc inc inc").unwrap()).unwrap();
+    assert_eq!(engine.stack(), &[Value::Int(4)]);
+    assert_eq!(
+        engine.next_frame, before,
+        "a bindless call allocated a frame"
+    );
+}
+
+#[test]
+fn a_call_that_binds_allocates_one_frame() {
+    let mut engine = Engine::new();
+    engine.apply(&parse("'sq {n: n n *} =").unwrap()).unwrap();
+    let before = engine.next_frame;
+    engine.apply(&parse("4 sq").unwrap()).unwrap();
+    assert_eq!(engine.stack(), &[Value::Int(16)]);
+    assert_eq!(engine.next_frame, before + 1);
+}
+
+#[test]
+fn capture_allocates_the_frame_a_later_bind_lands_in() {
+    // The case that makes "allocate on first bind" wrong on its own. The inner
+    // `{x}` must capture the frame the *later* `set` writes to — if capture
+    // borrowed the inherited frame and the `set` then allocated a fresh one,
+    // the closure would resolve `x` against the wrong environment and fail.
+    let source = "'f {  {x} 'peek set   3 'x set   peek call  } =  f";
+    assert_eq!(run(source).stack(), &[Value::Int(3)]);
+}
+
+#[test]
 fn a_tail_call_replaces_an_exhausted_activation() {
     // The mechanism, directly: a call made when the caller has nothing left to
     // run takes its place rather than stacking on it. Iteration here is
     // recursion over combinators, so without this an unbounded loop grows the
     // activation stack without bound.
-    let body: Rc<[Element]> = Rc::from(vec![Element::Word(Rc::from("dup"))]);
+    let body: Template = Rc::new(vec![Element::Word(Rc::from("dup"))]);
     let mut engine = Engine::new();
     engine.push_call(Rc::clone(&body), 1);
     engine.push_call(Rc::clone(&body), 1); // caller mid-template: stacks
@@ -1117,7 +1153,7 @@ fn every_primitive_is_in_the_prelude() {
     for p in ops::primitives() {
         assert_eq!(
             base.get(p.name),
-            Some(&Value::Builtin(*p)),
+            Some(&Value::Builtin(p)),
             "prelude missing `{}`",
             p.name,
         );

@@ -332,7 +332,7 @@ impl App {
             // once). With an empty buffer it duplicates the top of stack.
             KeyCode::Enter => {
                 if self.input.text().trim().is_empty() {
-                    self.edit("dup".to_string(), |e| e.run_builtin(DUP));
+                    self.edit("dup".to_string(), |e| e.run_builtin(&DUP));
                 } else {
                     self.commit_input();
                 }

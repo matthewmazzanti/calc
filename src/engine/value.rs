@@ -5,7 +5,7 @@
 
 use std::rc::Rc;
 
-use super::{Element, ErrorKind, FrameId, Primitive};
+use super::{Element, ErrorKind, FrameId, Primitive, Template};
 
 /// The kind of an open collection, carried by its [`Value::Mark`]. Only lists
 /// for now; `{` will add a function mark (carrying the captured environment) in
@@ -48,8 +48,13 @@ pub enum Value {
     Mark(MarkKind),
     /// A captured primitive op — a first-class word. A *bare* word runs its op;
     /// `'name get` instead pushes it here, so a builtin can be stored, passed,
-    /// and later applied. [`Primitive`] is `Copy`, so this stays cheap.
-    Builtin(Primitive),
+    /// and later applied.
+    ///
+    /// Held **by reference**: the tables are `'static`, so this is a pointer
+    /// rather than the `&str`-plus-fn-pointer pair, which would otherwise make
+    /// every `Value` in the system 24 bytes wide to hold a builtin almost none
+    /// of them contain.
+    Builtin(&'static Primitive),
     /// A function: a parse-time template paired with the environment it captured
     /// (§5). Produced by evaluating a `{ … }`, which is why instantiation is
     /// cheap — a pointer and an id — and why `{ {*} }` doesn't re-parse its
@@ -61,10 +66,7 @@ pub enum Value {
     /// keeps binding *late* — the id resolves against the environment as it is
     /// when the function runs, not as it was when the function was made, which
     /// is what makes recursion work with no forward declaration.
-    Function {
-        template: Rc<[Element]>,
-        env: FrameId,
-    },
+    Function { template: Template, env: FrameId },
 }
 
 impl Value {

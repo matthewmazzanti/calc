@@ -287,6 +287,27 @@ Lazy frame allocation (§7.2) is what keeps its job small, and it earns more her
 than it did: a call needs a frame only if it **binds** or **captures**, so
 `+ * dup swap` and the non-binding combinators allocate nothing.
 
+**Measured, once it was built** (`bench.py`, a million-deep non-tail recursion):
+
+| | per call level |
+|---|---|
+| inline `{…}` branches | 135 B |
+| pre-bound branches (`&more &stop if`) | 16 B |
+| CPython 3.13 | 147 B |
+
+The gap between the first two rows is the thing to know: **the ordinary `if`
+idiom defeats lazy allocation.** Writing `{…} {…} if` instantiates two closures
+every iteration, and instantiating one *captures* — which is a frame-observing
+event by §7.2's own rule, so a frame is born whether or not anything binds.
+Hoisting the branches into names first (`'more {…} =` … `&more &stop if`) makes
+them fetches rather than instantiations, and the frame disappears.
+
+That is a real cost with no obvious fix. Capture *must* trigger allocation, or
+the `{ {x} … 'x set }` case breaks. Narrowing it would need to know whether a
+binding can still follow in this activation — statically undecidable here, since
+`set` is an ordinary late-bound word rather than syntax. Worth revisiting if the
+in-language prelude (V6) makes the `{…} {…} if` shape ubiquitous, which it will.
+
 ### 0.6 What this costs
 
 - A map lookup per frame hop, rather than a pointer deref.
@@ -743,7 +764,7 @@ the §6 neutralize hazard (reducible to guarded batch-removal ordering, but no
 longer free), and a `Copy`-id arena is precisely what refcounting is not. Take
 this only if profiling shows boundary-time frame garbage actually hurts.
 
-### 7.2 Allocation axis: lazy frame allocation
+### 7.2 Allocation axis: lazy frame allocation — **built**, see §0.5
 
 Independently of how frames are reclaimed, most function applications never *need*
 a frame. A call needs one only if it **binds** (`set` / `=` / `:` / `del`) or

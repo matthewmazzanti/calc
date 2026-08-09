@@ -9,7 +9,7 @@
 //!
 //! [`Outcome`] is what [`Engine::apply`](super::Engine::apply) returns.
 
-use super::{Element, Span};
+use super::{Span, Template};
 
 /// What went wrong — the semantic error, independent of any engine state. This
 /// is what the pure index helpers produce; a failing engine op pairs it with the
@@ -154,7 +154,7 @@ pub struct Trace {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Call {
     /// The template being run — a line, or a function's body.
-    pub template: std::rc::Rc<[Element]>,
+    pub template: Template,
     /// The 0-based index within `template` of the element that was running:
     /// the one that failed at the innermost level, and the call that led
     /// inward at every other.

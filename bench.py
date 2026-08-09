@@ -28,6 +28,13 @@ LOOP = "'countdown {n: n 0 <= {0} {n 1 - countdown} if} ="
 FIB = "'fib {n: n 2 < {n} {n 1 - fib  n 2 - fib  +} if} ="
 SUM = "'sum {n acc: n 0 <= {acc} {n 1 - acc n + sum} if} ="
 BARE = "'count {dup 0 > {1 - count} {} if} ="
+# Deep *non-tail* recursion, in the two idioms that differ in whether a frame is
+# born per level. Inline `{…}` branches are instantiated every iteration, and
+# instantiating a closure captures — which is a frame-observing event, so the
+# lazy rule cannot help. Pre-binding them means `&more` fetches a closure that
+# already exists: nothing is captured, and no frame is ever allocated.
+DEEP_INLINE = "'deep {dup 0 > {1 - deep 0 +} {} if} ="
+DEEP_BOUND = "'more {1 - deep 0 +} =  'stop {} =  'deep {dup 0 > &more &stop if} ="
 
 CASES = [
     # A tail-recursive loop: one call, one frame, one `if` per iteration, and
@@ -45,6 +52,11 @@ CASES = [
     # stack actually grows and every call is a real return.
     ("fib 20", [CALC, "-c", f"{FIB}  20 fib"]),
     ("fib 25", [CALC, "-c", f"{FIB}  25 fib"]),
+    # The cooked pair: a million-deep recursion, with and without a frame per
+    # level. This is where the model pays — Python must materialise a frame
+    # object per call; we allocate an activation and, pre-bound, nothing else.
+    ("deep 1e6, inline", [CALC, "-c", f"{DEEP_INLINE}  1000000 deep"]),
+    ("deep 1e6, pre-bound", [CALC, "-c", f"{DEEP_BOUND}  1000000 deep"]),
     # Front end only: 20k tokens, no calls, no frames.
     ("parse 10k words", [CALC, "-c", "1 drop " * 10000]),
 ]
@@ -64,6 +76,16 @@ PYTHON_CASES = [
             sys.executable,
             "-c",
             "def fib(n): return n if n < 2 else fib(n-1) + fib(n-2)\nprint(fib(25))",
+        ],
+    ),
+    (
+        "deep 1e6",
+        [
+            sys.executable,
+            "-c",
+            "import sys\nsys.setrecursionlimit(1100000)\n"
+            "def deep(n):\n    return deep(n-1) + 0 if n > 0 else 0\n"
+            "print(deep(1000000))",
         ],
     ),
 ]
