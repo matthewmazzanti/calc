@@ -466,9 +466,9 @@ fn cursor_label(fixed: &str, wordn: &str, level: usize) -> String {
 /// (no state to restore), so the diagnostic is the whole interface to it; the
 /// column is 1-based in *characters*, since that is what a reader counts.
 fn syntax_note(source: &str, error: &engine::ParseError) -> String {
-    let column = source[..error.span.start].chars().count() + 1;
     format!(
-        "error: {error} at column {column} (`{}`)",
+        "error: {error} at column {} (`{}`)",
+        error.span.column(source),
         error.span.of(source)
     )
 }

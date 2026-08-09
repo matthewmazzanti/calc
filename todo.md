@@ -87,6 +87,14 @@
   autoresizes on `draw`, but our inline viewport is recreated on stack-height
   changes only; a width/height change from the WM may need explicit handling.
 
+## CLI
+- [x] **`-c EXPRESSION`** — evaluate one expression non-interactively and print
+  the resulting stack, one value per line, bottom to top. Degenerates to a
+  single line when a program leaves one value, so `$(calc -c "2 3 +")` is `5`;
+  errors go to stderr with a non-zero exit. Not yet done: reading a program from
+  **stdin** (`calc < file`, or `-` as the expression), and whether a `-f FILE`
+  form is wanted once modules exist.
+
 ## Project / packaging
 - [ ] **README, license, publish to GitHub** — write a README (what it is, the
   RPN/modal model, build via `nix develop` + `cargo run`, the instruction set),

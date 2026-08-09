@@ -56,6 +56,12 @@ impl Span {
     pub fn of<'a>(&self, source: &'a str) -> &'a str {
         &source[self.start..self.end]
     }
+
+    /// Where this span starts, as a 1-based **character** column. Bytes are the
+    /// right unit to index with and the wrong one to show a reader.
+    pub fn column(&self, source: &str) -> usize {
+        source[..self.start].chars().count() + 1
+    }
 }
 
 /// One of the three bracket pairs. All three are matched by the parser and must
