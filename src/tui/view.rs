@@ -84,24 +84,36 @@ fn info_line(app: &App) -> Line<'_> {
     }
 }
 
-/// Render an error as `error: <kind> in '<program>'`, all in red, with the
-/// offending command underlined — a source indicator pointing at what failed.
+/// Render an error as `error: <kind> in '<template>', called from '<template>'`,
+/// all in red, with the offending command underlined at each level. Innermost
+/// first: what failed, then outward to the line that reached it.
 fn error_line(e: &CalcError) -> Line<'static> {
     let red = Style::new().red();
     let mut spans = vec![Span::styled(format!("error: {}", e.kind), red)];
-    if let Some(trace) = &e.trace {
-        spans.push(Span::styled(" in '", red));
-        for (i, element) in trace.program.iter().enumerate() {
+    for (depth, call) in e
+        .trace
+        .iter()
+        .flat_map(|t| t.calls.iter().rev())
+        .enumerate()
+    {
+        let lead = match depth {
+            0 => " in '",
+            _ => "', called from '",
+        };
+        spans.push(Span::styled(lead, red));
+        for (i, element) in call.template.iter().enumerate() {
             if i > 0 {
                 spans.push(Span::styled(" ", red));
             }
-            let style = if i == trace.index {
+            let style = if i == call.index {
                 red.underlined()
             } else {
                 red
             };
             spans.push(Span::styled(element.to_string(), style));
         }
+    }
+    if e.trace.is_some() {
         spans.push(Span::styled("'", red));
     }
     Line::from(spans)

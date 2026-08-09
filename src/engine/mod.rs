@@ -30,7 +30,7 @@ mod program;
 mod token;
 mod value;
 
-pub use error::{CalcError, ErrorKind, Outcome, ParseError, ParseErrorKind, Trace};
+pub use error::{CalcError, Call, ErrorKind, Outcome, ParseError, ParseErrorKind, Trace};
 pub use frame::{Bindings, Env, FrameId};
 pub use program::{parse, Element, Region};
 pub use token::Span;
@@ -190,16 +190,7 @@ impl Engine {
     /// A failed batch leaves the engine part-way through: the caller took a
     /// [`State`] first and puts it back (see the module docs).
     pub fn apply(&mut self, program: &[Element]) -> Outcome {
-        match self.run(Rc::from(program)) {
-            Ok(()) => Ok(()),
-            Err((kind, index)) => Err(CalcError {
-                kind,
-                trace: Some(Trace {
-                    program: program.to_vec(),
-                    index,
-                }),
-            }),
-        }
+        self.run(Rc::from(program))
     }
 
     /// The evaluation loop: push an activation for the line — running in the
@@ -217,7 +208,7 @@ impl Engine {
     /// The element is cloned out before dispatch — an `Rc` bump for a template,
     /// a `Value` clone otherwise — because the op it runs needs `&mut self`, and
     /// the activation it came from lives in `self`.
-    fn run(&mut self, template: Rc<[Element]>) -> Result<(), (ErrorKind, usize)> {
+    fn run(&mut self, template: Rc<[Element]>) -> Outcome {
         self.calls.push(Activation {
             template,
             ip: 0,
@@ -235,18 +226,32 @@ impl Engine {
             let element = top.template[top.ip].clone();
             top.ip += 1;
             if let Err(kind) = self.apply_one(&element) {
-                // Blame the word *in this line* that led here, not the element
-                // that failed — an error inside a called function has an index
-                // into that function's template, which would mean nothing
-                // against the program the `Trace` carries. The line's activation
-                // is always the bottom one (tail calls leave it alone). A stack
-                // of activations replaces this approximation in V3's last step.
-                let index = self.calls[0].ip.saturating_sub(1);
+                let trace = self.trace();
                 // A failed line abandons whatever it was part-way through; the
                 // caller's copy puts the rest of the state back.
                 self.calls.clear();
-                return Err((kind, index));
+                return Err(CalcError {
+                    kind,
+                    trace: Some(trace),
+                });
             }
+        }
+    }
+
+    /// The call chain as it stands, for an error about to be returned. Every
+    /// activation's `ip` has already advanced past the element it dispatched, so
+    /// `ip - 1` is what was running at that level — the failing element at the
+    /// innermost, and the call that led inward at every other.
+    fn trace(&self) -> Trace {
+        Trace {
+            calls: self
+                .calls
+                .iter()
+                .map(|activation| Call {
+                    template: Rc::clone(&activation.template),
+                    index: activation.ip.saturating_sub(1),
+                })
+                .collect(),
         }
     }
 

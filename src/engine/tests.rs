@@ -153,8 +153,8 @@ fn a_type_error_names_the_mismatch_and_the_command() {
             found: "bool"
         }
     );
-    let trace = err.trace.unwrap();
-    assert_eq!(trace.program[trace.index], Element::Word(Rc::from("+")));
+    let call = &err.trace.unwrap().calls[0];
+    assert_eq!(call.template[call.index], Element::Word(Rc::from("+")));
 }
 
 #[test]
@@ -292,8 +292,9 @@ fn errors_carry_the_trace_of_the_failing_command() {
     let err = Engine::new().apply(&parse("1 0 /").unwrap()).unwrap_err();
     assert_eq!(err.kind, ErrorKind::DivideByZero);
     let trace = err.trace.unwrap();
-    assert_eq!(trace.index, 2);
-    assert_eq!(trace.program[trace.index], Element::Word(Rc::from("/")));
+    assert_eq!(trace.calls.len(), 1, "nothing was called, so one level");
+    assert_eq!(trace.calls[0].index, 2);
+    assert_eq!(trace.calls[0].template[2], Element::Word(Rc::from("/")));
 }
 
 #[test]
@@ -369,10 +370,10 @@ fn apply_error_traces_the_program_and_the_failing_command() {
     let err = Engine::new().apply(&parse("1 2 + /").unwrap()).unwrap_err();
     assert_eq!(err.kind, ErrorKind::StackUnderflow);
     let trace = err.trace.clone().unwrap();
-    assert_eq!(trace.index, 3);
+    assert_eq!(trace.calls[0].index, 3);
     assert_eq!(
-        trace.program,
-        vec![
+        *trace.calls[0].template,
+        [
             Element::Literal(Value::Int(1)),
             Element::Literal(Value::Int(2)),
             Element::Word(Rc::from("+")),
@@ -381,6 +382,47 @@ fn apply_error_traces_the_program_and_the_failing_command() {
     );
     // The message shows the whole batch with the failing command bracketed.
     assert_eq!(err.to_string(), "too few arguments in `1 2 + [/]`");
+}
+
+#[test]
+fn a_trace_names_every_level_that_was_running() {
+    // A flat program-plus-index cannot describe this: the failing element is
+    // inside `sq`, whose template the line never mentions. Innermost first,
+    // then outward to the line that reached it.
+    let err = Engine::new()
+        .apply(&parse("'sq {dup *} =  \"x\" sq").unwrap())
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "expected number, found string in `dup [*]`, called from `'sq {dup *} = \"x\" [sq]`"
+    );
+    let trace = err.trace.unwrap();
+    assert_eq!(trace.calls.len(), 2);
+    // `calls[0]` is always the line; the last is where it actually failed.
+    assert_eq!(
+        trace.calls[0].template[trace.calls[0].index].to_string(),
+        "sq"
+    );
+    assert_eq!(
+        trace.calls[1].template[trace.calls[1].index].to_string(),
+        "*"
+    );
+}
+
+#[test]
+fn a_tail_call_leaves_no_level_in_the_trace() {
+    // The bargain every language with proper tail calls makes: the frame that
+    // was replaced cannot appear, because it no longer exists.
+    let err = Engine::new()
+        .apply(&parse("'boom {+} =  'go {boom} =  go").unwrap())
+        .unwrap_err();
+    assert_eq!(err.kind, ErrorKind::StackUnderflow);
+    let trace = err.trace.unwrap();
+    assert_eq!(
+        trace.calls.len(),
+        2,
+        "`go`'s activation was replaced by the tail call to `boom`"
+    );
 }
 
 #[test]

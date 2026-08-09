@@ -134,13 +134,30 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-/// The program that was executing when an error struck, and the index of the
-/// element that failed — "here's what was running."
+/// The call chain when an error struck — "here's what was running", at every
+/// depth rather than only the outermost.
+///
+/// A flat program-plus-index cannot describe a failure inside a function: the
+/// index would point into *that function's* template, which means nothing
+/// against the line the user typed. So a trace is one [`Call`] per live
+/// activation, **outermost first** — `calls[0]` is always the line itself.
+///
+/// A tail call leaves no level here, because it left no activation: it replaced
+/// its caller rather than stacking on it. That is the usual bargain — the same
+/// one every language with proper tail calls makes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Trace {
-    /// The whole program being applied.
-    pub program: Vec<Element>,
-    /// The 0-based index within `program` of the element that failed.
+    pub calls: Vec<Call>,
+}
+
+/// One level of a [`Trace`]: what was running, and where in it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Call {
+    /// The template being run — a line, or a function's body.
+    pub template: std::rc::Rc<[Element]>,
+    /// The 0-based index within `template` of the element that was running:
+    /// the one that failed at the innermost level, and the call that led
+    /// inward at every other.
     pub index: usize,
 }
 
@@ -168,19 +185,27 @@ impl From<ErrorKind> for CalcError {
 impl std::fmt::Display for CalcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.kind)?;
-        if let Some(trace) = &self.trace {
-            // Show the program with the failing element bracketed, e.g.
-            // `1 2 + [/]`.
-            write!(f, " in `")?;
-            for (i, element) in trace.program.iter().enumerate() {
-                match (i, i == trace.index) {
+        // Innermost first — what failed, then outward to the line that reached
+        // it: `too few arguments in `dup [*]`, called from `4 [sq]``.
+        for (depth, call) in self
+            .trace
+            .iter()
+            .flat_map(|t| t.calls.iter().rev())
+            .enumerate()
+        {
+            f.write_str(match depth {
+                0 => " in `",
+                _ => ", called from `",
+            })?;
+            for (i, element) in call.template.iter().enumerate() {
+                match (i, i == call.index) {
                     (0, true) => write!(f, "[{element}]")?,
                     (0, false) => write!(f, "{element}")?,
                     (_, true) => write!(f, " [{element}]")?,
                     (_, false) => write!(f, " {element}")?,
                 }
             }
-            write!(f, "`")?;
+            f.write_str("`")?;
         }
         Ok(())
     }

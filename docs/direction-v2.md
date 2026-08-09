@@ -101,7 +101,7 @@ Carrying M0–M3b forward unchanged; renumbering from the front end outward.
 | **M0–M3b** | atoms, lists, `Rc`/COW, two-frame env, `set`/`get`, primitive table | **done (v1 model, carried forward)** |
 | **V1** | Tokenizer: `Token` type, 10 self-delimiting chars, `#` comments, number `.` exception | **done** (`engine/token.rs`) |
 | **V2** | Parser → tree: `Template`/`Fetch` elements, `[ ] ( )` as fixed elements, `'`/`&` consume-next, `:` params, the four parse errors | **done** (`engine/program.rs`) |
-| **V3** | Functions: `Value::Function { template, env: FrameId }`, a frame per application, `call`, `&f`, `=` binder, `=`→`==` rename, TCO. Frames, the session frame, and the snapshot (`engine.clone()`) are **done** — see `memory-model.md` §0 | in progress |
+| **V3** | Functions: `Value::Function { template, env: FrameId }`, a frame per application, `call`/`if`, `&f`, `=` binder, `=`→`==`, TCO, `Trace` as a call chain | **done** — the memory model it rests on is `memory-model.md` §0 |
 | **V4** | An optional `retain(reachable)` filter over the frame map, run at transaction boundaries. *Not* a cycle collector — see `memory-model.md` §0.2 | todo |
 | **V5** | Dicts/objects: `( )` second mark kind, `.` access, methods & receivers, `put`, per-type attribute tables (dicts are `Rc`/COW, like lists) | todo |
 | **V6** | Vocabulary, mostly in-language: startup-parsed prelude, `dip keep bi`, `if when cond`, `each map filter reduce`; move derived stack words out of Rust | todo |
