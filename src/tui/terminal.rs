@@ -83,7 +83,7 @@ fn event_loop(mut terminal: Terminal<CrosstermBackend<Stdout>>, app: &mut App) -
 
         // A beam cursor while editing the command line, a block otherwise.
         let cursor_style = match app.mode() {
-            Mode::Insert | Mode::Quote => SetCursorStyle::SteadyBar,
+            Mode::Insert => SetCursorStyle::SteadyBar,
             Mode::Normal => SetCursorStyle::DefaultUserShape,
         };
         execute!(io::stdout(), cursor_style)?;

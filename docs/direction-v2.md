@@ -64,7 +64,7 @@ text; which mark a given closer consumes stays dynamic.
 | Comments | none | **`#` to end of line** (Python-style) |
 | Parse errors | unterminated string only | + unmatched close, unclosed open, crossing regions, dangling sigil (the last is the *tokenizer's*) |
 | Unquote `~( )` | quasiquote for computed bodies | **removed** — templates hold parse-time words, nothing to splice |
-| `=` | equality | **binder** (name-first `'sq {dup *} =`); equality becomes `==` |
+| `=` | equality | **binder** (name-first `'sq {dup *} =`); equality becomes `==` — **done** |
 | Parameters | none | `{w h: …}` binds as `{'h set 'w set …}` would, via `Element::Bind`; names checked |
 | `[ ]` `]` | prelude primitives (words) | **fixed parser elements**, never looked up |
 | `( )` | freed (rejected infix) | **dicts** — literal, `.` access, methods, `put` |

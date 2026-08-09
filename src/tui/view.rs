@@ -39,7 +39,6 @@ fn prompt(mode: Mode) -> &'static str {
     match mode {
         Mode::Insert => "> ",
         Mode::Normal => ": ",
-        Mode::Quote => "' ",
     }
 }
 

@@ -68,11 +68,11 @@ fn comparisons_push_a_bool() {
 
 #[test]
 fn equality_works_across_types() {
-    assert_eq!(run("2 2 =").stack(), &[true]);
-    assert_eq!(run("2 3 =").stack(), &[false]);
-    assert_eq!(run("true true =").stack(), &[true]);
+    assert_eq!(run("2 2 ==").stack(), &[true]);
+    assert_eq!(run("2 3 ==").stack(), &[false]);
+    assert_eq!(run("true true ==").stack(), &[true]);
     // A number never equals a bool — but it's not an error, just false.
-    assert_eq!(run("1 true =").stack(), &[false]);
+    assert_eq!(run("1 true ==").stack(), &[false]);
 }
 
 #[test]
@@ -81,7 +81,7 @@ fn boolean_words_operate_on_bools() {
     assert_eq!(run("true false and").stack(), &[false]);
     assert_eq!(run("true false or").stack(), &[true]);
     // Inequality is `=` then `not`.
-    assert_eq!(run("2 3 = not").stack(), &[true]);
+    assert_eq!(run("2 3 == not").stack(), &[true]);
 }
 
 #[test]
@@ -198,8 +198,8 @@ fn integer_overflow_promotes_to_float() {
 
 #[test]
 fn equality_spans_the_int_float_split() {
-    assert_eq!(run("2 2.0 =").stack(), &[true]);
-    assert_eq!(run("2 3.0 =").stack(), &[false]);
+    assert_eq!(run("2 2.0 ==").stack(), &[true]);
+    assert_eq!(run("2 3.0 ==").stack(), &[false]);
 }
 
 #[test]
@@ -263,10 +263,10 @@ fn to_str_renders_any_value_unquoted() {
 
 #[test]
 fn strings_compare_by_content() {
-    assert_eq!(run(r#""a" "a" ="#).stack(), &[true]);
-    assert_eq!(run(r#""a" "b" ="#).stack(), &[false]);
+    assert_eq!(run(r#""a" "a" =="#).stack(), &[true]);
+    assert_eq!(run(r#""a" "b" =="#).stack(), &[false]);
     // A string never equals a number, even a look-alike.
-    assert_eq!(run(r#"1 "1" ="#).stack(), &[false]);
+    assert_eq!(run(r#"1 "1" =="#).stack(), &[false]);
 }
 
 #[test]
@@ -277,18 +277,12 @@ fn neg_flips_top() {
 
 #[test]
 fn divide_by_zero_is_an_error() {
-    assert_eq!(
-        run("1 0").run_builtin(DIV).unwrap_err(),
-        ErrorKind::DivideByZero
-    );
+    assert_eq!(run_err("1 0 /"), ErrorKind::DivideByZero);
 }
 
 #[test]
 fn underflow_is_an_error() {
-    assert_eq!(
-        run("1").run_builtin(ADD).unwrap_err(),
-        ErrorKind::StackUnderflow
-    );
+    assert_eq!(run_err("1 +"), ErrorKind::StackUnderflow);
 }
 
 #[test]
@@ -428,17 +422,17 @@ fn clear_empties_the_stack() {
 }
 
 #[test]
-fn apply_runs_a_batch_of_commands() {
-    // The TUI path: push literal elements, then run an operator directly on
-    // the engine (as the operator keys do) rather than as a program word.
+fn apply_runs_a_batch_of_elements() {
+    // Elements built directly rather than parsed — the engine's own interface,
+    // independent of the front end.
     let mut engine = Engine::new();
     engine
         .apply(&[
             Element::Literal(Value::Num(2.0)),
             Element::Literal(Value::Num(3.0)),
+            Element::Word(Rc::from("*")),
         ])
         .unwrap();
-    engine.run_builtin(MUL).unwrap();
     assert_eq!(engine.stack(), &[6.0]);
 }
 
@@ -648,8 +642,8 @@ fn a_list_is_an_ordinary_value() {
 
 #[test]
 fn lists_compare_by_structure() {
-    assert_eq!(run("[ 1 2 ] [ 1 2 ] =").stack(), &[true]);
-    assert_eq!(run("[ 1 2 ] [ 1 3 ] =").stack(), &[false]);
+    assert_eq!(run("[ 1 2 ] [ 1 2 ] ==").stack(), &[true]);
+    assert_eq!(run("[ 1 2 ] [ 1 3 ] ==").stack(), &[false]);
 }
 
 #[test]
@@ -865,7 +859,7 @@ fn a_template_instantiates_into_a_function() {
     assert_eq!(run("{dup *}").stack()[0].to_string(), "{dup *}");
     // Two instantiations of the same template in the same scope are the same
     // value — the template is shared, not re-parsed (§5).
-    assert_eq!(run("{dup *} {dup *} =").stack(), &[true]);
+    assert_eq!(run("{dup *} {dup *} ==").stack(), &[true]);
 }
 
 #[test]
@@ -880,12 +874,45 @@ fn call_applies_the_function_on_top() {
 
 #[test]
 fn a_word_bound_to_a_function_runs_when_applied() {
-    assert_eq!(run("{dup *} 'sq set  4 sq").stack(), &[Value::Int(16)]);
+    assert_eq!(run("'sq {dup *} =  4 sq").stack(), &[Value::Int(16)]);
     // `&sq` fetches it instead, unapplied — application's reflective inverse.
+    assert_eq!(run("'sq {dup *} =  4 &sq call").stack(), &[Value::Int(16)]);
+}
+
+#[test]
+fn both_binders_reach_the_same_frame_differing_only_in_order() {
+    // §5: `=` takes the name first, `set` the value first, and both are
+    // primitive. `=` suits a definition, whose value is a literal and so pushes
+    // everything it consumes; `set` suits a computed value, where a name pushed
+    // first would be in the expression's way.
+    assert_eq!(run("'x 3 =  x").stack(), &[Value::Int(3)]);
+    assert_eq!(run("3 'x set  x").stack(), &[Value::Int(3)]);
+    // Each wants on top what the other wants underneath, so a swapped pair is a
+    // type error rather than a silent misbinding.
     assert_eq!(
-        run("{dup *} 'sq set  4 &sq call").stack(),
-        &[Value::Int(16)]
+        run_err("3 'x ="),
+        ErrorKind::TypeError {
+            expected: "name",
+            found: "number"
+        }
     );
+    assert_eq!(
+        run_err("'x 3 set"),
+        ErrorKind::TypeError {
+            expected: "name",
+            found: "number"
+        }
+    );
+}
+
+#[test]
+fn a_definition_binds_into_the_frame_it_captured() {
+    // The shape that would be a reference cycle if `env` were a pointer: the
+    // session frame ends up holding a function whose captured environment is
+    // that same frame (`memory-model.md` §0.2). It stores an id, so there is
+    // nothing to collect — and the function still sees definitions made after
+    // it, which is the same fact from the other side.
+    assert_eq!(run("'sq {n *} =  'n 5 =  5 sq").stack(), &[Value::Int(25)]);
 }
 
 #[test]
@@ -985,8 +1012,8 @@ fn set_and_get_want_a_name() {
 
 #[test]
 fn names_compare_by_text() {
-    assert_eq!(run("'x 'x =").stack(), &[true]);
-    assert_eq!(run("'x 'y =").stack(), &[false]);
+    assert_eq!(run("'x 'x ==").stack(), &[true]);
+    assert_eq!(run("'x 'y ==").stack(), &[false]);
 }
 
 #[test]
@@ -1028,7 +1055,8 @@ fn a_user_binding_shadows_a_builtin() {
 fn builtins_are_reached_by_the_same_lookup() {
     // `+` is a word resolved to a prelude binding — no special parse case;
     // `get` reaches it through the same lookup as any user binding.
-    assert_eq!(run("'+ get").stack(), &[Value::Builtin(ADD)]);
+    assert_eq!(run("'+ get").stack()[0].to_string(), "+");
+    assert_eq!(run("'+ get").stack()[0].type_name(), "builtin");
     assert_eq!(run_err("nope"), ErrorKind::UnboundName("nope".to_string()));
 }
 

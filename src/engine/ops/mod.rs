@@ -20,9 +20,7 @@ mod logic;
 mod seq;
 mod stack;
 
-// The words the TUI dispatches directly (its operator keys and the empty-Enter
-// `dup`), re-exported to the engine root so `crate::engine::ADD` resolves.
-pub(crate) use arith::{ADD, DIV, MUL, SUB};
+// `dup`, which the TUI's empty-Enter dispatches directly.
 pub(crate) use stack::DUP;
 
 /// The prelude's non-primitive bindings — values, not operations. See

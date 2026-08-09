@@ -1,19 +1,24 @@
-//! Comparison words: `=` (any two values) and the numeric orderings
+//! Comparison words: `==` (any two values) and the numeric orderings
 //! `< > <= >=`. All push a `Bool`.
+//!
+//! Equality is `==`, not `=`, because **`=` is the binder** (§5): `'sq {dup *} =`
+//! reads name-first, which is what makes a definition scan down its left edge.
+//! Doubling the character for equality is the cost of spending the single one on
+//! the thing a calculator session does more often.
 
 use crate::engine::{Engine, ErrorKind, Primitive, Value};
 
 #[rustfmt::skip]
 pub(super) static PRIMITIVES: &[Primitive] = &[
-    Primitive { name: "=",  run: eq },
+    Primitive { name: "==", run: eq },
     Primitive { name: "<",  run: lt },
     Primitive { name: ">",  run: gt },
     Primitive { name: "<=", run: le },
     Primitive { name: ">=", run: ge },
 ];
 
-/// `=`: equality of the top two values. Numbers compare by value across the
-/// int/float split, so `2 2.0 =` is true; anything else is structural equality.
+/// `==`: equality of the top two values. Numbers compare by value across the
+/// int/float split, so `2 2.0 ==` is true; anything else is structural equality.
 fn eq(e: &mut Engine) -> Result<(), ErrorKind> {
     let b = e.pop()?;
     let a = e.pop()?;

@@ -36,9 +36,9 @@ pub use program::{parse, Element, Region};
 pub use token::Span;
 pub use value::{MarkKind, Value};
 
-// The words the TUI dispatches directly from its operator keys, re-exported so
-// `crate::engine::ADD` still resolves; the vocabulary otherwise lives in `ops`.
-pub(crate) use ops::{ADD, DIV, DUP, MUL, SUB};
+// `dup` is dispatched directly by the TUI's empty-Enter; every other word is
+// reached by resolving it, which is what makes them all rebindable.
+pub(crate) use ops::DUP;
 
 /// The stack of values, bottom-to-top: the top of stack is the last element.
 /// Internal — the public handle is [`Engine`].

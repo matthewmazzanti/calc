@@ -5,9 +5,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::engine::{
-    self, CalcError, Element, Engine, ErrorKind, Outcome, Primitive, Value, ADD, DIV, DUP, MUL, SUB,
-};
+use crate::engine::{self, CalcError, Element, Engine, ErrorKind, Outcome, Value, DUP};
 use crate::history::History;
 
 /// Vim-style editing modes.
@@ -15,13 +13,9 @@ use crate::history::History;
 pub(super) enum Mode {
     /// Navigate and manipulate the stack with single keys.
     Normal,
-    /// Edit the command line.
+    /// Edit the command line. Every key is typed verbatim — no auto-push, no
+    /// mid-entry parsing — and the whole buffer is evaluated on Enter.
     Insert,
-    /// Literal command-line entry: every key (operators and space included) is
-    /// typed verbatim, with no auto-push and no mid-entry parsing. The whole
-    /// buffer is evaluated only on Enter. Entered from insert on an empty buffer
-    /// with `'`; exits back to insert once the buffer is accepted.
-    Quote,
 }
 
 /// A transient message for the info bar, cleared on the next keypress.
@@ -36,7 +30,7 @@ pub(super) enum Notice {
 /// The command-line editor: the text buffer plus a caret within it. The caret
 /// is a byte offset into `text`, always kept on a char boundary (`text.len()`
 /// is end-of-line). This is what makes the readline-style moves and kills
-/// possible — before it, entry was append-only. Shared by insert and quote mode.
+/// possible — before it, entry was append-only.
 #[derive(Default)]
 pub(super) struct LineEditor {
     text: String,
@@ -170,7 +164,7 @@ pub(super) struct App {
     engine: Engine,
     history: History<Snapshot>,
     mode: Mode,
-    /// The command-line buffer and caret, edited in insert and quote modes.
+    /// The command-line buffer and caret.
     input: LineEditor,
     /// Selected stack level in normal mode, 1-based from the top (level 1 is
     /// the top of stack). Kept clamped to the stack, or 1 when empty.
@@ -260,7 +254,6 @@ impl App {
         match self.mode {
             Mode::Normal => self.handle_normal(key),
             Mode::Insert => self.handle_insert(key),
-            Mode::Quote => self.handle_quote(key),
         }
         self.clamp_cursor();
     }
@@ -344,51 +337,14 @@ impl App {
                     self.commit_input();
                 }
             }
-            // Operators auto-push: commit the pending number, then apply.
-            KeyCode::Char('+') => self.apply_operator(ADD),
-            KeyCode::Char('*') => self.apply_operator(MUL),
-            KeyCode::Char('/') => self.apply_operator(DIV),
-            KeyCode::Char('-') => {
-                // A `-` right after an exponent marker is part of the number
-                // (e.g. `1e-3`), not the subtract operator.
-                let text = self.input.text();
-                if text.ends_with('e') || text.ends_with('E') {
-                    self.input.insert('-');
-                } else {
-                    self.apply_operator(SUB);
-                }
-            }
-            // A leading `'` opens quote mode for literal entry; mid-entry it is
-            // just an ordinary character.
-            KeyCode::Char('\'') if self.input.text().is_empty() => self.mode = Mode::Quote,
             KeyCode::Char(c) => self.input.insert(c),
             _ => {}
         }
     }
 
-    /// Literal entry: keys go straight into the buffer (operators and space
-    /// included), and the whole line is evaluated only on Enter — accepting it
-    /// drops back to insert. Esc bails out to insert, keeping the buffer.
-    fn handle_quote(&mut self, key: KeyEvent) {
-        if self.handle_edit(key) {
-            return;
-        }
-        match key.code {
-            KeyCode::Esc => self.mode = Mode::Insert,
-            KeyCode::Enter => {
-                if self.commit_input() {
-                    self.mode = Mode::Insert;
-                }
-            }
-            KeyCode::Char(c) => self.input.insert(c),
-            _ => {}
-        }
-    }
-
-    /// Readline-style command-line editing — caret moves and kills — shared by
-    /// insert and quote modes. Returns whether the key was consumed; if not, the
-    /// caller applies its own mode-specific handling (operators, Enter, Esc,
-    /// literal char entry). `^C`/`^D` are handled earlier (they quit), and
+    /// Readline-style command-line editing — caret moves and kills. Returns
+    /// whether the key was consumed; if not, the caller applies its own
+    /// mode-specific handling (Enter, Esc, literal char entry). `^C`/`^D` are handled earlier (they quit), and
     /// `^A`/`^E`/`^B`/`^F`/`^U`/`^K`/`^W` mirror the usual readline bindings.
     fn handle_edit(&mut self, key: KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -436,35 +392,6 @@ impl App {
             true
         } else {
             false
-        }
-    }
-
-    /// Commit any pending entry, then apply an operator — as one undo unit. The
-    /// operator hits the engine *directly* (like the cursor ops), not as a
-    /// program word, so the `+` key always means addition regardless of any
-    /// user rebinding. The pending entry keeps its trace; the operator's own
-    /// error is trace-less. `cmd` still reads the whole thing, e.g. `10 0 /`. On
-    /// error the buffer is kept so the user can fix it.
-    fn apply_operator(&mut self, op: Primitive) {
-        let source = self.input.text().trim().to_string();
-        let program = match engine::parse(&source) {
-            Ok(program) => program,
-            Err(error) => {
-                self.notice = Some(Notice::Note(syntax_note(&source, &error)));
-                return;
-            }
-        };
-        let entry = describe(&program);
-        let cmd = if entry.is_empty() {
-            op.to_string()
-        } else {
-            format!("{entry} {op}")
-        };
-        if self.update(cmd, |engine| {
-            engine.apply(&program)?;
-            engine.run_builtin(op).map_err(CalcError::from)
-        }) {
-            self.input.clear();
         }
     }
 
@@ -602,32 +529,35 @@ mod tests {
     }
 
     #[test]
-    fn operator_auto_pushes_the_pending_entry() {
+    fn operators_are_ordinary_characters() {
+        // No auto-push: an operator key types itself and the line runs on
+        // Enter, which is what makes `{dup *}` typable at all.
         let mut app = App::new();
         typ(&mut app, "3");
         press(&mut app, KeyCode::Enter); // stack: [3]
-        typ(&mut app, "4"); // pending entry, not yet pushed
-        ch(&mut app, '+'); // commits 4, then adds
+        typ(&mut app, "4 +");
+        assert_eq!(app.stack(), &[3.0], "the `+` applied before Enter");
+        press(&mut app, KeyCode::Enter);
         assert_eq!(app.stack(), &[7.0]);
         assert_eq!(app.input.text(), "");
     }
 
     #[test]
-    fn minus_is_subtraction_and_auto_pushes() {
+    fn a_function_literal_can_be_typed() {
+        // The reason auto-push had to go: `*` inside a template must reach the
+        // parser rather than firing as a key.
         let mut app = App::new();
-        typ(&mut app, "10");
-        press(&mut app, KeyCode::Enter); // [10]
-        typ(&mut app, "3");
-        ch(&mut app, '-'); // commits 3, subtracts -> 7
-        assert_eq!(app.stack(), &[7.0]);
+        typ(&mut app, "'sq {dup *} =");
+        press(&mut app, KeyCode::Enter);
+        typ(&mut app, "4 sq");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.stack(), &[16.0]);
     }
 
     #[test]
-    fn minus_after_exponent_is_part_of_the_number() {
+    fn a_minus_needs_no_special_case_in_an_exponent() {
         let mut app = App::new();
-        typ(&mut app, "1e");
-        ch(&mut app, '-'); // exponent sign, not subtraction
-        typ(&mut app, "3");
+        typ(&mut app, "1e-3");
         assert_eq!(app.input.text(), "1e-3");
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.stack(), &[0.001]);
@@ -688,52 +618,21 @@ mod tests {
     }
 
     #[test]
-    fn quote_opens_only_on_an_empty_buffer() {
+    fn a_sigil_can_lead_a_line() {
+        // `'` used to open a mode when the buffer was empty, which made the
+        // most common line in the language — `'name {…} =` — the one thing you
+        // could not type.
         let mut app = App::new();
-        ch(&mut app, '\''); // empty buffer -> opens quote
-        assert_eq!(app.mode, Mode::Quote);
-        assert_eq!(app.input.text(), ""); // the `'` itself is not typed
-    }
-
-    #[test]
-    fn quote_mid_entry_is_a_literal_character() {
-        let mut app = App::new();
-        typ(&mut app, "ab");
-        ch(&mut app, '\''); // non-empty buffer -> ordinary character
+        typ(&mut app, "'x");
+        assert_eq!(app.input.text(), "'x");
         assert_eq!(app.mode, Mode::Insert);
-        assert_eq!(app.input.text(), "ab'");
     }
 
     #[test]
-    fn quote_types_operators_literally_and_evaluates_on_enter() {
+    fn a_failed_line_keeps_the_buffer_to_fix() {
         let mut app = App::new();
-        ch(&mut app, '\''); // enter quote
-        typ(&mut app, "3 4 +"); // operator does not auto-push here
-        assert_eq!(app.input.text(), "3 4 +");
-        assert!(app.stack().is_empty());
-        press(&mut app, KeyCode::Enter); // accept the whole line at once
-        assert_eq!(app.stack(), &[7.0]);
-        assert_eq!(app.input.text(), "");
-        assert_eq!(app.mode, Mode::Insert); // quote exits after accept
-    }
-
-    #[test]
-    fn quote_esc_returns_to_insert_keeping_the_buffer() {
-        let mut app = App::new();
-        ch(&mut app, '\'');
-        typ(&mut app, "1 2");
-        press(&mut app, KeyCode::Esc);
-        assert_eq!(app.mode, Mode::Insert);
-        assert_eq!(app.input.text(), "1 2"); // buffer preserved for editing
-    }
-
-    #[test]
-    fn quote_stays_open_when_the_line_fails() {
-        let mut app = App::new();
-        ch(&mut app, '\'');
         typ(&mut app, "1 nope"); // an unbound word
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.mode, Mode::Quote); // stay in quote to fix it
         assert_eq!(app.input.text(), "1 nope");
         assert!(matches!(app.notice, Some(Notice::Error(_))));
     }
@@ -873,16 +772,16 @@ mod tests {
     }
 
     #[test]
-    fn undo_reverts_an_operator_and_its_auto_push_together() {
+    fn undo_reverts_a_whole_line_at_once() {
         let mut app = App::new();
         typ(&mut app, "3");
         press(&mut app, KeyCode::Enter); // [3]
-        typ(&mut app, "4");
-        ch(&mut app, '+'); // auto-push 4 then add -> [7], one action
+        typ(&mut app, "4 +");
+        press(&mut app, KeyCode::Enter); // [7], one action
         assert_eq!(app.stack(), &[7.0]);
         press(&mut app, KeyCode::Esc);
         ch(&mut app, 'u');
-        assert_eq!(app.stack(), &[3.0]); // back to before the `+`
+        assert_eq!(app.stack(), &[3.0]); // back to before the line
     }
 
     #[test]
@@ -907,24 +806,21 @@ mod tests {
         typ(&mut app, "3");
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.cmd(), "3"); // the committed line
-        typ(&mut app, "4");
-        ch(&mut app, '+'); // operator with a pending entry
+        typ(&mut app, "4 +");
+        press(&mut app, KeyCode::Enter);
         assert_eq!(app.cmd(), "4 +");
         assert_eq!(app.stack(), &[7.0]);
     }
 
     #[test]
-    fn operator_error_reports_without_a_trace() {
-        // `10 0 /`: the pending entry applies, then the operator runs directly
-        // on the engine (not as a program word), so its divide-by-zero is a
-        // trace-less error — but `cmd` still names the whole line.
+    fn a_runtime_error_carries_the_line_it_failed_in() {
         let mut app = App::new();
-        typ(&mut app, "10 0");
-        ch(&mut app, '/'); // divide by zero
+        typ(&mut app, "10 0 /");
+        press(&mut app, KeyCode::Enter);
         match &app.notice {
             Some(Notice::Error(e)) => {
-                assert!(e.trace.is_none());
                 assert_eq!(e.kind, ErrorKind::DivideByZero);
+                assert!(e.trace.is_some(), "a line failure should carry a trace");
             }
             _ => panic!("expected an error notice"),
         }
@@ -948,7 +844,7 @@ mod tests {
         assert_eq!(app.cmd(), "3");
     }
 
-    // --- Readline-style command-line editing (insert/quote modes). ---
+    // --- Readline-style command-line editing. ---
 
     #[test]
     fn typing_inserts_at_the_caret() {
@@ -1057,15 +953,13 @@ mod tests {
     }
 
     #[test]
-    fn editing_binds_work_in_quote_mode_too() {
+    fn editing_binds_work_mid_line() {
         let mut app = App::new();
-        ch(&mut app, '\''); // enter quote
         typ(&mut app, "3 4 +");
         ctrl(&mut app, 'a');
         assert_eq!(line(&app), "|3 4 +");
         ctrl(&mut app, 'k'); // kill the whole line
         assert_eq!(line(&app), "|");
-        assert_eq!(app.mode, Mode::Quote); // still in quote
     }
 
     #[test]
