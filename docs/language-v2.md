@@ -31,7 +31,7 @@ Three operations move values around:
 is a word.
 
 Because the default is *apply*, referencing something without applying it requires explicit syntax —
-hence the sigils.
+which is `{ }`, and only `{ }`: a word passed rather than run is `{f}` (section 4).
 
 ---
 
@@ -48,28 +48,28 @@ either is text. What remains is three kinds of character, and their whole behavi
 
 ```
 {  }  [  ]  (  )  :     standalone — a token whatever they abut
-'  &                    prefix sigils — bind to the run on their right
+'                       prefix sigil — binds to the run on its right
 .                       postfix operator — binds to what is on its left
 ```
 
 **The standalone characters bunch up freely.** `[1 2 3]` gives the same tokens as `[ 1 2 3 ]`, `{x *}`
 the same as `{ x * }`, and `word[word` is three tokens.
 
-**The sigils are lexical, not structural.** `'x`, `&x`, `.x`, and `.&x` are each *one* token, so
-`' x` is not a name — a sigil binds tightly or not at all. This is why the two kinds have mirror-image
-rules:
+**The sigils are lexical, not structural.** `'x` and `.x` are each *one* token, so `' x` is not a
+name — a sigil binds tightly or not at all. This is why the two kinds have mirror-image rules:
 
 - A **prefix** is a sigil only where a token begins — after whitespace, after a standalone character,
-  or at the start of input. Everywhere else it is an ordinary name character, so `x'`, `don't`, and
-  `a&b` are names, and `'` and `&` are the only fixed characters a name may *contain*.
+  or at the start of input. Everywhere else it is an ordinary name character, so `x'` and `don't` are
+  names, and `'` is the only fixed character a name may *contain*. A name may not *begin* with it.
 - A **postfix** attaches to what is on its left, so `.` is the attribute operator whenever something
   is there. It may begin a number only when nothing is: `obj.1` reads as attribute `1` and fails,
   while `obj .1` is `obj` then `0.1`. An attribute is always the fallback, so `.map` works wherever
   it appears.
 
-Because the prefix rule is positional, an attribute named `&x` is unwritable exactly as a word named
-`&x` is — after a `.` you are at a token start, so `.&x` is the fetch sigil, and no rule about dots is
-needed to say so. A name may not *begin* with a sigil; it may contain one.
+**`&` was a second prefix and is now ordinary**, in every position: `&x` said what `{x}` says
+(section 4), so `&`, `a&b`, and `&x` are simply names. That also retires the dotted `.&x` — after a
+`.` you are at a token start, and with no sigil to find there, it reads as the attribute *named* `&x`.
+No rule about dots was needed to say so before, and none is needed now.
 
 **This phase owns the literals**, both of them, decoded: a `"…"` arrives with its escapes resolved and
 its quotes gone, and a number arrives as a number.
@@ -100,8 +100,8 @@ The parser consumes the token stream and resolves everything positional:
 
 - `{` opens a template and `}` closes one. Nesting is the parser's own recursion, so depth needs no
   counter.
-- A literal token becomes a **literal element**, and a name, fetch, or attribute token the matching
-  element. All four arrived whole: adjacency was settled upstream.
+- A literal token becomes a **literal element**, and a name or attribute token the matching element.
+  All three arrived whole: adjacency was settled upstream.
 - Every other token is a **word reference**, resolved at application time (section 8).
 
 **There are no keywords.** Every token is a literal shape, a fixed character, or a name — `true` and
@@ -135,7 +135,7 @@ nothing. Runtime errors and unconsumed marks are the transaction's business.
 
 ```
 f      apply the binding
-&f     push the function bound to f, unapplied
+{f}    push the word f, unapplied — suspension
 'f     push the name f
 call   apply the function on top of the stack
 ```
@@ -145,25 +145,49 @@ call   apply the function on top of the stack
 ( ... )   dict          " ... "   string
 ```
 
-**Twelve characters are fixed** — `{`, `}`, `[`, `]`, `(`, `)`, `:`, `.`, `"`, `#`, `'`, and `&`. They
+**Eleven characters are fixed** — `{`, `}`, `[`, `]`, `(`, `)`, `:`, `.`, `"`, `#`, and `'`. They
 belong to the tokenizer and parser, they are never looked up, and they cannot be rebound or shadowed.
 They divide by how much of a name they exclude:
 
 ```
 never in a name:      .  :  {  }  [  ]  (  )  "  #
-name-initial only:    '  &
+name-initial only:    '
 ```
 
-`'` and `&` are the exception because they are *prefixes* (section 3): they are sigils only where a
-token begins, so `x'` and `a&b` are ordinary names. `"` and `#` open a region of text rather than
-standing alone as tokens. All three bracket pairs are matched at parse time; `{ }` resolves there, while
-`[ ]` and `( )` take effect at runtime (sections 6 and 7).
+`'` is the exception because it is a *prefix* (section 3): a sigil only where a token begins, so `x'`
+is an ordinary name. `"` and `#` open a region of text rather than standing alone as tokens. All three
+bracket pairs are matched at parse time; `{ }` resolves there, while `[ ]` and `( )` take effect at
+runtime (sections 6 and 7).
 
-**Two sigils, because the requirements are opposite.** `&f` fetches, and requires `f` to be bound.
-`'f` denotes, and works on unbound names — which is what `set` and `del` need, since `&x set` would
-have to resolve `x` before creating it.
+**One prefix sigil, because only one requirement is left.** `'f` denotes, and works on unbound
+names — which is what `set` and `del` need, since a form that resolved `x` first could not create it.
+`.f` is the postfix, and belongs to section 7.
 
-`&` reads as address-of. There is no writing through the reference — rebinding is `'f ... set`.
+**`{f}` is how a word is passed, and there is no sigil for it.** `&f` used to be, and it earned
+nothing: the environment holds *words*, and the only thing to do with a word is apply it, so the only
+thing a reference can mean is application *deferred* — which is what a template already is. `{f}` is
+an ordinary one whose body happens to be a single word, so suspending a word and suspending anything
+else are the same construct, spelled the same way.
+
+That settles what it yields for every binding, since there is nothing else it could be. A name bound
+to data gives a function that pushes the data (`'x 1 = {x}` is a nullary function emitting 1), a name
+bound to a function gives one that applies it, and a builtin is no different from either. So
+`{x} call` agrees with `x`, and a value binding passes wherever a function is taken (`{x} {y} bi`,
+`cond {a} {b} if`) with no lifting rule to state.
+
+**It defers; it does not pin.** The name inside resolves whenever the function runs — the same late
+binding every other mention gets (section 8) — so a rebinding is visible through a suspension taken
+before it. The alternative, freezing the word where it is written, freezes exactly *one* level: the
+body's own mentions stay live either way, so a saved recursive word runs its old body against its new
+callees and computes something no version of the program ever did. One level is not a useful amount to
+freeze, and freezing all of them would mean copying the reachable environment.
+
+A suspension therefore keeps a *frame* alive, not a value — it retains whatever its name resolves
+through, which is wider than a snapshot would have held. It is also a capture, so the call it appears
+in must own its frame.
+
+The reverse direction — applying a name that arrived as a *value* rather than being written out — is
+the word `get`, so `'f get` is `{f} call`.
 
 ---
 
@@ -333,17 +357,35 @@ does, so the mark is linear (section 6) and the region runs its contents — a c
 needs no escape. What `)` adds is a check that what it collected is pairs, with a name or datum in
 each key position.
 
-**Access stages the receiver.**
+**Access binds the receiver**, and `.` is fixed syntax like the brackets — self-delimiting, never
+looked up.
 
 | | reference | apply |
 |---|---|---|
-| ambient | `&x` | `x` ≡ `&x call` |
-| receiver | `obj.&x` | `obj.x` ≡ `obj.&x call` |
+| ambient | `{x}` | `x` ≡ `{x} call` |
+| receiver | *(unspelled)* — `( obj -- fn )` | `obj.x` |
 
-`.` is fixed syntax like the brackets — self-delimiting, never looked up. `obj.&x` leaves the receiver
-beneath the function it found, so the rows differ by one argument: an ambient attribute is nullary, a
-dict attribute takes the receiver. `obj.&x nip` yields the function alone. Reading a name the dict
-lacks is an error, as is a dot on a value that has no attributes.
+`obj.x` is `( obj -- … )`: it consumes the receiver and applies the function it found with the object
+supplied on top.
+
+**The reference row has no spelling.** `obj.&x` was it, and it went with the `&` sigil. What it has to
+yield is a **nullary callable** — the found function with the receiver already attached, `( obj -- fn )`
+— so that reference means one thing in both rows and apply is `call` applied to it. An earlier draft
+left the receiver *beneath* the function instead, which made the two rows differ by an argument for no
+reason anyone could state.
+
+**It is the one operation `{ }` cannot express**, which is why it needs a notation at all rather than
+falling back on a template. A template closes over *names*; a receiver is a *value*. `{obj.x}` needs
+the receiver to have a name, and re-reads that name late, following whatever `obj` is rebound to
+instead of carrying the object. Capturing a value means going stack→env first — `'r set {r.x}`,
+section 5's curry — which burns a name to do what the notation would do for you.
+
+The freeze there is nothing like the one section 4 rejects. A word reference would have frozen a
+name→word edge, one level deep, with the body's own names still live; this freezes a *value*, and a
+value cannot be redefined out from under the callable. The cost is a frame per reference, since
+attaching a receiver is a capture.
+
+Reading a name the dict lacks is an error, as is a dot on a value that has no attributes.
 
 **A name key wraps its value; any other key stores what it was given.** Under a name, a value becomes
 a function that discards the receiver and pushes it, and a function is stored verbatim — receiving the
@@ -368,12 +410,12 @@ r.area              → 12
 5 r.with-w          → a new rect
 ```
 
-A method takes the receiver as its last parameter, since that is what the dot stages on top, and may
+A method takes the receiver as its last parameter, since that is what the dot supplies on top, and may
 equally read the constructor's locals — so a binding the literal leaves out stays private. `self` is
 an ordinary parameter name.
 
-**Builtins have attributes too**, from a fixed table per type: `lst.map` stages the list exactly as a
-dict stages itself. A generic word is therefore a dot,
+**Builtins have attributes too**, from a fixed table per type: `lst.map` binds the list exactly as a
+dict binds itself. A generic word is therefore a dot,
 
 ```
 'map {.map} =
@@ -465,10 +507,8 @@ The environment is for *definitions*. Values go on the stack:
 
 ```
 'ohms {*} =
-&ohms 12 solve
+{ohms} 12 solve
 ```
-
-`&` is what makes this possible, and it's the operation's main justification.
 
 ---
 
@@ -595,7 +635,7 @@ bi*   ( x y p q -- px qy )
 bi@   ( x y fn -- fx fy )
 ```
 
-`keep` and `bi` are what let you drop `dup`-heavy code: `&f &g bi` rather than `dup f swap g swap`.
+`keep` and `bi` are what let you drop `dup`-heavy code: `{f} {g} bi` rather than `dup f swap g swap`.
 The parameters are `fn`, not Factor's `quot`; because ours capture, `curry` needn't be primitive.
 
 ### 12.2 Flow control
@@ -608,10 +648,10 @@ ordinary word, not a special form. `when`, `unless`, `cond` follow.
 usual family is not a set of mechanisms but a set of calling conventions on that one word:
 
 ```
-lst &f each              forEach     f : 1 -> 0
-[ lst &f each ]          map         f : 1 -> 1
-[ lst &f each ]          flatMap     f : 1 -> n     — the same code
-seed lst &f each         reduce      f : 2 -> 1     — the seed sits below the region
+lst {f} each              forEach     f : 1 -> 0
+[ lst {f} each ]          map         f : 1 -> 1
+[ lst {f} each ]          flatMap     f : 1 -> n     — the same code
+seed lst {f} each         reduce      f : 2 -> 1     — the seed sits below the region
 ```
 
 Map and flatMap coincide because nothing intermediate is ever built to flatten. Reduce needs no
@@ -619,8 +659,8 @@ accumulator parameter because the stack is the accumulator.
 
 **A `map` word is not added, because it would express less.** Opening its own region would give up
 what §6 establishes — that the mark is an ordinary stack value — and so forbid a region holding two
-producers, or literals beside produced values, or `1 2 [unrot lst &f each]` reaching backwards. It
-would also forbid the plainest use of all, `lst &f each` with no region, where results simply land
+producers, or literals beside produced values, or `1 2 [unrot lst {f} each]` reaching backwards. It
+would also forbid the plainest use of all, `lst {f} each` with no region, where results simply land
 on the stack. Where the familiar name is wanted, §7's per-type attribute tables supply `lst.map`,
 which type-dispatches as a free word could not.
 
@@ -640,7 +680,7 @@ distinguish "f pushed 2" from "two iterations pushed 1." Whether a checked form 
 
 **`true` and `false` are bindings, not literals** — prelude entries holding a boolean, applied like any
 other name. Section 1's rule already covers it: a value in the environment is a nullary function that
-pushes something, which is exactly what these are. So they can be fetched (`&true`), used as names
+pushes something, which is exactly what these are. So they can be suspended (`{true}`), used as names
 (`'true`, `{true: …}`), shadowed, and un-shadowed with `del` (section 9), and the language needs no
 reserved words. The cost is a lookup where a literal would have been free — section 11's per-access
 indirection, which every other name already pays.
@@ -677,7 +717,7 @@ earns its keep.
 ## 14. Terminology
 
 - **word** — an operation. Not "symbol"; `'f` yields a *name*, and there's no separate symbol type.
-- **element** — a member of a template's sequence: a word reference, a name, a fetch, a literal, or a
+- **element** — a member of a template's sequence: a word reference, a name, an attribute, a literal, or a
   nested template.
 - **template** — parsed code with no environment. Immutable, shared, plain data.
 - **function** — the type. A template plus a captured environment. Covers anonymous `{ }` and named

@@ -14,10 +14,10 @@
 # words but calling conventions on this one, because a function may leave any
 # number of values and `[ ]` is an ordinary runtime mark:
 #
-#     lst &f each              forEach     f : 1 -> 0
-#     [ lst &f each ]          map         f : 1 -> 1
-#     [ lst &f each ]          flatMap     f : 1 -> n    — the same code
-#     seed lst &f each         reduce      f : 2 -> 1    — the stack accumulates
+#     lst {f} each             forEach     f : 1 -> 0
+#     [ lst {f} each ]         map         f : 1 -> 1
+#     [ lst {f} each ]         flatMap     f : 1 -> n    — the same code
+#     seed lst {f} each        reduce      f : 2 -> 1    — the stack accumulates
 #
 # Map and flatMap coincide because there is no intermediate container to
 # flatten. Reduce needs no accumulator parameter because the seed simply sits

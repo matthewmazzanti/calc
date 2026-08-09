@@ -348,8 +348,8 @@ impl Engine {
         }
     }
 
-    /// Apply one program element: push a literal, resolve a word, fetch a
-    /// binding unapplied, or run a region's opener/closer. The parser accepts
+    /// Apply one program element: push a literal, resolve a word, instantiate a
+    /// template, or run a region's opener/closer. The parser accepts
     /// the whole v2 surface, so the elements evaluation doesn't reach yet — a
     /// template (V3), a dict region or an attribute (V5) — report
     /// [`ErrorKind::Unimplemented`] rather than being absent from the tree.
@@ -360,15 +360,6 @@ impl Engine {
                 Ok(())
             }
             Element::Word(name) => self.resolve_word(name),
-            // `&f` is application's reflective inverse: the binding is pushed,
-            // not run. Unlike `'f`, it requires `f` to be bound (§4).
-            Element::Fetch(name) => match self.lookup(name) {
-                Some(value) => {
-                    self.stack.push(value);
-                    Ok(())
-                }
-                None => Err(ErrorKind::UnboundName(name.to_string())),
-            },
             // `[` and `]` are fixed elements, not words — the lookup every other
             // token gets, these skip, so they can't be rebound or shadowed. Only
             // the *dispatch* moved here; the mark discipline is unchanged (§6).
@@ -399,9 +390,7 @@ impl Engine {
             Element::Open(Region::Dict) | Element::Close(Region::Dict) => {
                 Err(ErrorKind::Unimplemented("dicts"))
             }
-            Element::Attr(_) | Element::AttrFetch(_) => {
-                Err(ErrorKind::Unimplemented("attribute access"))
-            }
+            Element::Attr(_) => Err(ErrorKind::Unimplemented("attribute access")),
         }
     }
 

@@ -54,14 +54,8 @@ mod tok {
     pub fn name(text: &str) -> TokenKind {
         TokenKind::Name(Rc::from(text))
     }
-    pub fn fetch(text: &str) -> TokenKind {
-        TokenKind::Fetch(Rc::from(text))
-    }
     pub fn attr(text: &str) -> TokenKind {
         TokenKind::Attr(Rc::from(text))
-    }
-    pub fn attr_fetch(text: &str) -> TokenKind {
-        TokenKind::AttrFetch(Rc::from(text))
     }
     pub fn open(bracket: Bracket) -> TokenKind {
         TokenKind::Open(bracket)
@@ -91,14 +85,8 @@ mod el {
     pub fn name(text: &str) -> Element {
         Element::Literal(Value::Name(Rc::from(text)))
     }
-    pub fn fetch(text: &str) -> Element {
-        Element::Fetch(Rc::from(text))
-    }
     pub fn attr(text: &str) -> Element {
         Element::Attr(Rc::from(text))
-    }
-    pub fn attr_fetch(text: &str) -> Element {
-        Element::AttrFetch(Rc::from(text))
     }
     pub fn bind(text: &str) -> Element {
         Element::Bind(Rc::from(text))
@@ -225,22 +213,17 @@ fn adjacency() {
             tokens: Ok(vec![tok::name("f")]),
             program: Ok(vec![el::name("f")]),
         },
-        Case {
-            source: "&f",
-            tokens: Ok(vec![tok::fetch("f")]),
-            program: Ok(vec![el::fetch("f")]),
-        },
         // A token begins after a delimiter, not only after whitespace.
         Case {
-            source: "[&f]",
+            source: "['f]",
             tokens: Ok(vec![
                 tok::open(Bracket::Square),
-                tok::fetch("f"),
+                tok::name("f"),
                 tok::close(Bracket::Square),
             ]),
             program: Ok(vec![
                 el::open(Region::List),
-                el::fetch("f"),
+                el::name("f"),
                 el::close(Region::List),
             ]),
         },
@@ -249,13 +232,13 @@ fn adjacency() {
             tokens: Ok(vec![tok::word("obj"), tok::attr("x")]),
             program: Ok(vec![el::word("obj"), el::attr("x")]),
         },
+        // `&` is an ordinary name character now, in every position — so a
+        // dotted `.&x` is just the attribute named `&x`, and needs no rule.
         Case {
             source: "obj.&x",
-            tokens: Ok(vec![tok::word("obj"), tok::attr_fetch("x")]),
-            program: Ok(vec![el::word("obj"), el::attr_fetch("x")]),
+            tokens: Ok(vec![tok::word("obj"), tok::attr("&x")]),
+            program: Ok(vec![el::word("obj"), el::attr("&x")]),
         },
-        // After a `.` you are at a token start, so the prefix rule applies
-        // unchanged: the `&` is a sigil, and one that isn't leading is not.
         Case {
             source: ".foo&bar",
             tokens: Ok(vec![tok::attr("foo&bar")]),
@@ -343,10 +326,12 @@ fn errors() {
             tokens: fails(ParseErrorKind::ExpectedName { after: '\'' }, 0, 1),
             program: fails(ParseErrorKind::ExpectedName { after: '\'' }, 0, 1),
         },
+        // But `&` is no sigil, so `&2e3` is simply a name — the number grammar
+        // never gets a chance to claim a run it doesn't account for.
         Case {
             source: "&2e3",
-            tokens: fails(ParseErrorKind::ExpectedName { after: '&' }, 0, 1),
-            program: fails(ParseErrorKind::ExpectedName { after: '&' }, 0, 1),
+            tokens: Ok(vec![tok::word("&2e3")]),
+            program: Ok(vec![el::word("&2e3")]),
         },
         // Attached, so the dot is the attribute operator and `1` is no name —
         // not a silent `obj 0.1`. A list on the left reads the same way.

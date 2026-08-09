@@ -68,8 +68,8 @@ Show both: point-free, and with a named parameter. Then the reveal that words
 are values:
 
 ```
-3 4 '+ get 'plus set  plus     →  7
-&+                             →  +
+3 4 '+ get                     →  7
+{+} 'plus set  3 4 plus        →  7
 ```
 
 Recursion, no forward declaration needed:
@@ -110,8 +110,8 @@ Build it up. Each line is a new calling convention, **not a new word**.
 > code*. There's no intermediate container to flatten."
 
 ```
-0 [ 1 2 3 4 5 ] &+ each              →  15
-1 [ 1 2 3 4 5 ] &* each              →  120
+0 [ 1 2 3 4 5 ] {+} each             →  15
+1 [ 1 2 3 4 5 ] {*} each             →  120
 ```
 > "Put a seed underneath and it's `reduce`. No accumulator parameter — the seed
 > just sits below the working area."
@@ -132,19 +132,22 @@ couldn't do either:
 
 ## Act 6 — the payoff (~20s)
 
-```
-&each
-```
-```
-{lst f: 'step {i: i lst length < {lst i nth f i 1 + step} {} if} = 0 step}
-```
+> **TODO — this beat has no spelling.** `&each` used to print the stored
+> function, body and all. `{each}` prints `{each}`: a suspension is a word that
+> *applies* `each`, not the definition itself, so nothing shows a body any more.
+> It needs a word that looks a name up and renders what it finds — Forth's `SEE`:
+>
+> ```
+> 'each see
+> {lst f: 'step {i: i lst length < {lst i nth f i 1 + step} {} if} = 0 step}
+> 'dup see
+> dup                    # a primitive: nothing to show
+> ```
 
 > "`each` isn't built in. It's written in the language, in the prelude, over
 > `length` and `nth` — and it recurses in tail position, so it runs flat over a
-> list of any length."
-
-Compare with `&dup` → `dup`, which *is* a primitive. Nothing else can tell the
-difference.
+> list of any length." Compare with `dup`, which *is* a primitive — nothing else
+> can tell the difference.
 
 Then, because there are no keywords at all:
 

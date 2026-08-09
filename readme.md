@@ -27,7 +27,7 @@ Some examples to try:
 [lst {dup *} each]  # Apply function to each element, collect into list (map)
 [lst {dup} each]    # Can expand a list
 0 lst {+} each      # Accumulate on the stack
-[lst &square each]  # Refer to a function by name
+[lst {square} each] # Refer to a function by name
 ```
 
 

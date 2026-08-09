@@ -46,9 +46,12 @@ pub enum Value {
     /// but the shuffles move and copy it like any other stack item — a collection
     /// is a manipulable region, not a sealed scope (see `language.md` §13).
     Mark(MarkKind),
-    /// A captured primitive op — a first-class word. A *bare* word runs its op;
-    /// `'name get` instead pushes it here, so a builtin can be stored, passed,
-    /// and later applied.
+    /// A primitive op, as the environment holds it. **Never on the stack**:
+    /// `&name` yields `{name}` rather than extracting the word, so this is the
+    /// prelude's representation of a builtin and
+    /// [`Engine::apply_value`](super::Engine::apply_value) its only consumer —
+    /// which is what lets a word move between the Rust and in-language halves of
+    /// the prelude without a caller noticing.
     ///
     /// Held **by reference**: the tables are `'static`, so this is a pointer
     /// rather than the `&str`-plus-fn-pointer pair, which would otherwise make

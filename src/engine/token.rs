@@ -9,19 +9,19 @@
 //!
 //! ```text
 //! {  }  [  ]  (  )  :     standalone — a token whatever they abut
-//! '  &                    prefix sigils — bind to the run on their right
+//! '                       prefix sigil — binds to the run on its right
 //! .                       postfix operator — binds to what is on its left
 //! ```
 //!
-//! **Adjacency is this phase's, not the parser's.** `'x`, `&x`, `.x`, and `.&x`
-//! are single tokens, so there is no bare sigil in the stream and no
-//! consume-next rule downstream. Which in turn is why the two sigil kinds have
-//! mirror-image rules, and why neither needs stating twice:
+//! **Adjacency is this phase's, not the parser's.** `'x` and `.x` are single
+//! tokens, so there is no bare sigil in the stream and no consume-next rule
+//! downstream. Which in turn is why the two sigil kinds have mirror-image
+//! rules, and why neither needs stating twice:
 //!
 //! - A **prefix** is a sigil when nothing precedes it in the same token. That
 //!   falls out of [`breaks_word`] rather than being checked: a run swallows `'`
-//!   and `&` (`x'`, `a&b`, `don't`), so the scanner can only *land* on one where
-//!   a token begins.
+//!   (`x'`, `don't`), so the scanner can only *land* on one where a token
+//!   begins.
 //! - A **postfix** attaches to whatever is on its left, so `.` is the attribute
 //!   operator unless nothing is there ([`attached`]) — `obj.1` reads as an
 //!   attribute and fails, while `obj .1` is a number.
@@ -114,12 +114,8 @@ pub enum TokenKind {
     /// `'x` — a name. The sigil binds to the run after it, so this is one
     /// lexical unit and there is no such thing as a bare `'` in the stream.
     Name(Rc<str>),
-    /// `&x` — a fetch: the binding, unapplied (§4).
-    Fetch(Rc<str>),
     /// `.x` — attribute access, which stages the receiver (§7).
     Attr(Rc<str>),
-    /// `.&x` — the same lookup without applying.
-    AttrFetch(Rc<str>),
     /// `:` — closes a template's parameter list (§5).
     Colon,
     /// `{`, `[`, or `(`.
@@ -169,12 +165,15 @@ fn standalone(c: char) -> Option<TokenKind> {
 ///   would be one name;
 /// - **`"` and `#`**, which open a region of text the lookahead owns.
 ///
-/// **`'` and `&` are deliberately absent**, and that is what makes them
-/// position-sensitive without a rule saying so. A run swallows them (`x'`,
-/// `a&b`, `don't`), so the scanner only ever *lands* on one where a token
-/// genuinely begins — after whitespace, after a standalone character, or at the
-/// start of input. There they are the prefix sigils; nowhere else can they be
-/// reached.
+/// **`'` is deliberately absent**, and that is what makes it position-sensitive
+/// without a rule saying so. A run swallows it (`x'`, `don't`), so the scanner
+/// only ever *lands* on one where a token genuinely begins — after whitespace,
+/// after a standalone character, or at the start of input. There it is the
+/// prefix sigil; nowhere else can it be reached.
+///
+/// **`&` is absent for a plainer reason: it is no longer syntax.** It was the
+/// second prefix, and `{x}` says what `&x` said (§4), so it is an ordinary name
+/// character in every position — `&`, `a&b`, and `&x` are all names.
 fn breaks_word(c: char) -> bool {
     c.is_whitespace() || standalone(c).is_some() || matches!(c, '.' | '"' | '#')
 }
@@ -302,15 +301,11 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
                 let (text, end) = read_string(input, i)?;
                 (TokenKind::Str(Rc::new(text)), end)
             }
-            // A prefix sigil. Only reachable at a token start: a run swallows
-            // these characters, so mid-name ones are never seen here.
-            '\'' | '&' => {
-                let (name, end) = read_name(input, i, c)?;
-                let kind = match c {
-                    '\'' => TokenKind::Name(name),
-                    _ => TokenKind::Fetch(name),
-                };
-                (kind, end)
+            // The prefix sigil. Only reachable at a token start: a run swallows
+            // the character, so a mid-name one is never seen here.
+            '\'' => {
+                let (name, end) = read_name(input, i, '\'')?;
+                (TokenKind::Name(name), end)
             }
             '.' => read_dot(input, i)?,
             // A standalone character, or else a run to classify.
@@ -354,8 +349,10 @@ fn classify(text: &str) -> TokenKind {
 /// `.map` reads the same wherever it appears — only whether a *number* is on
 /// offer depends on what precedes the dot.
 ///
-/// `.&x` fetches and `.x` applies. After the dot you are at a token start, so
-/// the `&` is the ordinary prefix sigil and needs no rule of its own.
+/// An attribute is the fallback either way, so `.map` reads the same wherever it
+/// appears — only whether a *number* is on offer depends on what precedes the
+/// dot. With `&` no longer a sigil there is no second dotted form: `.&x` is the
+/// attribute *named* `&x`, exactly as `&x` is a word named `&x`.
 fn read_dot(input: &str, start: usize) -> Result<(TokenKind, usize), ParseError> {
     if !attached(input, start) {
         let end = read_word(input, start);
@@ -363,20 +360,12 @@ fn read_dot(input: &str, start: usize) -> Result<(TokenKind, usize), ParseError>
             return Ok((TokenKind::Number(value), end));
         }
     }
-    let fetch = input[start + 1..].starts_with('&');
-    let (name, end) = match fetch {
-        true => read_name(input, start + 1, '&')?,
-        false => read_name(input, start, '.')?,
-    };
-    let kind = match fetch {
-        true => TokenKind::AttrFetch(name),
-        false => TokenKind::Attr(name),
-    };
-    Ok((kind, end))
+    let (name, end) = read_name(input, start, '.')?;
+    Ok((TokenKind::Attr(name), end))
 }
 
 /// Read the name a sigil at `start` binds to: the run just after it, which must
-/// be a word. A literal is no name, and neither is an empty run — so `'3`, `&`,
+/// be a word. A literal is no name, and neither is an empty run — so `'3`, `'`,
 /// and `. x` all fail here, at the sigil, rather than reaching the parser. This
 /// is the whole of the consume-next rule, and it is lexical because adjacency is.
 fn read_name(input: &str, start: usize, sigil: char) -> Result<(Rc<str>, usize), ParseError> {
@@ -488,10 +477,6 @@ mod tests {
         TokenKind::Name(Rc::from(text))
     }
 
-    fn fetch(text: &str) -> TokenKind {
-        TokenKind::Fetch(Rc::from(text))
-    }
-
     fn attr(text: &str) -> TokenKind {
         TokenKind::Attr(Rc::from(text))
     }
@@ -513,7 +498,7 @@ mod tests {
     fn the_sigils_are_prefixes_that_bind_to_a_run() {
         // One lexical unit, so there is no bare `'` in the stream — and the
         // spaced form is *not* the same thing.
-        assert_eq!(kinds("'f &g"), vec![name("f"), fetch("g")]);
+        assert_eq!(kinds("'f g"), vec![name("f"), word("g")]);
         assert!(
             tokenize("' f").is_err(),
             "a sigil binds tightly or not at all"
@@ -523,17 +508,27 @@ mod tests {
         // its own, since a run swallows the character everywhere else.
         assert_eq!(kinds("x'"), vec![word("x'")]);
         assert_eq!(kinds("don't"), vec![word("don't")]);
-        assert_eq!(kinds("a&b"), vec![word("a&b")]);
         assert_eq!(kinds("'x'"), vec![name("x'")]);
         // A token begins after a delimiter too, not only after whitespace.
         assert_eq!(
-            kinds("[&f]"),
+            kinds("['f]"),
             vec![
                 TokenKind::Open(Bracket::Square),
-                fetch("f"),
+                name("f"),
                 TokenKind::Close(Bracket::Square)
             ]
         );
+    }
+
+    #[test]
+    fn the_ampersand_is_an_ordinary_name_character() {
+        // It was the second prefix sigil; `{x}` says what `&x` said, so the
+        // character went back to the vocabulary and is unremarkable in every
+        // position — leading, interior, and alone.
+        assert_eq!(kinds("a&b"), vec![word("a&b")]);
+        assert_eq!(kinds("&x"), vec![word("&x")]);
+        assert_eq!(kinds("&"), vec![word("&")]);
+        assert_eq!(kinds("1 2 &"), vec![int(1), int(2), word("&")]);
     }
 
     #[test]
@@ -541,10 +536,6 @@ mod tests {
         // Attached, `.` is the attribute operator — there is something on its
         // left to stage. Detached, it may open a number.
         assert_eq!(kinds("obj.x"), vec![word("obj"), attr("x")]);
-        assert_eq!(
-            kinds("obj.&x"),
-            vec![word("obj"), TokenKind::AttrFetch(Rc::from("x"))]
-        );
         assert_eq!(kinds("obj .1"), vec![word("obj"), float(0.1)]);
         assert_eq!(kinds(".1"), vec![float(0.1)]);
         // So a numeric attribute is an error rather than a silent float, and it
@@ -562,9 +553,10 @@ mod tests {
         );
         assert_eq!(kinds(".map"), vec![attr("map")]);
         assert_eq!(kinds("obj.2dup"), vec![word("obj"), attr("2dup")]);
-        // The `&` after a dot is the ordinary prefix sigil, so an attribute
-        // named `&x` is unwritable exactly as a word named `&x` is.
+        // `&` is a name character after a dot as everywhere else, so `.&x` is
+        // simply the attribute named `&x` — no second dotted form to tell apart.
         assert_eq!(kinds(".foo&bar"), vec![attr("foo&bar")]);
+        assert_eq!(kinds("obj.&x"), vec![word("obj"), attr("&x")]);
     }
 
     #[test]

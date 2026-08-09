@@ -1,6 +1,7 @@
 //! Environment words: `=` and `set` bind a name in the current frame, `get`
-//! reads one back (reaching the prelude too, so `'+ get` captures the op as a
-//! value).
+//! applies one (reaching the prelude too, so `3 4 '+ get` adds) — the dynamic
+//! counterpart of writing the word out. `&f` is the other direction: the
+//! binding, unapplied.
 //!
 //! **Two binders, differing only in argument order** (§5), and both primitive:
 //!
@@ -43,14 +44,21 @@ fn set(e: &mut Engine) -> Result<(), ErrorKind> {
     Ok(())
 }
 
-/// `get` ( name -- value ): push the value bound to `name` — a user binding or a
-/// prelude builtin — or fail with `UnboundName`. The value is *pushed*, not run:
-/// the reflective inverse of bare-word application.
+/// `get` ( name -- … ): **apply** the binding named on top of the stack — a user
+/// binding or a prelude builtin — or fail with `UnboundName`.
+///
+/// `'x get` is what writing `x` does, with the name arriving as a value instead
+/// of being written out, so a computed name can be applied. It reaches
+/// [`Engine::apply_value`], the same seam a bare word does: a function enters
+/// its frame, a builtin runs, and a data binding pushes — which is why
+/// `'x 1 = 'x get` leaves `1`.
+///
+/// **`&x` is the other direction, and the two are no longer the same word**: the
+/// sigil defers instead of applying — `&x` is `{x}` — so `'x get` is `&x call`.
 fn get(e: &mut Engine) -> Result<(), ErrorKind> {
     let name = e.pop_name()?;
     let value = e
         .lookup(&name)
         .ok_or_else(|| ErrorKind::UnboundName(name.to_string()))?;
-    e.push(value);
-    Ok(())
+    e.apply_value(value)
 }

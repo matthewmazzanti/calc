@@ -12,8 +12,8 @@
 //! the tree is only what evaluation still has to decide.
 //!
 //! Positional here means *structural*. Adjacency — that `'x` is a name and
-//! `obj.x` an attribute — is lexical, so the sigils arrive already bound to
-//! their names and this phase only places them.
+//! `obj.x` an attribute — is lexical, so both arrive already bound to their
+//! names and this phase only places them.
 //!
 //! **A tree, not a flat program** — this is the reversal from v1, where `{ }`
 //! was a runtime mark and code was data. A template is parsed once, holds no
@@ -61,14 +61,13 @@ pub enum Element {
     /// A bare word, resolved against the environment at *application* time — the
     /// late binding that gives recursion for free (§8).
     Word(Rc<str>),
-    /// `&f` — push the value bound to `f` unapplied. Requires `f` to be bound;
-    /// contrast `'f`, which denotes and works on unbound names (§4).
-    Fetch(Rc<str>),
-    /// `.x` — attribute access, staging the receiver: `obj.x` ≡ `obj.&x call`.
+    /// `.x` — attribute access, binding the receiver: `( obj -- … )` (§7).
+    ///
+    /// The *reference* half of §7's table has no spelling: `.&x` was it, and it
+    /// went with the `&` sigil. What it has to yield is a callable with the
+    /// receiver already attached, which is the one thing `{ }` cannot express —
+    /// a template closes over names, and a receiver is a value.
     Attr(Rc<str>),
-    /// `.&x` — the same lookup without applying, leaving the receiver beneath
-    /// the function it found (§7).
-    AttrFetch(Rc<str>),
     /// Bind the top of the stack to a name in the current frame — what a
     /// template's `names :` list emits, one per parameter.
     ///
@@ -97,9 +96,7 @@ impl std::fmt::Display for Element {
         match self {
             Element::Literal(v) => write!(f, "{v}"),
             Element::Word(name) => write!(f, "{name}"),
-            Element::Fetch(name) => write!(f, "&{name}"),
             Element::Attr(name) => write!(f, ".{name}"),
-            Element::AttrFetch(name) => write!(f, ".&{name}"),
             // Only reachable outside a template's parameter list, which the
             // parser never produces — printed as the `set` it is equivalent to,
             // so the form stays re-parseable whatever built it.
@@ -212,9 +209,7 @@ impl<'a> Parser<'a> {
                 // The sigils arrive already bound to their names: adjacency is
                 // lexical, so consume-next is the tokenizer's rule, not ours.
                 TokenKind::Name(name) => elements.push(Element::Literal(Value::Name(name.clone()))),
-                TokenKind::Fetch(name) => elements.push(Element::Fetch(name.clone())),
                 TokenKind::Attr(name) => elements.push(Element::Attr(name.clone())),
-                TokenKind::AttrFetch(name) => elements.push(Element::AttrFetch(name.clone())),
                 // A `:` the parameter scan didn't consume is out of position.
                 TokenKind::Colon => {
                     return Err(ParseError::new(ParseErrorKind::MisplacedColon, token.span))
@@ -400,29 +395,27 @@ mod tests {
     }
 
     #[test]
-    fn the_sigils_arrive_bound_to_their_names() {
+    fn the_sigil_arrives_bound_to_its_name() {
         assert_eq!(parsed("'x"), vec![name("x")]);
-        assert_eq!(parsed("&x"), vec![Element::Fetch(Rc::from("x"))]);
-        // `'` denotes and so works on an unbound name; `&` fetches.
-        assert_eq!(
-            parsed("'sq &sq"),
-            vec![name("sq"), Element::Fetch(Rc::from("sq"))]
-        );
         // A sigil is a lexical prefix, not a token of its own, so the spaced
         // form is no longer the same program — it is not a program at all.
         assert_eq!(err("' x"), ParseErrorKind::ExpectedName { after: '\'' });
-        assert_eq!(err("& x"), ParseErrorKind::ExpectedName { after: '&' });
+        // `&` is no longer one of them: it parses as the name it looks like.
+        assert_eq!(parsed("&x"), vec![word_ref("&x")]);
+        assert_eq!(parsed("& x"), vec![word_ref("&"), word_ref("x")]);
     }
 
     #[test]
-    fn a_dot_stages_the_receiver() {
+    fn a_dot_binds_the_receiver() {
         assert_eq!(
             parsed("obj.x"),
             vec![word_ref("obj"), Element::Attr(Rc::from("x"))]
         );
+        // `.&x` is no longer a form of its own: `&` is a name character, so
+        // this is the attribute *named* `&x`.
         assert_eq!(
             parsed("obj.&x"),
-            vec![word_ref("obj"), Element::AttrFetch(Rc::from("x"))]
+            vec![word_ref("obj"), Element::Attr(Rc::from("&x"))]
         );
     }
 
@@ -600,18 +593,18 @@ mod tests {
     #[test]
     fn a_sigil_with_nothing_usable_after_it_is_an_error() {
         assert_eq!(err("'"), ParseErrorKind::ExpectedName { after: '\'' });
-        assert_eq!(err("&"), ParseErrorKind::ExpectedName { after: '&' });
-        assert_eq!(err("x."), ParseErrorKind::ExpectedName { after: '.' });
         // No name may contain a fixed character, so a delimiter is no name.
         assert_eq!(err("'{}"), ParseErrorKind::ExpectedName { after: '\'' });
-        assert_eq!(err(r#"&"s""#), ParseErrorKind::ExpectedName { after: '&' });
         // Nor is a literal. One rule now covers the sigils and the parameter
         // list: a name is what the number grammar didn't claim.
         assert_eq!(err("'3"), ParseErrorKind::ExpectedName { after: '\'' });
-        assert_eq!(err("&2e3"), ParseErrorKind::ExpectedName { after: '&' });
-        assert_eq!(err("obj.3"), ParseErrorKind::ExpectedName { after: '.' });
         // `true` is a binding, so it names like anything else.
-        assert!(parse("'true &true obj.true").is_ok());
+        assert!(parse("'true obj.true").is_ok());
+        assert_eq!(err("x."), ParseErrorKind::ExpectedName { after: '.' });
+        assert_eq!(err("obj.3"), ParseErrorKind::ExpectedName { after: '.' });
+        // `&` has no rule left to break: it is a name character, so these are
+        // words rather than sigils with nothing after them.
+        assert_eq!(parsed("& &2e3"), vec![word_ref("&"), word_ref("&2e3")]);
     }
 
     #[test]

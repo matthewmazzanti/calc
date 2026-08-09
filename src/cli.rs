@@ -51,7 +51,9 @@ mod tests {
     fn values_render_as_the_stack_shows_them() {
         assert_eq!(evaluate(r#""hi""#).unwrap(), r#""hi""#);
         assert_eq!(evaluate("[1 2]").unwrap(), "[ 1 2 ]");
-        assert_eq!(evaluate("'sq {dup *} =  &sq").unwrap(), "{dup *}");
+        assert_eq!(evaluate("'sq {dup *} =  {dup *}").unwrap(), "{dup *}");
+        // A suspended word renders as what was written: `{sq}`, not its body.
+        assert_eq!(evaluate("'sq {dup *} =  {sq}").unwrap(), "{sq}");
         assert_eq!(evaluate(r#""hi" to_str"#).unwrap(), r#""hi""#);
     }
 

@@ -52,8 +52,10 @@ fn booleans_are_prelude_bindings_not_keywords() {
     // But it *is* a binding: fetchable, nameable, and shadowable like any
     // builtin, with `del` as the recovery path (§9). The language has no
     // keywords, so there is nothing here the parser reserves.
-    assert_eq!(run("&true").stack(), &[true]);
+    assert_eq!(run("{true} call").stack(), &[true]);
     assert_eq!(run("'true get").stack(), &[true]);
+    // Suspended, it is the nullary function §1 says a bound value is.
+    assert_eq!(run("{true}").stack()[0].type_name(), "function");
     assert_eq!(run("1 'true set true").stack(), &[Value::Int(1)]);
 }
 
@@ -308,7 +310,7 @@ fn power_preserves_integers_where_it_can() {
 fn power_is_an_ordinary_word_named_with_an_operator() {
     // `^` is a name, not syntax — so it is fetchable and rebindable like any
     // other word, which is what keeps the vocabulary uniform.
-    assert_eq!(run("3 4 '^ get 'p set p").stack(), &[Value::Int(81)]);
+    assert_eq!(run("{^} 'p set 3 4 p").stack(), &[Value::Int(81)]);
 }
 
 #[test]
@@ -1049,12 +1051,16 @@ fn quote_pushes_a_name() {
 
 #[test]
 fn set_then_get_round_trips() {
+    // `get` applies the binding, so a bound value lands back on the stack — the
+    // name arriving as a value is the only difference from writing `x`.
     assert_eq!(run("3 'x set 'x get").stack(), &[Value::Int(3)]);
     // Any value binds — a list too.
     assert_eq!(
         run("[ 1 2 ] 'xs set 'xs get").stack(),
         &[list(&[Value::Int(1), Value::Int(2)])]
     );
+    // And a function binding *runs*, since that is what applying one does.
+    assert_eq!(run("'sq {dup *} =  4 'sq get").stack(), &[Value::Int(16)]);
 }
 
 #[test]
@@ -1068,13 +1074,52 @@ fn get_on_an_unbound_name_fails() {
 }
 
 #[test]
-fn the_fetch_sigil_pushes_a_binding_unapplied() {
-    // `&x` is what `'x get` spells the long way — application's reflective
-    // inverse (§4). It's parser-owned, so it can't be shadowed the way `get`
-    // can, and unlike `'x` it demands that the name be bound.
-    assert_eq!(run("3 'x set &x").stack(), &[Value::Int(3)]);
-    assert_eq!(run("&+ to_str").stack(), &[Value::from("+")]);
-    assert_eq!(run_err("&nope"), ErrorKind::UnboundName("nope".to_string()));
+fn a_one_word_template_is_the_suspension_idiom() {
+    // What `&x` used to spell (§4). There is no sigil for it, because there is
+    // nothing for one to add: `{x}` is an ordinary template whose body happens
+    // to be a single word, so suspending a word and suspending anything else
+    // are the same construct.
+    //
+    // Whatever `x` is bound to, the same thing comes back — a function — so
+    // there is no lift for a data binding and no unwrapping for a callable one.
+    assert_eq!(run("3 'x set {x}").stack()[0].to_string(), "{x}");
+    assert_eq!(run("3 'x set {x}").stack()[0].type_name(), "function");
+    // Applying it is applying the word, so a data binding lands its value.
+    assert_eq!(run("3 'x set {x} call").stack(), &[Value::Int(3)]);
+    assert_eq!(run("3 'x set {x} 'y set y").stack(), &[Value::Int(3)]);
+    assert_eq!(run("'sq {dup *} =  4 {sq} call").stack(), &[Value::Int(16)]);
+    assert_eq!(run("3 4 {+} call").stack(), &[Value::Int(7)]);
+    // Including where a *branch* is wanted: `if` applies what it chose.
+    assert_eq!(
+        run("'a 1 =  'b 2 =  true {a} {b} if").stack(),
+        &[Value::Int(1)]
+    );
+    // Deferring is not pinning: the name resolves when the function runs, so a
+    // rebinding is visible through a suspension taken before it. Freezing the
+    // binding instead would freeze exactly one level — the body's own mentions
+    // stay live either way — which is what made a saved recursive word run its
+    // old body against the new callee.
+    assert_eq!(
+        run("'x 1 =  {x} 'y set  'x 2 =  y").stack(),
+        &[Value::Int(2)]
+    );
+    // Nothing is checked at suspension time either, which is what lets a
+    // definition name something defined later.
+    assert_eq!(run("'g {h} =  'h {7} =  g").stack(), &[Value::Int(7)]);
+    assert_eq!(
+        run_err("{nope} call"),
+        ErrorKind::UnboundName("nope".to_string())
+    );
+}
+
+#[test]
+fn the_ampersand_is_an_ordinary_word_now() {
+    // The payoff for dropping the sigil: `&` is a name character in every
+    // position, so the vocabulary can have it back — `and`/`or`/`xor` no longer
+    // hold the operator spellings open against a sigil that is gone.
+    assert_eq!(run("'& {and} =  6 3 &").stack(), &[Value::Int(2)]);
+    assert_eq!(run("'&x 7 =  &x").stack(), &[Value::Int(7)]);
+    assert_eq!(run_err("&x"), ErrorKind::UnboundName("&x".to_string()));
 }
 
 #[test]
@@ -1106,6 +1151,11 @@ fn the_parsed_but_unevaluated_surface_names_its_milestone() {
         run_err("3 .x"),
         ErrorKind::Unimplemented("attribute access")
     );
+    // `.&x` is not a second form — it is the attribute named `&x`.
+    assert_eq!(
+        run_err("3 .&x"),
+        ErrorKind::Unimplemented("attribute access")
+    );
 }
 
 // --- V3: functions ---
@@ -1128,14 +1178,14 @@ fn call_applies_the_function_on_top() {
     // push rather than an error (§1).
     assert_eq!(run("3 call").stack(), &[Value::Int(3)]);
     // Builtins reach the same seam, so primitive-vs-function is invisible.
-    assert_eq!(run("3 4 &+ call").stack(), &[Value::Int(7)]);
+    assert_eq!(run("3 4 {+} call").stack(), &[Value::Int(7)]);
 }
 
 #[test]
 fn a_word_bound_to_a_function_runs_when_applied() {
     assert_eq!(run("'sq {dup *} =  4 sq").stack(), &[Value::Int(16)]);
-    // `&sq` fetches it instead, unapplied — application's reflective inverse.
-    assert_eq!(run("'sq {dup *} =  4 &sq call").stack(), &[Value::Int(16)]);
+    // `{sq}` suspends it instead, so `call` is what applies it.
+    assert_eq!(run("'sq {dup *} =  4 {sq} call").stack(), &[Value::Int(16)]);
 }
 
 #[test]
@@ -1237,6 +1287,19 @@ fn a_call_that_neither_binds_nor_captures_allocates_no_frame() {
 }
 
 #[test]
+fn an_inner_template_is_a_capture_and_so_allocates_one() {
+    // Instantiating a nested `{ }` captures, and a capture makes the call own
+    // its frame — where the same body without one borrows what it inherited
+    // (the test above). Since `{f}` is how a word is suspended now, that is the
+    // standing cost of the idiom: a suspension in a hot body is a frame a call.
+    let mut engine = Engine::new();
+    engine.apply(&parse("'take {{+} drop} =").unwrap()).unwrap();
+    let before = engine.env.len();
+    engine.apply(&parse("take").unwrap()).unwrap();
+    assert_eq!(engine.env.len(), before + 1);
+}
+
+#[test]
 fn a_call_that_binds_allocates_one_frame() {
     let mut engine = Engine::new();
     engine.apply(&parse("'sq {n: n n *} =").unwrap()).unwrap();
@@ -1300,6 +1363,20 @@ fn marking_reaches_closures_inside_aggregates() {
 }
 
 #[test]
+fn marking_reaches_a_closure_through_a_deferring_word() {
+    // What `&` keeps alive, now that it defers: not the value but the *frame*
+    // `xs` resolves in — so `grab`'s frame survives its own return, and the
+    // closure two aggregates down it survives with it. The wider retention is
+    // the price of late binding; a snapshot would have held only the list.
+    let mut engine = Engine::new();
+    let source = "'make {n: {n}} =  'grab {'xs [ 7 make ] =  {xs}} =  grab";
+    engine.apply(&parse(source).unwrap()).unwrap();
+    engine.collect();
+    engine.apply(&parse("call first call").unwrap()).unwrap();
+    assert_eq!(engine.stack(), &[Value::Int(7)]);
+}
+
+#[test]
 fn a_live_call_chains_frames_are_roots() {
     // Deep recursion holds every frame at once — nothing here is garbage, and
     // a collection mid-way must not decide otherwise.
@@ -1329,7 +1406,7 @@ fn each_applies_a_function_to_every_element() {
     );
     // Anything callable will do — a builtin as readily as a function.
     assert_eq!(
-        run("[ 1 2 3 ] &neg each").stack(),
+        run("[ 1 2 3 ] {neg} each").stack(),
         &[Value::Int(-1), Value::Int(-2), Value::Int(-3)]
     );
     // An empty list is not a special case.
@@ -1358,8 +1435,8 @@ fn map_flatmap_and_reduce_are_calling_conventions_on_each() {
     );
     // reduce needs no accumulator parameter: the seed sits below the working
     // area and the stack does the accumulating.
-    assert_eq!(run("0 [ 1 2 3 4 ] &+ each").stack(), &[Value::Int(10)]);
-    assert_eq!(run("1 [ 1 2 3 4 5 ] &* each").stack(), &[Value::Int(120)]);
+    assert_eq!(run("0 [ 1 2 3 4 ] {+} each").stack(), &[Value::Int(10)]);
+    assert_eq!(run("1 [ 1 2 3 4 5 ] {*} each").stack(), &[Value::Int(120)]);
     // filter, unfolded — the reason a `keep_if` adapter is wanted eventually.
     assert_eq!(
         run("[ [ 1 2 3 ] {dup 1 > { } {drop} if} each ]").stack(),
@@ -1402,7 +1479,7 @@ fn each_runs_flat_over_a_long_list() {
     // rather than nesting: iteration depth is bounded by memory, not by the
     // Rust stack. Without the tail call this overflows and aborts the process.
     let items = (1..=20_000).map(|i| i.to_string()).collect::<Vec<_>>();
-    let source = format!("0 [ {} ] &+ each", items.join(" "));
+    let source = format!("0 [ {} ] {{+}} each", items.join(" "));
     let engine = run(&source);
     assert_eq!(engine.stack(), &[Value::Int(20_000 * 20_001 / 2)]);
 }
@@ -1478,7 +1555,7 @@ fn to_str_of_a_name_is_its_bare_text() {
 
 #[test]
 fn a_bound_value_shares_but_get_plus_mutation_copies_on_write() {
-    // `foo` holds a list; `get` shares it (Rc bump). Mutating the retrieved
+    // `foo` holds a list; applying it shares it (Rc bump). Mutating the retrieved
     // copy must not corrupt the binding — the durable-alias case that made
     // us pick Rc + copy-on-write.
     assert_eq!(
@@ -1495,7 +1572,8 @@ fn a_bound_value_shares_but_get_plus_mutation_copies_on_write() {
 #[test]
 fn a_bare_word_pushes_its_binding() {
     assert_eq!(run("3 'x set x").stack(), &[Value::Int(3)]);
-    // A bare word and `get` retrieve the same value.
+    // `get` is that same application with the name arriving as a value, so the
+    // two agree by construction — both reach `apply_value`.
     assert_eq!(run("3 'x set x").stack(), run("3 'x set 'x get").stack());
 }
 
@@ -1508,18 +1586,30 @@ fn a_user_binding_shadows_a_builtin() {
 
 #[test]
 fn builtins_are_reached_by_the_same_lookup() {
-    // `+` is a word resolved to a prelude binding — no special parse case;
-    // `get` reaches it through the same lookup as any user binding.
-    assert_eq!(run("'+ get").stack()[0].to_string(), "+");
-    assert_eq!(run("'+ get").stack()[0].type_name(), "builtin");
+    // `+` is a word resolved to a prelude binding — no special parse case; the
+    // same lookup any user binding gets, reached here through `get`.
+    assert_eq!(run("3 4 '+ get").stack(), &[Value::Int(7)]);
+    // A builtin is now only ever *in* the environment, never on the stack:
+    // `&+` defers to the word rather than extracting it, so `Value::Builtin` is
+    // the prelude's representation and `apply_value` its only consumer.
+    assert_eq!(
+        Engine::new().lookup("+"),
+        Some(Value::Builtin(
+            ops::primitives().find(|p| p.name == "+").unwrap()
+        ))
+    );
+    assert_eq!(run("{+}").stack()[0].type_name(), "function");
     assert_eq!(run_err("nope"), ErrorKind::UnboundName("nope".to_string()));
 }
 
 #[test]
-fn a_captured_builtin_runs_when_applied() {
-    // `get` captures the op as a value; binding it to a name and applying
-    // that name runs it — first-class words end to end.
-    assert_eq!(run("3 4 '+ get 'plus set plus").stack(), &[7.0]);
+fn a_deferred_builtin_runs_when_applied() {
+    // `&+` is a word that applies `+`; binding it to a name and applying that
+    // name reaches the op — first-class words end to end, with no arm anywhere
+    // for "it was a primitive".
+    assert_eq!(run("{+} 'plus set 3 4 plus").stack(), &[7.0]);
+    // `'+ get` is the other half: applying the op *by name*, without writing it.
+    assert_eq!(run("3 4 '+ get").stack(), &[7.0]);
 }
 
 #[test]
