@@ -266,14 +266,16 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
     let mut i = 0;
     while let Some(c) = input[i..].chars().next() {
         let (kind, end) = match c {
+            // The two that produce nothing: a run of whitespace, and a comment
+            // to end of line — which may hold any character, delimiters
+            // included, since this lookahead wins. The newline itself is left
+            // for the whitespace arm.
             _ if c.is_whitespace() => {
-                i += c.len_utf8();
+                i = skip_to(input, i, |c| !c.is_whitespace());
                 continue;
             }
-            // A comment runs to end of line and vanishes — it may hold any
-            // character, delimiters included, since this lookahead wins.
             '#' => {
-                i = input[i..].find('\n').map_or(input.len(), |n| i + n);
+                i = skip_to(input, i, |c| c == '\n');
                 continue;
             }
             '"' => {
@@ -307,6 +309,15 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
         i = end;
     }
     Ok(tokens)
+}
+
+/// The index at or after `start` of the first character `stop` accepts, or the
+/// end of input — how the two token-less arms skip what they consume, in the
+/// same shape every other arm reports where its token ends.
+fn skip_to(input: &str, start: usize, stop: impl Fn(char) -> bool) -> usize {
+    input[start..]
+        .find(stop)
+        .map_or(input.len(), |offset| start + offset)
 }
 
 /// A run is a number when the grammar accounts for **all** of it, and a name
