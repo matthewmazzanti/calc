@@ -129,11 +129,17 @@ pub struct Token {
     pub span: Span,
 }
 
-/// The token a character is when it stands alone: the brackets and the `:`.
-/// `"` and `#` are fixed too, but they open a *region* of text (a string, a
-/// comment) that the lookahead in [`tokenize`] handles instead. The sigils are
-/// not here — they are prefixes, and bind to the run after them.
-fn delimiter(c: char) -> Option<TokenKind> {
+/// The token a **standalone** character is — one that is its own token whatever
+/// it abuts, so `word[word` is three tokens.
+///
+/// This is the single statement of that set, and it answers two questions at
+/// once: *what token is this* (for [`tokenize`]) and *is this character in the
+/// set* (for [`breaks_word`]). Keeping them one function is what stops them
+/// disagreeing. Were the mapping inlined at the call site instead, a character
+/// present there but missing from `breaks_word` would lex correctly at a token
+/// start and be swallowed by a run anywhere else — a difference nothing would
+/// catch.
+fn standalone(c: char) -> Option<TokenKind> {
     Some(match c {
         ':' => TokenKind::Colon,
         '{' => TokenKind::Open(Bracket::Brace),
@@ -146,17 +152,25 @@ fn delimiter(c: char) -> Option<TokenKind> {
     })
 }
 
-/// Whether `c` ends a run — equivalently, the characters no name may contain:
-/// whitespace, a standalone fixed character, the `.` that is the attribute
-/// operator, and the `"`/`#` that open a string or a comment.
+/// Whether `c` ends a run — equivalently, the characters no name may contain
+/// (`language-v2.md` §4). Four categories, and each is in the set for its own
+/// reason:
 ///
-/// **`'` and `&` are absent**, and that is what makes them position-sensitive
-/// without a rule saying so. A run swallows them (`x'`, `a&b`, `don't`), so the
-/// scanner only ever *lands* on one where a token genuinely begins — after
-/// whitespace, after a delimiter, or at the start of input. There they are the
-/// prefix sigils; nowhere else can they be reached.
+/// - **whitespace**, which separates by definition;
+/// - the [`standalone`] characters, each its own token;
+/// - **`.`**, which is never a token by itself — it always binds to the name or
+///   number after it — but must still end whatever run precedes it, or `obj.x`
+///   would be one name;
+/// - **`"` and `#`**, which open a region of text the lookahead owns.
+///
+/// **`'` and `&` are deliberately absent**, and that is what makes them
+/// position-sensitive without a rule saying so. A run swallows them (`x'`,
+/// `a&b`, `don't`), so the scanner only ever *lands* on one where a token
+/// genuinely begins — after whitespace, after a standalone character, or at the
+/// start of input. There they are the prefix sigils; nowhere else can they be
+/// reached.
 fn breaks_word(c: char) -> bool {
-    c.is_whitespace() || delimiter(c).is_some() || c == '.' || c == '"' || c == '#'
+    c.is_whitespace() || standalone(c).is_some() || matches!(c, '.' | '"' | '#')
 }
 
 /// Whether a `.` at `index` has anything on its left to attach to. `.` is a
@@ -294,7 +308,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
             }
             '.' => read_dot(input, i)?,
             // A standalone character, or else a run to classify.
-            _ => match delimiter(c) {
+            _ => match standalone(c) {
                 Some(kind) => (kind, i + c.len_utf8()),
                 None => {
                     let end = read_word(input, i);
