@@ -245,7 +245,8 @@ This retires the per-token `Element::parse` model. It is the largest single piec
 > The `Rc`-spine prose below is kept for the reasoning it carries — the cycle
 > theorem, why data wants a refcount, why the two populations differ.
 
-The frame representation converged on the **`Rc`-spine split** (`src/rc_heap.rs`;
+The frame representation converged on the **`Rc`-spine split** (sketched in a
+`src/rc_heap.rs` since removed — see git history;
 see `memory-model.md`'s top note), *not* the slotmap arena the V3/V4 prose below
 still describes. The arena reasoning — the cycle theorem, non-owning ids — remains
 correct and is kept for the record, but the representation is now:
