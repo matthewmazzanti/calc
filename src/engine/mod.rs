@@ -10,15 +10,15 @@
 //! **Atomicity is the caller's, not the op's.** An op may leave the stack
 //! half-consumed when it fails (it pops before it type-checks), and a batch may
 //! have bound names before failing, so there is no "operands intact on error"
-//! guarantee. Instead the caller takes a [`State`] before applying and puts it
-//! back on failure — a value copy of the stack and the whole environment.
+//! guarantee. Instead the caller **clones the engine** before applying and puts
+//! the copy back on failure.
 //!
-//! Putting it back is an *assignment*, because a closure names its frame by
-//! [`FrameId`] rather than pointing at it: an old [`Env`] means exactly what it
-//! meant, and every frame is covered rather than only the one the REPL mutates
-//! (`memory-model.md` §0). `Engine` is deliberately not `Clone` — a copy would
-//! duplicate the frame-id counter, and two engines minting the same id is the
-//! one thing the model cannot survive.
+//! That works — and is cheap — because a closure names its frame by [`FrameId`]
+//! rather than pointing at it (`memory-model.md` §0). Cloning an [`Env`] is a
+//! pointer bump per frame; the frames stay shared until one engine writes to
+//! one, and then only that frame is copied. And because an id means something
+//! only *within* the environment it was minted in, a whole-engine copy is
+//! internally consistent with nothing left to reconcile.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -31,7 +31,7 @@ mod token;
 mod value;
 
 pub use error::{CalcError, ErrorKind, Outcome, ParseError, ParseErrorKind, Trace};
-pub use frame::{Bindings, Env, FrameId, State};
+pub use frame::{Bindings, Env, FrameId};
 pub use program::{parse, Element, Region};
 pub use token::Span;
 pub use value::{MarkKind, Value};
@@ -84,29 +84,32 @@ impl std::fmt::Display for Primitive {
 /// The calculator engine: the RPN stack, plus (later) evaluation settings such
 /// as angle mode, display precision, or named registers.
 ///
-/// Ops take `&mut self` and mutate in place; the caller wraps a batch in a
-/// [`State`] taken beforehand and puts it back on failure — see the module docs.
+/// Ops take `&mut self` and mutate in place; the caller clones one beforehand
+/// and puts it back on failure — see the module docs.
 ///
-/// Deliberately **not `Clone`**. The snapshot is [`Engine::state`], which copies
-/// only what a line can change; an engine copy would also duplicate the id
-/// counter, and two engines minting the same [`FrameId`] is the one thing the
-/// model cannot survive.
-#[derive(Debug)]
+/// **`Clone` is the snapshot**, and cheap: the environment is a map of shared
+/// frames, so a copy is one pointer bump each and a frame is only duplicated
+/// when one of the two engines writes to it. Snapshotting the whole engine
+/// rather than a hand-picked subset is deliberate — a state that had to be kept
+/// in step with the fields by hand would silently stop covering the next one
+/// added (an angle mode, a display precision), and that failure is invisible.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Engine {
     stack: Stack,
     /// The call stack — see [`Activation`]. Empty except while [`Engine::run`]
     /// is inside a batch.
     calls: Vec<Activation>,
-    /// Every frame that exists. Cloned wholesale by [`Engine::state`], which is
-    /// cheap because frames are shared and copied on write.
+    /// Every frame that exists, by id.
     env: Env,
     /// The module frame: the REPL's own scope, where top-level binding lands.
     /// Its parent is the global frame holding the prelude, so the chain from
     /// here reaches every builtin (§8).
     module: FrameId,
-    /// The next frame id to hand out. **Outside the snapshot on purpose**: undo
-    /// must not rewind it, or a later line would mint an id that a value in the
-    /// discarded future still names (`memory-model.md` §0.4).
+    /// The next frame id to hand out. Rewound by a snapshot like everything
+    /// else, which is safe because **an id only means anything inside the
+    /// environment it was minted in** — a value and the `Env` it names are
+    /// always copied and restored together, so a reused id after an undo lands
+    /// in a map where the old frame never existed.
     next_frame: FrameId,
 }
 
@@ -116,9 +119,10 @@ pub struct Engine {
 /// the new frame's parent to the function's captured environment rather than to
 /// its caller.
 ///
-/// The stack is empty at every line boundary, which is what lets [`Engine`]'s
-/// equality and the transaction snapshot ignore it.
-#[derive(Debug, Clone)]
+/// The stack is empty at every line boundary, so a snapshot always copies an
+/// empty one — it is part of `Engine`'s equality only because leaving a field
+/// out of that is the mistake the whole-engine snapshot exists to prevent.
+#[derive(Debug, Clone, PartialEq)]
 struct Activation {
     template: Rc<[Element]>,
     ip: usize,
@@ -449,30 +453,6 @@ impl Engine {
         self.next_frame += 1;
         self.env.insert(id, parent, Bindings::new());
         id
-    }
-
-    /// Everything a line can change, copied by value — take one before applying
-    /// a batch, put it back if the batch fails. Cloning the environment is a
-    /// pointer bump per frame; the frames stay shared until one of the two
-    /// versions writes to one, and then only that frame is copied.
-    pub fn state(&self) -> State {
-        State {
-            stack: self.stack.clone(),
-            env: self.env.clone(),
-        }
-    }
-
-    /// Undo a failed (or undone) line: put the stack and environment back, and
-    /// drop any half-run call stack.
-    ///
-    /// An assignment, not a repair. A closure names its frame by id, so an old
-    /// environment means exactly what it meant — and *every* frame is covered,
-    /// not just the one the REPL mutates. The id counter is untouched, so no
-    /// later frame can take an id a discarded value still names.
-    pub fn restore(&mut self, state: &State) {
-        self.stack.clone_from(&state.stack);
-        self.env.clone_from(&state.env);
-        self.calls.clear();
     }
 
     /// Apply a looked-up value: a callable (a builtin, later a function) runs;

@@ -107,22 +107,6 @@ impl Env {
 /// A frame's bindings before it is installed — the prelude arrives this way.
 pub type Bindings = HashMap<Rc<str>, Value>;
 
-/// Everything one line can change, copied by value: the data stack and the
-/// environment. Taken before a line runs and put back if it fails, which is how a
-/// failed line costs nothing (`language-v2.md` §10).
-///
-/// Restoring is an assignment, not a repair. Because a closure names its frame by
-/// id, putting an old [`Env`] back is enough — every id still means the same
-/// frame, and every frame is covered rather than just the one the REPL mutates.
-/// That is the difference from a design where frames are shared pointers: there,
-/// a snapshot has to write bindings *into* the live frame to keep its identity,
-/// and covers only the frames it knows to visit.
-#[derive(Debug, Clone, PartialEq)]
-pub struct State {
-    pub(super) stack: Vec<Value>,
-    pub(super) env: Env,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

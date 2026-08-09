@@ -303,13 +303,13 @@ fn errors_carry_the_trace_of_the_failing_command() {
 }
 
 #[test]
-fn a_failed_batch_is_rolled_back_from_a_state() {
+fn a_failed_batch_is_rolled_back_by_the_copy_taken_first() {
     // Atomicity is the caller's: a failed batch leaves the engine part-way
-    // through, and the `State` taken beforehand puts it back. The engine is
-    // *not* copied — its frames are shared handles, so restoring assigns values
-    // into the live ones and a closure's captured frame keeps its identity.
+    // through, and the copy taken beforehand puts it back. A copy really is
+    // independent — frames live in a map keyed by id and are copied on write —
+    // so this is an assignment with nothing left to reconcile.
     let mut engine = run("1 'x set");
-    let before = engine.state();
+    let before = engine.clone();
     assert_eq!(
         engine
             .apply(&parse("2 'y set +").unwrap())
@@ -319,28 +319,28 @@ fn a_failed_batch_is_rolled_back_from_a_state() {
     );
     // Mid-failure the damage is real — `y` was bound before `+` failed.
     assert_eq!(engine.lookup("y"), Some(Value::Int(2)));
-    engine.restore(&before);
+    engine = before;
     assert_eq!(engine.stack(), &[] as &[Value]);
     assert_eq!(engine.lookup("x"), Some(Value::Int(1)));
     assert_eq!(engine.lookup("y"), None);
 }
 
 #[test]
-fn a_restore_is_an_assignment_and_ids_do_not_rewind() {
-    // Rollback puts an old environment back wholesale — no repair, because a
-    // frame is named by id and an old `Env` means exactly what it meant. What
-    // must *not* rewind is the id counter: a frame minted after an undo has to
-    // get a fresh id, or it would take one a discarded value still names.
+fn a_snapshot_is_the_whole_engine_so_nothing_can_be_left_out() {
+    // Everything a line touches rides along, including the frames it allocated
+    // and the id counter. Rewinding the counter is safe precisely because an id
+    // means something only inside the environment it was minted in: a value and
+    // the `Env` naming it are always copied and restored together.
     let mut engine = Engine::new();
-    let before = engine.state();
+    let before = engine.clone();
     engine.apply(&parse("1 'x set").unwrap()).unwrap();
-    let minted = engine.new_frame(None);
-    engine.restore(&before);
+    let minted = engine.new_frame(Some(0));
+    engine = before.clone();
     assert_eq!(engine.lookup("x"), None);
-    assert!(
-        engine.new_frame(None) > minted,
-        "the id counter rewound with the state"
-    );
+    assert_eq!(engine, before);
+    // The id is free again, and the frame it named went with the state it was
+    // minted into.
+    assert_eq!(engine.new_frame(Some(0)), minted);
 }
 
 #[test]

@@ -6,8 +6,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::engine::{
-    self, CalcError, Element, Engine, ErrorKind, Outcome, Primitive, State, Value, ADD, DIV, DUP,
-    MUL, SUB,
+    self, CalcError, Element, Engine, ErrorKind, Outcome, Primitive, Value, ADD, DIV, DUP, MUL, SUB,
 };
 use crate::history::History;
 
@@ -153,14 +152,14 @@ impl LineEditor {
 /// unit of history, so undo/redo restore the state *and* the info-bar label
 /// together — each one remembers how it was reached.
 ///
-/// It holds a [`State`] — a value copy of the stack and bindings — rather than
-/// an `Engine`, because the engine is a live thing now: its frames are shared
-/// handles, so a copy of one would share what it was supposed to preserve.
-/// Undo puts values *back into* the live engine instead of swapping it out.
+/// It holds a whole `Engine`, which is a copy rather than a share: frames live
+/// in a map keyed by id and are copied on write, so cloning an engine gives one
+/// that diverges from this instant on. Snapshotting everything means no field
+/// can be added to the engine and quietly left out of undo.
 #[derive(Debug)]
 struct Snapshot {
-    state: State,
-    /// The command that produced `state` (empty for the initial state).
+    engine: Engine,
+    /// The command that produced `engine` (empty for the initial state).
     cmd: String,
 }
 
@@ -186,7 +185,7 @@ impl App {
         let engine = Engine::new();
         Self {
             history: History::new(Snapshot {
-                state: engine.state(),
+                engine: engine.clone(),
                 cmd: String::new(),
             }),
             engine,
@@ -476,39 +475,33 @@ impl App {
         self.update(cmd, |engine| f(engine).map_err(CalcError::from));
     }
 
-    /// Run a transform against the live engine as one transaction: take a
-    /// [`State`] first, and on failure put it back. On success — if the state
+    /// Run a transform against the live engine as one transaction: copy the
+    /// engine first, and on failure put the copy back. On success — if the state
     /// actually changed — commit it with its `cmd` as an undo point. Returns
     /// success.
-    ///
-    /// The engine is mutated in place rather than copied, because its frames are
-    /// shared handles; rollback restores *values into* the live frames, which is
-    /// what keeps a closure's captured environment intact across a failed line.
     fn update(&mut self, cmd: String, f: impl FnOnce(&mut Engine) -> Outcome) -> bool {
-        let before = self.engine.state();
+        let before = self.engine.clone();
         match f(&mut self.engine) {
+            Ok(()) if self.engine == before => true, // a no-op is not a new state
             Ok(()) => {
-                let after = self.engine.state();
-                // Commit only if the state actually changed — a no-op command
-                // is not a new state, so it neither records history nor relabels
-                // the current one.
-                if after != before {
-                    self.history.commit(Snapshot { state: after, cmd });
-                }
+                self.history.commit(Snapshot {
+                    engine: self.engine.clone(),
+                    cmd,
+                });
                 true
             }
             Err(e) => {
-                self.engine.restore(&before);
+                self.engine = before;
                 self.notice = Some(Notice::Error(e));
                 false
             }
         }
     }
 
-    /// Restore the previous snapshot (state and its `cmd`) into the engine.
+    /// Restore the previous snapshot (engine and its `cmd`) as the live state.
     fn undo(&mut self) {
         if self.history.undo() {
-            self.engine.restore(&self.history.current().state);
+            self.engine = self.history.current().engine.clone();
         } else {
             self.notice = Some(Notice::Note("nothing to undo".to_string()));
         }
@@ -517,7 +510,7 @@ impl App {
     /// Re-apply the most recently undone snapshot.
     fn redo(&mut self) {
         if self.history.redo() {
-            self.engine.restore(&self.history.current().state);
+            self.engine = self.history.current().engine.clone();
         } else {
             self.notice = Some(Notice::Note("nothing to redo".to_string()));
         }

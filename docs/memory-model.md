@@ -150,7 +150,7 @@ enum Value {
 }
 
 struct Engine { stack: Vec<Value>, env: Env, module: FrameId, next: FrameId, … }
-struct State  { stack: Vec<Value>, env: Env }    // a snapshot: clone the map
+// a snapshot is `engine.clone()` — the map copy is a pointer bump per frame
 ```
 
 Everything follows from the one substitution: **a closure names its environment
@@ -235,22 +235,28 @@ all hold for the same reason. The recursive call allocates frame 3 with parent
 
 ### 0.4 Undo is the reason, and it is now structural
 
-A snapshot is `State { stack, env }` — cloning the map is one `Rc` bump per
-frame, and unchanged frames stay shared. Undo assigns the map back. No
-restore-into-a-live-frame, no identity to preserve by hand, and **every** frame is
-covered rather than just the module frame, so the guarantee doesn't rest on §8's
-"only the current frame is mutable" holding forever (the debt §8 flags for
+**A snapshot is a clone of the whole engine.** Cloning the map is one `Rc` bump
+per frame and unchanged frames stay shared, so it is cheap; undo assigns it back.
+No restore-into-a-live-frame, no identity to preserve by hand, and **every** frame
+is covered rather than just the module frame — so the guarantee doesn't rest on
+§8's "only the current frame is mutable" holding forever (the debt §8 flags for
 continuations and generators).
 
-Two things must sit *outside* the snapshot:
+Snapshotting *everything* rather than a chosen subset is the point. A `State`
+that had to be kept in step with the engine's fields by hand would silently stop
+covering the next one added — an angle mode, a display precision — and that
+failure is invisible: the field simply wouldn't undo.
 
-- **`next: FrameId`** — monotonic and never reset by undo. If it rolled back, a
-  post-undo line would mint an id that a value in the discarded future still
-  names. Kept outside, a stale id resolves to *nothing* rather than to the wrong
-  frame — what slotmap's generational keys buy, for free.
-- The reachability filter's roots must include **the data stack**, since a
-  closure on the stack (or inside a list — §4.1's invariant 2) may be the only
-  thing keeping its frame alive.
+**The frame-id counter rides along too**, and rewinding it is safe. It looks
+unsafe — a post-undo line re-mints an id that a value in the discarded future
+still names — but that value lives in *that version's* `Env`, and the reused id
+lands in a map where the old frame never existed. A value and the environment it
+names are always copied and restored together, which is what "an id means
+something only within a version" actually buys. Nothing has to sit outside.
+
+One thing the reachability filter must remember: its roots include **the data
+stack**, since a closure on the stack (or inside a list — §4.1's invariant 2) may
+be the only thing keeping its frame alive.
 
 ### 0.5 Reclamation, honestly
 
