@@ -863,6 +863,163 @@ interpreter.
 
 ---
 
+## 9. The native boundary — suspension, not re-entry
+
+> **Status: designed, implemented, measured, not merged.** Two branches carry it:
+> `native-each` (one hand-written combinator) and `native-resumables` (the general
+> interface, plus `times` as a second user). `each` stays in-language on `main` —
+> see "What this is worth" at the end. The mechanism is recorded here because it
+> retires a parked question rather than deferring it again, and because the two
+> hazards it avoids apply to *any* native code that calls a language callable.
+
+### 9.1 The governing fact: two liveness disciplines, one Rust stack
+
+Everything so far assumes a `Value` lives either on the data stack or in a frame.
+Native code breaks that assumption, and the break is narrower — and sharper — than
+"Rust has no call frame."
+
+Rust *does* have a call frame, and it works for most of a `Value`. Hold an
+`Rc<Vec<Value>>` in a native local and the `Vec`, its strings, and its templates all
+stay alive; refcounting follows Rust's stack automatically. What does not follow it
+is the other half of §0:
+
+```rust
+Function { template: Template, env: FrameId }
+```
+
+`env` is an **id, not an `Rc<Frame>`**. Holding that `Value` in Rust keeps the value
+alive but does nothing for the id, because the only thing that keeps a `FrameId`
+valid is reachability from `Env::retain`'s roots. So:
+
+| | kept alive by | safe in a native local? |
+|---|---|---|
+| lists, strings, templates | `Rc` | yes, automatically |
+| closure environments | reachability from roots | **no** |
+
+That split is exactly what §0 bought on purpose — naming frames by id is what makes
+`Engine::clone` a pointer bump per frame — and the native boundary is where it is
+paid for. The failure mode is quiet: `Env::lookup` walks `frames.get(id)`, misses,
+and returns `None`, so a swept frame surfaces as `unbound name: n` for a name that is
+definitely bound. Not a panic, not a dangle. A wrong answer.
+
+**Rust's safety net is what creates the blind spot.** The borrow checker will not let
+a native op hold a `&Value` into `self.stack` across a `&mut self` call, so the op is
+forced to `pop()` an owned value — which is precisely the move that hides it from the
+mark phase. The escape hatch and the bug are the same line of code.
+
+### 9.2 Why not run the callee synchronously
+
+The natural shape for a post-work combinator (`each` must call `f` and then keep
+going) is a re-entrant helper: `push_call`, then run the loop until the callee's
+activation pops. That was the parked `run_function` in `direction-v2.md`. It has two
+hazards, and the one that was recorded is the smaller.
+
+**Depth.** A synchronous call keeps a Rust frame live across the callee, so nesting
+depth moves from the heap `Vec` of activations onto the Rust stack. That depth is
+data-driven — `each` nests once per level of data nesting, so a tree walk over user
+input decides how deep it goes — and Rust stack overflow is a process abort, not a
+catchable `Err`. In a calculator with undo history that is the session, bypassing the
+clone-and-restore transaction that exists to prevent exactly this. For scale: the
+evaluator today runs `deep 1e6` (a million-deep *non-tail* recursion) in 113MB of
+heap.
+
+**Rooting.** §9.1. The operands are invisible while the call runs.
+
+Both are properties of synchronous re-entry, not of the problem. Suspension avoids
+them together.
+
+### 9.3 The mechanism
+
+A post-work native op pushes its *state* onto the activation stack and returns. The
+loop steps it, and steps it again each time whatever it called comes back.
+
+```rust
+enum Activation {
+    Language { template, ip, frame, owns_frame },
+    Native(Box<Resumable>),
+}
+```
+
+- **Depth** stays in the heap `Vec`, so it is bounded by memory like everything else.
+  Verified: `each` in tail position of a recursive walk completes 1e6 levels at flat
+  7.9MB.
+- **Rooting** is free, because `collect` already walks `self.calls`.
+- **Error unwind** is free: there are no Rust frames to unwind through, so the
+  existing "clear the call stack, attach a trace" path covers it unchanged.
+- **TCO composes.** A step that has just dispatched its last piece of work reports
+  exhausted, so the call it makes replaces its own activation. Without this, an `each`
+  in tail position of a recursive walk piles up one dead activation per level.
+
+### 9.4 The interface
+
+One variant and one loop arm, not one per combinator. A resumable is the same shape a
+`Primitive` already is — a name and a fn pointer, *data* rather than an enum tag:
+
+```rust
+struct Resumable { name: &'static str, step: fn(&mut Engine) -> Result<(), ErrorKind>, state: State }
+struct State { values: Vec<Value>, counters: [usize; 2], exhausted: bool }
+```
+
+`Clone` and `PartialEq` derive normally, so the snapshot machinery needs no
+`clone_box`/`Any` dance — which a `Box<dyn Resumable>` would. (`PartialEq` on `Engine`
+turns out to be used only by tests, so trait objects were more viable than first
+assumed. The fn-pointer form was still preferred: it matches the file's existing
+idiom and costs less.)
+
+**Rooting is structural, not remembered.** Everything a suspended op holds goes in
+`State::values`, so `collect` roots it without knowing which op it is:
+
+```rust
+if let Activation::Native(r) = activation { held.extend(r.state.values.iter()); }
+```
+
+There is nowhere else to put a value, so a new combinator *cannot* silently fail to be
+collectable. Given the failure is a wrong answer rather than a crash, designing the
+mistake out beats documenting it.
+
+**The one contract left is `exhausted`**, which a step sets when dispatching its last
+work. Getting it wrong costs no correctness — the loop pops on the next turn either
+way — only flatness, which a depth test catches.
+
+### 9.5 Two costs, both found only by measuring
+
+Neither was visible in correctness tests. Both were ~20% regressions on *every*
+program, including ones that never iterate.
+
+**An enum is as wide as its widest variant.** Inline, the suspended state took
+`Activation` from 32 to 40 bytes. `deep 1e6` holds a million activations, so that is
++8MB there and a fifth of the throughput everywhere. Boxing the rare variant — one
+allocation per *suspension*, not per step — recovers all of it. `main` should keep
+`Activation` at 32 bytes; the branches assert it.
+
+**A shared "what to do next" value costs more than it tidies.** Funnelling both
+activation kinds through one `Step` enum before dispatch adds a move of the element
+per loop turn, which measured as the other ~20%. Isolated with a probe carrying the
+enum but *no* second variant, which reproduced the whole regression. The two kinds are
+dispatched by separate paths instead.
+
+The general lesson for this loop: it is sensitive to changes that look free. Bench
+against `main` before believing any restructuring of it is neutral.
+
+### 9.6 What this is worth
+
+With the interface in place, `bench.py` is unchanged against `main` (all cases within
+noise), and `each` runs **3–5×** an in-language definition over `nth`/`length` —
+roughly 130–260 ns/element against 650–810. The generic form is within noise of a
+hand-written variant, so the indirect call is free. Peak memory is identical either
+way: §4's collector absorbs the in-language version's frame-per-element churn.
+
+Against that: it is ~190 lines of engine, `values[0]` is a list by convention rather
+than by type, and 3–5× on ~800 ns is imperceptible at the list sizes a calculator
+sees — tens of elements, not hundreds of thousands.
+
+So `each` stays in-language for now. What changed is the *reason*: not "going native
+means hand-rolling CPS per combinator where mistakes dangle `FrameId`s" — that is no
+longer true — but simply that the win does not yet pay for the code. If a workload
+ever asks for it, the branches are ready and the hazards are already tested.
+
+---
+
 ## Appendix A — the `Weak`-registry model in full
 
 The alternative of §5.3 in code. Seeing it concretely is the argument: the two

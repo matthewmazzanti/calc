@@ -601,8 +601,38 @@ The parameters are `fn`, not Factor's `quot`; because ours capture, `curry` need
 ### 12.2 Flow control
 
 Probably nothing but functions. `if` is `( bool fn fn -- )` and applies one of its arguments — an
-ordinary word, not a special form. `when`, `unless`, `cond` follow. Iteration likewise: `each map
-filter reduce times while until`.
+ordinary word, not a special form. `when`, `unless`, `cond` follow.
+
+**Iteration is one word.** `each` ( lst fn -- … ) applies `fn` to each element and leaves whatever
+`fn` leaves. Because a function may leave any number of values and `[ ]` is a runtime mark (§6), the
+usual family is not a set of mechanisms but a set of calling conventions on that one word:
+
+```
+lst &f each              forEach     f : 1 -> 0
+[ lst &f each ]          map         f : 1 -> 1
+[ lst &f each ]          flatMap     f : 1 -> n     — the same code
+seed lst &f each         reduce      f : 2 -> 1     — the seed sits below the region
+```
+
+Map and flatMap coincide because nothing intermediate is ever built to flatten. Reduce needs no
+accumulator parameter because the stack is the accumulator.
+
+**A `map` word is not added, because it would express less.** Opening its own region would give up
+what §6 establishes — that the mark is an ordinary stack value — and so forbid a region holding two
+producers, or literals beside produced values, or `1 2 [unrot lst &f each]` reaching backwards. It
+would also forbid the plainest use of all, `lst &f each` with no region, where results simply land
+on the stack. Where the familiar name is wanted, §7's per-type attribute tables supply `lst.map`,
+which type-dispatches as a free word could not.
+
+Filtering is an *element-level* adapter rather than an iteration word — `x -- bool` to
+`x -- x|nothing` — which keeps the iteration vocabulary at one word and fuses with a map in a single
+pass. `times`, `while`, and `until` remain open; none is settled, and each should justify itself
+against `each` plus recursion rather than being assumed.
+
+**Arity is unchecked, and that is the price.** Since map and flatMap are the same code, a `f` that
+leaves two values where one was meant yields a longer list and no complaint. Nothing in the mark can
+distinguish "f pushed 2" from "two iterations pushed 1." Whether a checked form is wanted depends on
+§12.1's unsettled stack-effect story.
 
 ### 12.3 Booleans and comparisons
 

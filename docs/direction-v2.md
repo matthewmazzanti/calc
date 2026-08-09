@@ -104,7 +104,7 @@ Carrying M0–M3b forward unchanged; renumbering from the front end outward.
 | **V3** | Functions: `Value::Function { template, env: FrameId }`, a frame per application, `call`/`if`, `&f`, `=` binder, `=`→`==`, TCO, `Trace` as a call chain | **done** — the memory model it rests on is `memory-model.md` §0 |
 | **V4** | A `retain(reachable)` filter over the frame map, run *mid-line* on a growth threshold. *Not* a cycle collector — see `memory-model.md` §0.2 | **done** (`Env::retain`, `Engine::collect`) |
 | **V5** | Dicts/objects: `( )` second mark kind, `.` access, methods & receivers, `put`, per-type attribute tables (dicts are `Rc`/COW, like lists) | todo |
-| **V6** | Vocabulary, mostly in-language: startup-parsed prelude, `dip keep bi`, `if when cond`, `each map filter reduce`; move derived stack words out of Rust | todo |
+| **V6** | Vocabulary, mostly in-language: startup-parsed prelude, `dip keep bi`, `if when cond`, `each` (the one iteration word); move derived stack words out of Rust | todo |
 
 V1–V4 are the spine — closures run at V3, their memory reclaimed at V4. V5–V6 build on it.
 
@@ -324,20 +324,41 @@ dynamic chain never needs to be an enumerable GC root.
   *before* pushing the callee (replace, don't stack), or tail recursion regrows the
   call stack and the VM's whole purpose is lost.
 
-**Deferred — `run_function`.** A re-entrant helper (`push_call` + `run_until(depth)`)
-that runs a callable to completion synchronously, for *native* post-work combinators
-if speed ever demands them. Skipped for now (combinators go in-language). Its one
-hazard, recorded for when we return: it keeps the Rust caller's frame live across the
-call, so it **cannot tail-call its callee** — it must never be used for `if`/`call`
-or any tail position, which would silently reintroduce the Rust-stack overflow the VM
-exists to avoid. Rule: tail position → `push_call`; post-work → `run_function`.
+- **Post-work combinators suspend** — see below. A native op that must do something
+  *after* calling a callable pushes its state onto the activation stack and returns,
+  rather than running the callee to completion.
 
-**Parked conversation — Rust/callable interfacing.** The general surface where native
-Rust and language callables meet is only sketched. Open when it's needed: the
-`Primitive` signature's evolution, how a native op *schedules* vs. *runs* a callable,
-how post-work/continuations are represented, error-unwind across the boundary, and
-whether native combinators are ever worth their complexity over the in-language path.
-Revisit before writing any native code that invokes a callable beyond `if`/`call`.
+**Retired — `run_function`.** This slot used to hold a deferred re-entrant helper
+(`push_call` + `run_until(depth)`) that would run a callable to completion
+synchronously, for native post-work combinators if speed ever demanded them, with one
+recorded hazard: it keeps the Rust caller's frame live across the call and so cannot
+tail-call its callee.
+
+**That hazard was the smaller of two, and both are properties of synchronous re-entry
+rather than of the problem.** Suspension avoids them, so `run_function` is not
+deferred but unnecessary — see `memory-model.md` §9 for the mechanism and the
+measurements. In brief:
+
+- **Depth.** A Rust frame held across the callee puts nesting depth on the Rust stack.
+  Depth there is data-driven (a tree walk nests once per level), and overflow is a
+  process abort, not a catchable error — in a calculator with undo history, the
+  session. The evaluator today runs 1e6-deep non-tail recursion in a heap `Vec`.
+- **Rooting.** A `Value` held in a Rust local is invisible to `Env::retain`. `Rc`
+  keeps the *list* alive; it does not keep the `FrameId` inside a `Value::Function`
+  **valid**, because only reachability from the mark phase does. This surfaces as a
+  spurious `unbound name`, not a crash. Rust's borrow checker forces the operand to be
+  owned — the escape hatch and the bug are the same line.
+
+**Rule, replacing the old one:** tail position → `push_call`; post-work → suspend.
+Nothing native runs a callable to completion.
+
+**Settled — Rust/callable interfacing.** This was parked as an open conversation
+covering the `Primitive` signature's evolution, schedule-vs-run, how post-work is
+represented, error unwind, and whether native combinators earn their complexity. It
+is now answered by the `Resumable` interface (`memory-model.md` §9): a native op is a
+name, a fn pointer, and a `State`, exactly as a `Primitive` is a name and a fn
+pointer. Error unwind needs no special handling, because there are no Rust frames to
+unwind through — the existing "clear the call stack and attach a trace" path covers it.
 
 ### V3 — functions, frames, `call`, `&`, `=` (v2's M3c)
 
@@ -540,10 +561,73 @@ fall out. Naturally its own milestone.
 
 A **startup-parsed prelude** bound into `base`: move the derived stack words
 (`over rot unrot nip tuck dupd 2dup 2drop`) out of the Rust table, leaving a true
-primitive core. Add the combinators (`dip keep bi bi* bi@`), flow control
-(`if when unless cond`) as ordinary words over a real boolean, and iteration
-(`each map filter reduce times while until`). `apply_value` is already the single
-"run any callable" seam, so primitive-vs-function stays transparent.
+primitive core. Add the combinators (`dip keep bi bi* bi@`) and flow control
+(`if when unless cond`) as ordinary words over a real boolean. `apply_value` is
+already the single "run any callable" seam, so primitive-vs-function stays
+transparent.
+
+**Iteration is one word, not four.** This slot used to read `each map filter
+reduce times while until`. It should read **`each`**, because in a language where
+a function may leave any number of values and `[ ]` is a runtime mark, the rest
+are not separate mechanisms — they are `each` under different calling
+conventions:
+
+```
+lst &f each              forEach     f : 1 -> 0
+[ lst &f each ]          map         f : 1 -> 1
+[ lst &f each ]          flatMap     f : 1 -> n     — the same code
+seed lst &f each         reduce      f : 2 -> 1     — the stack is the accumulator
+```
+
+Map and flatMap coincide because there is no intermediate container to flatten:
+`f` pushing two values is indistinguishable from two iterations pushing one.
+Reduce needs no accumulator parameter because the seed simply sits below the
+working area. Neither is a trick; both fall out of §6 and of the stack.
+
+**`map` would be strictly *less* expressive than `[ … each ]`**, which is the
+argument against adding it. A `map` that opens its own region gives up the mark's
+defining property — that it is an ordinary stack value — and with it:
+
+```
+[ lstA &f each  lstB &g each ]   two producers, one list, one allocation
+[ 0 lst &f each 99 ]             literals beside the produced values
+1 2 [ unrot lst &f each ]        §6's reach back over values that predate the region
+lst &f each                      no region at all — results just land on the stack
+```
+
+The last line matters most in a calculator: the stack *is* the working area, so
+"no brackets" is not a mistake, it is the other legitimate use. Welding
+collection to iteration would price it out.
+
+**Filter is the exception, and it is not an iteration word.** Unfolded it is
+`{dup p { } {drop} if}`, which is genuinely bad to write repeatedly — but the
+fix belongs at the *element* level, an adapter from `x -- bool` to `x -- x|nothing`,
+so the iteration vocabulary stays at one word and the adapter composes into a
+single fused pass:
+
+```
+'keep_if {p: {dup p { } {drop} if}} =
+[ lst {3 >} keep_if each ]
+{3 >} keep_if 'k set   [ lst {1 + k} each ]      map and filter, one pass
+```
+
+(Name unsettled — reusing `filter` reads well but will mislead. Hoist the adapter
+out of the loop or it builds a closure per element.)
+
+Two further consequences. **`map` should come from the dot, not the prelude:**
+V5's per-type attribute tables already give `lst.map`, which type-dispatches as a
+free word could not. And **`each` written over `length`/`nth` is generic for
+free** the moment those attributes exist — strings, dicts, ranges, user types —
+where a native one would need an arm per type.
+
+**Where `each` itself lives.** In-language, over `length` and `nth`, recursing
+flat by TCO — roughly 840 ns/element, about 2× a bare loop iteration. Not
+`first`/`rest`: `rest` is O(n) here (the list is bound, so `Rc::make_mut` clones),
+making the obvious cons-style definition quadratic — measured 160 ms → 2.8 s from
+n=2000 to n=16000, against 52 ms → 201 ms for the index form. A native `each`
+runs 3–5× faster and is fully designed and tested (`memory-model.md` §9), but the
+absolute cost is imperceptible at the list sizes a calculator sees, so it waits
+for a workload that asks.
 
 ## Costs and debts carried into v2
 

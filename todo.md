@@ -104,3 +104,30 @@
 ## Deferred (from earlier)
 - [ ] Negative-literal entry — a change-sign key (leading `-` is subtraction).
 - [ ] Indicator when the stack is taller than the visible rows (cap is 10).
+
+## Iteration and the native boundary (designed, not merged)
+
+- [ ] **`each` in the in-language prelude** (V6). One iteration word; `map`,
+  `flatMap`, `filter`, and `reduce` are calling conventions on it, not separate
+  words — `direction-v2.md` V6 and `language-v2.md` §12.2. Define it over
+  `length`/`nth`, **not** `first`/`rest`: `rest` clones the list each step
+  (`Rc::make_mut` on a bound list), making the cons-style definition quadratic —
+  160 ms → 2.8 s from n=2000 to n=16000, against 52 ms → 201 ms for the index form.
+- [ ] **A filter adapter**, element-level (`x -- bool` → `x -- x|nothing`), not an
+  iteration word. Name unsettled; `keep_if` is a placeholder.
+- [ ] Decide whether `times`/`while`/`until` earn their place over `each` plus
+  recursion. Not assumed.
+
+Not scheduled, and deliberately so:
+
+- **Native `each`.** Fully designed, implemented, tested, and benched — see
+  `memory-model.md` §9. Branches `native-each` (one combinator) and
+  `native-resumables` (the general `Resumable` interface, plus `times` as a second
+  user); both green, neither merged. It is 3–5× the in-language definition with no
+  cost to any program that doesn't iterate, but the absolute cost is imperceptible
+  at calculator list sizes. Merge when a workload asks, not before.
+- **`run_function` is retired, not deferred.** Any native op that calls a language
+  callable and then continues must *suspend*, never run the callee to completion:
+  a Rust frame held across the call puts data-driven depth on the Rust stack (an
+  abort, not an error) and hides the operands from `Env::retain` (a spurious
+  `unbound name`, not a crash). `memory-model.md` §9.1–9.2.
