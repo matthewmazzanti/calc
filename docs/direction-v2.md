@@ -210,9 +210,13 @@ This retires the per-token `Element::parse` model. It is the largest single piec
   rather than its short-circuiting `and`/`or`; a lazy form would take templates
   and need its own spelling.
 - **The lexical surface is a golden test** (`engine/conformance.rs`): source →
-  tokens → program, as one table. Its *diff* is the review surface when a rule
-  moves — a new numeric literal shape shows up as rows leaving the `WORDS` group,
-  which is the question "which names does this take?" answered mechanically.
+  tokens → program, as one table of typed rows — the tokens and elements
+  themselves, so nothing passes or fails on formatting. Its *diff* is the review
+  surface when a rule moves; a new numeric literal shape shows up as rows leaving
+  the `words` group, which is the question "which names does this take?" answered
+  mechanically. Which *phase* answers is part of each row too, since that is
+  itself specified: a dangling sigil is the tokenizer's error, an unpaired
+  bracket the parser's.
 - **Two error kinds beyond the doc's four.** `MisplacedColon`, since `:` is the
   one construct recognized by position; and `TooDeeplyNested` — `{` is the
   parser's own recursion, so nesting is capped (256 open regions) rather than
