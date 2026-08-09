@@ -326,6 +326,22 @@ fn a_failed_batch_is_rolled_back_by_the_copy_taken_first() {
 }
 
 #[test]
+fn the_module_activation_rests_holding_no_code() {
+    // A line is *loaded into* the module activation rather than pushed above
+    // it, and the module never returns — so the call stack is never empty. What
+    // makes that invisible to equality is that the module is left holding no
+    // code, whether the line succeeded or failed. Without it, two engines that
+    // differ only in which line ran last would compare unequal and every no-op
+    // would record an undo point.
+    let mut engine = Engine::new();
+    let rest = engine.clone();
+    engine.apply(&parse("1 drop").unwrap()).unwrap();
+    assert_eq!(engine, rest, "a no-op line left the engine changed");
+    assert!(engine.apply(&parse("+").unwrap()).is_err());
+    assert_eq!(engine, rest, "a failed line left code in the module");
+}
+
+#[test]
 fn a_snapshot_is_the_whole_engine_so_nothing_can_be_left_out() {
     // Everything a line touches rides along, including the frames it allocated
     // and the id counter. Rewinding the counter is safe precisely because an id
