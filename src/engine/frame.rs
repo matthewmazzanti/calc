@@ -37,14 +37,22 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use slotmap::{new_key_type, SlotMap};
+
 use super::Value;
 
-/// Names a frame within an [`Env`]. Monotonic and **never reused**, so a stale id
-/// resolves to nothing rather than aliasing a fresh frame — what a slotmap's
-/// generational keys buy, without the slotmap. The counter lives on the engine,
-/// deliberately outside any snapshot: rolling it back would let a post-undo line
-/// mint an id that a discarded value still names.
-pub type FrameId = u32;
+new_key_type! {
+    /// Names a frame within an [`Env`]: a slot index paired with a generation.
+    ///
+    /// The generation is what makes **reuse** safe. Ids have to be reused — a
+    /// monotonic counter would make the slot vector grow with total allocations
+    /// rather than with peak *simultaneous* frames, which for a loop is the
+    /// difference between a few thousand slots and a million. Reuse costs the
+    /// property that a stale id resolves to nothing: without a generation it
+    /// would resolve to *a different frame*, turning a missed root from a loud
+    /// failure into a silent wrong answer.
+    pub struct FrameId;
+}
 
 /// One environment level: what is bound here, and what encloses it.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -55,19 +63,35 @@ pub struct Frame {
 }
 
 /// Every frame that exists, by id. Cloning one is a pointer bump per frame and
-/// shares every frame with the original — which is what makes it a snapshot: see
-/// [`State`].
-#[derive(Debug, Clone, PartialEq, Default)]
+/// shares every frame with the original — which is what makes it a snapshot.
+///
+/// A [`SlotMap`] rather than a hash map: ids are dense slot indices, so a lookup
+/// is an index rather than a hash, allocation is a free-list pop, and the freed
+/// slots left by a collection are reused instead of leaving the array to grow
+/// with every frame ever made.
+#[derive(Debug, Clone, Default)]
 pub struct Env {
-    frames: HashMap<FrameId, Rc<Frame>>,
+    frames: SlotMap<FrameId, Rc<Frame>>,
+}
+
+/// `SlotMap` has no `PartialEq`, and [`Engine`](super::Engine)'s no-op check
+/// needs one. Compares live frames only — two environments that reached the same
+/// bindings are equal whatever slots and generations they happen to occupy.
+impl PartialEq for Env {
+    fn eq(&self, other: &Self) -> bool {
+        self.frames.len() == other.frames.len()
+            && self
+                .frames
+                .iter()
+                .all(|(id, frame)| other.frames.get(id) == Some(frame))
+    }
 }
 
 impl Env {
-    /// Install a frame under `id`, enclosed by `parent` (`None` for the global
-    /// frame). The caller owns the id counter, so ids stay monotonic across
-    /// snapshots.
-    pub fn insert(&mut self, id: FrameId, parent: Option<FrameId>, bindings: Bindings) {
-        self.frames.insert(id, Rc::new(Frame { parent, bindings }));
+    /// Add a frame enclosed by `parent` (`None` only for the global frame), and
+    /// return the id it was given.
+    pub fn create(&mut self, parent: Option<FrameId>, bindings: Bindings) -> FrameId {
+        self.frames.insert(Rc::new(Frame { parent, bindings }))
     }
 
     /// Resolve `name` from `id` outward, or `None` if nothing binds it. A binding
@@ -75,7 +99,7 @@ impl Env {
     /// is the floor.
     pub fn lookup(&self, id: FrameId, name: &str) -> Option<Value> {
         let mut current = Some(id);
-        while let Some(frame) = current.and_then(|id| self.frames.get(&id)) {
+        while let Some(frame) = current.and_then(|id| self.frames.get(id)) {
             if let Some(value) = frame.bindings.get(name) {
                 return Some(value.clone());
             }
@@ -92,7 +116,7 @@ impl Env {
     /// place when this `Env` is its only holder, and clones it when a snapshot
     /// shares it — leaving that snapshot with the frame as it was.
     pub fn bind(&mut self, id: FrameId, name: Rc<str>, value: Value) {
-        if let Some(frame) = self.frames.get_mut(&id) {
+        if let Some(frame) = self.frames.get_mut(id) {
             Rc::make_mut(frame).bindings.insert(name, value);
         }
     }
@@ -127,7 +151,7 @@ impl Env {
             if !live.insert(id) {
                 continue; // already marked
             }
-            let Some(frame) = self.frames.get(&id) else {
+            let Some(frame) = self.frames.get(id) else {
                 continue;
             };
             pending.extend(frame.parent);
@@ -135,7 +159,7 @@ impl Env {
                 mark(value, &mut pending);
             }
         }
-        self.frames.retain(|id, _| live.contains(id));
+        self.frames.retain(|id, _| live.contains(&id));
     }
 }
 
@@ -143,7 +167,7 @@ impl Env {
     /// One frame, for the tests that check copy-on-write by pointer identity.
     #[cfg(test)]
     pub fn frame(&self, id: FrameId) -> Option<&Rc<Frame>> {
-        self.frames.get(&id)
+        self.frames.get(id)
     }
 }
 
@@ -294,28 +318,29 @@ impl<'a> Iterator for Iter<'a> {
 mod tests {
     use super::*;
 
-    fn env() -> (Env, FrameId) {
+    /// A global frame with a child under it, as the engine builds them.
+    fn env() -> (Env, FrameId, FrameId) {
         let mut env = Env::default();
-        env.insert(0, None, Bindings::new());
-        env.insert(1, Some(0), Bindings::new());
-        (env, 1)
+        let global = env.create(None, Bindings::new());
+        let session = env.create(Some(global), Bindings::new());
+        (env, global, session)
     }
 
     #[test]
     fn lookup_walks_outward_and_nearer_bindings_shadow() {
-        let (mut env, module) = env();
-        env.bind(0, Rc::from("x"), Value::Int(1));
-        assert_eq!(env.lookup(module, "x"), Some(Value::Int(1)));
-        env.bind(module, Rc::from("x"), Value::Int(2));
-        assert_eq!(env.lookup(module, "x"), Some(Value::Int(2)));
+        let (mut env, global, session) = env();
+        env.bind(global, Rc::from("x"), Value::Int(1));
+        assert_eq!(env.lookup(session, "x"), Some(Value::Int(1)));
+        env.bind(session, Rc::from("x"), Value::Int(2));
+        assert_eq!(env.lookup(session, "x"), Some(Value::Int(2)));
         // Binding installs here, so the outer one is shadowed, not replaced.
-        assert_eq!(env.lookup(0, "x"), Some(Value::Int(1)));
-        assert_eq!(env.lookup(module, "nope"), None);
+        assert_eq!(env.lookup(global, "x"), Some(Value::Int(1)));
+        assert_eq!(env.lookup(session, "nope"), None);
     }
 
     #[test]
     fn a_binding_mutates_in_place_when_nothing_shares_the_frame() {
-        let (mut env, module) = env();
+        let (mut env, _global, module) = env();
         let before = Rc::clone(env.frame(module).unwrap());
         // `before` is a second holder, so this bind must clone…
         env.bind(module, Rc::from("x"), Value::Int(1));
@@ -364,7 +389,7 @@ mod tests {
     fn a_snapshot_keeps_the_frame_it_captured() {
         // The whole of undo, in miniature: clone the map, mutate, and the clone
         // still sees what it saw — because `bind` copied on write.
-        let (mut env, module) = env();
+        let (mut env, _global, module) = env();
         env.bind(module, Rc::from("x"), Value::Int(1));
         let snapshot = env.clone();
         env.bind(module, Rc::from("x"), Value::Int(2));

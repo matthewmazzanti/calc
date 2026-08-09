@@ -349,19 +349,40 @@ fn the_session_frame_persists_across_evaluations() {
 #[test]
 fn a_snapshot_is_the_whole_engine_so_nothing_can_be_left_out() {
     // Everything a line touches rides along, including the frames it allocated
-    // and the id counter. Rewinding the counter is safe precisely because an id
-    // means something only inside the environment it was minted in: a value and
-    // the `Env` naming it are always copied and restored together.
+    // and the slots they occupied. Reusing a slot after a rollback is safe
+    // precisely because an id means something only inside the environment it
+    // was minted in: a value and the `Env` naming it are always copied and
+    // restored together, so the old occupant went with the state it lived in.
     let mut engine = Engine::new();
     let before = engine.clone();
     engine.apply(&parse("1 'x set").unwrap()).unwrap();
-    let minted = engine.new_frame(Some(0));
+    let minted = engine.new_frame(None);
     engine = before.clone();
     assert_eq!(engine.lookup("x"), None);
     assert_eq!(engine, before);
-    // The id is free again, and the frame it named went with the state it was
-    // minted into.
-    assert_eq!(engine.new_frame(Some(0)), minted);
+    // Slot allocation rolled back too, so the very same id is handed out again
+    // — *not* a hazard, and the clearest evidence the snapshot is total. The
+    // frame that held it was discarded along with every value that named it,
+    // because a value and the `Env` naming it always travel together.
+    assert_eq!(engine.new_frame(None), minted);
+}
+
+#[test]
+fn a_swept_id_does_not_alias_the_frame_that_replaces_it() {
+    // What the generation *is* for: reuse within one version. A collection
+    // frees a slot and the next frame takes it, so without a generation an id
+    // held by a missed root would silently resolve to a stranger's frame
+    // instead of failing loudly.
+    let mut engine = Engine::new();
+    let dead = engine.new_frame(None); // reachable from nothing
+    engine.collect();
+    assert!(
+        engine.env.frame(dead).is_none(),
+        "the collector kept an unreachable frame"
+    );
+    let fresh = engine.new_frame(None); // same slot, later generation
+    assert_ne!(fresh, dead);
+    assert!(engine.env.frame(dead).is_none(), "a stale id found a frame");
 }
 
 #[test]
@@ -1009,11 +1030,12 @@ fn a_call_that_neither_binds_nor_captures_allocates_no_frame() {
     // so the call runs against the one it inherited (`memory-model.md` §7.2).
     let mut engine = Engine::new();
     engine.apply(&parse("'inc {1 +} =").unwrap()).unwrap();
-    let before = engine.next_frame;
+    let before = engine.env.len();
     engine.apply(&parse("1 inc inc inc").unwrap()).unwrap();
     assert_eq!(engine.stack(), &[Value::Int(4)]);
     assert_eq!(
-        engine.next_frame, before,
+        engine.env.len(),
+        before,
         "a bindless call allocated a frame"
     );
 }
@@ -1022,10 +1044,10 @@ fn a_call_that_neither_binds_nor_captures_allocates_no_frame() {
 fn a_call_that_binds_allocates_one_frame() {
     let mut engine = Engine::new();
     engine.apply(&parse("'sq {n: n n *} =").unwrap()).unwrap();
-    let before = engine.next_frame;
+    let before = engine.env.len();
     engine.apply(&parse("4 sq").unwrap()).unwrap();
     assert_eq!(engine.stack(), &[Value::Int(16)]);
-    assert_eq!(engine.next_frame, before + 1);
+    assert_eq!(engine.env.len(), before + 1);
 }
 
 #[test]
@@ -1099,13 +1121,14 @@ fn a_tail_call_replaces_an_exhausted_activation() {
     // activation stack without bound.
     let body: Template = Rc::new(vec![Element::Word(Rc::from("dup"))]);
     let mut engine = Engine::new();
-    engine.push_call(Rc::clone(&body), 1);
-    engine.push_call(Rc::clone(&body), 1); // caller mid-template: stacks
+    let env = engine.session;
+    engine.push_call(Rc::clone(&body), env);
+    engine.push_call(Rc::clone(&body), env); // caller mid-template: stacks
     let depth = engine.calls.len();
     assert_eq!(depth, 2);
 
     engine.calls.last_mut().unwrap().ip = body.len(); // now in tail position
-    engine.push_call(body, 1);
+    engine.push_call(body, env);
     assert_eq!(engine.calls.len(), depth, "a tail call grew the stack");
 }
 

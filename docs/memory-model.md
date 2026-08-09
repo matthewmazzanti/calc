@@ -138,10 +138,10 @@ it (see §4 for why non-owning ids matter so much).
 ## 0. The chosen model — indirected frames and copy-on-write
 
 ```rust
-type FrameId = u32;                              // monotonic, never reused
+new_key_type! { struct FrameId; }                // slot index + generation
 
-struct Frame { parent: Option<FrameId>, bindings: HashMap<Rc<str>, Value> }
-struct Env   { frames: HashMap<FrameId, Rc<Frame>> }
+struct Frame { parent: Option<FrameId>, bindings: Bindings }   // Vec, or a map past 8
+struct Env   { frames: SlotMap<FrameId, Rc<Frame>> }
 
 enum Value {
     Int(i64), Num(f64), Bool(bool),              // inline leaves
@@ -247,12 +247,22 @@ that had to be kept in step with the engine's fields by hand would silently stop
 covering the next one added — an angle mode, a display precision — and that
 failure is invisible: the field simply wouldn't undo.
 
-**The frame-id counter rides along too**, and rewinding it is safe. It looks
-unsafe — a post-undo line re-mints an id that a value in the discarded future
-still names — but that value lives in *that version's* `Env`, and the reused id
-lands in a map where the old frame never existed. A value and the environment it
-names are always copied and restored together, which is what "an id means
-something only within a version" actually buys. Nothing has to sit outside.
+**Slot allocation rides along too**, and rewinding it is safe. It looks unsafe —
+a line after an undo re-mints the very id a discarded value named — but that
+value lives in *that version's* `Env`, and the reused id lands in a map where the
+old frame never existed. A value and the environment naming it are always copied
+and restored together, which is what "an id means something only within a
+version" actually buys. Nothing has to sit outside.
+
+Ids are **reused**, which a monotonic counter would not allow: the slot array
+would then grow with every frame ever made rather than with the peak
+*simultaneous* count, and for a loop that is the difference between a few
+thousand slots and a million. Reuse is why the id carries a **generation**. Not
+for the rollback case — a generation rewinds with the snapshot like everything
+else, and needs to — but for reuse *within* a version: a collection frees a slot,
+the next frame takes it, and without a generation an id held by a root the
+collector failed to see would silently resolve to a stranger's frame instead of
+failing loudly.
 
 One thing the reachability filter must remember: its roots include **the data
 stack**, since a closure on the stack (or inside a list — §4.1's invariant 2) may

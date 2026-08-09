@@ -118,12 +118,6 @@ pub struct Engine {
     /// snapshot like everything else, where rewinding it is harmless — it
     /// re-adapts within one collection.
     collect_at: usize,
-    /// The next frame id to hand out. Rewound by a snapshot like everything
-    /// else, which is safe because **an id only means anything inside the
-    /// environment it was minted in** — a value and the `Env` it names are
-    /// always copied and restored together, so a reused id after an undo lands
-    /// in a map where the old frame never existed.
-    next_frame: FrameId,
 }
 
 /// One level of the **dynamic** call stack: a template, how far through it
@@ -177,24 +171,20 @@ const MIN_FRAMES: usize = 1024;
 /// free. Beyond 4 it stops helping.
 const GROWTH: usize = 4;
 
-/// The global frame's id. Every chain ends here, and it is the one frame that
-/// will never be a collection candidate — reachable as a root from everywhere.
-const GLOBAL: FrameId = 0;
-/// The session frame's id — the interactive scope, under the global frame.
-const SESSION: FrameId = 1;
-
 impl Default for Engine {
     fn default() -> Self {
         let mut env = Env::default();
-        env.insert(GLOBAL, None, prelude());
-        env.insert(SESSION, Some(GLOBAL), Bindings::new());
+        // The global frame holds the prelude and ends every chain; the session
+        // frame is the interactive scope under it. Neither is ever collected —
+        // the session is a root and the global is its parent.
+        let global = env.create(None, prelude());
+        let session = env.create(Some(global), Bindings::new());
         Self {
             stack: Stack::new(),
             calls: Vec::new(),
             env,
-            session: SESSION,
+            session,
             collect_at: MIN_FRAMES,
-            next_frame: SESSION + 1,
         }
     }
 }
@@ -552,10 +542,7 @@ impl Engine {
     /// The id comes from a counter that no snapshot rewinds, so an id is unique
     /// for the life of the session even across an undo.
     pub(crate) fn new_frame(&mut self, parent: Option<FrameId>) -> FrameId {
-        let id = self.next_frame;
-        self.next_frame += 1;
-        self.env.insert(id, parent, Bindings::new());
-        id
+        self.env.create(parent, Bindings::new())
     }
 
     /// Apply a looked-up value: a callable — a builtin or a function — runs;
