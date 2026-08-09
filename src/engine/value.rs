@@ -5,7 +5,7 @@
 
 use std::rc::Rc;
 
-use super::{ErrorKind, Primitive};
+use super::{Element, ErrorKind, FrameId, Primitive};
 
 /// The kind of an open collection, carried by its [`Value::Mark`]. Only lists
 /// for now; `{` will add a function mark (carrying the captured environment) in
@@ -48,9 +48,23 @@ pub enum Value {
     Mark(MarkKind),
     /// A captured primitive op — a first-class word. A *bare* word runs its op;
     /// `'name get` instead pushes it here, so a builtin can be stored, passed,
-    /// and later applied. [`Primitive`] is `Copy`, so this stays cheap. Functions
-    /// (`{ … }`) will join it as the other callable value.
+    /// and later applied. [`Primitive`] is `Copy`, so this stays cheap.
     Builtin(Primitive),
+    /// A function: a parse-time template paired with the environment it captured
+    /// (§5). Produced by evaluating a `{ … }`, which is why instantiation is
+    /// cheap — a pointer and an id — and why `{ {*} }` doesn't re-parse its
+    /// inner template per call.
+    ///
+    /// **`env` is an id, not a pointer**, and that is what lets a function be an
+    /// ordinary value: it can be copied, snapshotted, and stored inside the very
+    /// frame it captured without forming a cycle (`memory-model.md` §0). It also
+    /// keeps binding *late* — the id resolves against the environment as it is
+    /// when the function runs, not as it was when the function was made, which
+    /// is what makes recursion work with no forward declaration.
+    Function {
+        template: Rc<[Element]>,
+        env: FrameId,
+    },
 }
 
 impl Value {
@@ -65,6 +79,7 @@ impl Value {
             Value::List(_) => "list",
             Value::Name(_) => "name",
             Value::Builtin(_) => "builtin",
+            Value::Function { .. } => "function",
             // The open-collection sentinel isn't a first-class value: the value
             // words reject it, naming it as an "open list" in the error.
             Value::Mark(MarkKind::List) => "open list",
@@ -144,6 +159,14 @@ impl std::fmt::Display for Value {
             // A captured op shows as its word — a display choice to revisit
             // when functions get their own rendering.
             Value::Builtin(b) => write!(f, "{b}"),
+            // A function shows as its source: the same rendering a `Template`
+            // element gets, reused rather than restated so the two can't drift
+            // (it reconstructs a parameter list, among other things). The
+            // captured environment is deliberately absent — §11's "closures
+            // aren't plain data", visible in the display.
+            Value::Function { template, .. } => {
+                write!(f, "{}", Element::Template(Rc::clone(template)))
+            }
             // A lone, still-open mark — shown so an unclosed `[` is visible on
             // the stack. Distinct from the empty list's `[ ]`.
             Value::Mark(MarkKind::List) => write!(f, "["),

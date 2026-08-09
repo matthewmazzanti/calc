@@ -233,9 +233,15 @@ impl Engine {
             }
             let top = self.calls.last_mut().expect("checked just above");
             let element = top.template[top.ip].clone();
-            let index = top.ip;
             top.ip += 1;
             if let Err(kind) = self.apply_one(&element) {
+                // Blame the word *in this line* that led here, not the element
+                // that failed — an error inside a called function has an index
+                // into that function's template, which would mean nothing
+                // against the program the `Trace` carries. The line's activation
+                // is always the bottom one (tail calls leave it alone). A stack
+                // of activations replaces this approximation in V3's last step.
+                let index = self.calls[0].ip.saturating_sub(1);
                 // A failed line abandons whatever it was part-way through; the
                 // caller's copy puts the rest of the state back.
                 self.calls.clear();
@@ -273,6 +279,17 @@ impl Engine {
                 Ok(())
             }
             Element::Close(Region::List) => self.close_list(),
+            // Instantiation: pair the template with the frame this code is
+            // running in (§5). Cheap — a pointer and an id — so a nested `{ }`
+            // costs nothing per call beyond the pairing.
+            Element::Template(template) => {
+                let function = Value::Function {
+                    template: Rc::clone(template),
+                    env: self.frame(),
+                };
+                self.stack.push(function);
+                Ok(())
+            }
             // A template's `names :` list. The same binding `set` performs, but
             // reached without a lookup — so fixed syntax can't be broken by
             // rebinding a word (§5).
@@ -281,7 +298,6 @@ impl Engine {
                 self.bind(name.clone(), value);
                 Ok(())
             }
-            Element::Template(_) => Err(ErrorKind::Unimplemented("functions")),
             Element::Open(Region::Dict) | Element::Close(Region::Dict) => {
                 Err(ErrorKind::Unimplemented("dicts"))
             }
@@ -469,9 +485,6 @@ impl Engine {
     ///
     /// The id comes from a counter that no snapshot rewinds, so an id is unique
     /// for the life of the session even across an undo.
-    // Nothing calls this until applying a function does; it exists now so the id
-    // discipline it enforces is testable before there is a caller to get it wrong.
-    #[allow(dead_code)]
     pub(crate) fn new_frame(&mut self, parent: Option<FrameId>) -> FrameId {
         let id = self.next_frame;
         self.next_frame += 1;
@@ -479,17 +492,52 @@ impl Engine {
         id
     }
 
-    /// Apply a looked-up value: a callable (a builtin, later a function) runs;
+    /// Apply a looked-up value: a callable — a builtin or a function — runs;
     /// anything else is data and is pushed. This is what makes a bare word *do*
-    /// its op while a word bound to a number just lands it on the stack.
-    fn apply_value(&mut self, value: Value) -> Result<(), ErrorKind> {
+    /// its op while a word bound to a number just lands it on the stack, and it
+    /// is the single seam through which everything callable is reached, so
+    /// primitive-versus-function stays invisible to callers.
+    pub(crate) fn apply_value(&mut self, value: Value) -> Result<(), ErrorKind> {
         match value {
             Value::Builtin(primitive) => self.run_builtin(primitive),
+            Value::Function { template, env } => {
+                self.push_call(template, env);
+                Ok(())
+            }
             data => {
                 self.stack.push(data);
                 Ok(())
             }
         }
+    }
+
+    /// Enter a function: allocate its frame and push an activation over its
+    /// template. The loop descends into it and resumes the caller when it
+    /// returns, so this schedules rather than runs — nothing recurses in Rust.
+    ///
+    /// **The frame's parent is the function's captured `env`, never the
+    /// caller's** (§8). That is the whole of lexical scoping: a callee sees the
+    /// names its *definition* could see, not its caller's locals.
+    ///
+    /// **Tail calls replace rather than stack.** If the caller has nothing left
+    /// to run, its activation is popped first, so a function whose last act is a
+    /// call runs flat — which iteration in this language depends on, since loops
+    /// are recursion over combinators. The line's own activation is exempt, so
+    /// it stays at the bottom of the stack for the trace to index against.
+    fn push_call(&mut self, template: Rc<[Element]>, env: FrameId) {
+        let frame = self.new_frame(Some(env));
+        let exhausted = self
+            .calls
+            .last()
+            .is_some_and(|top| top.ip >= top.template.len());
+        if exhausted && self.calls.len() > 1 {
+            self.calls.pop();
+        }
+        self.calls.push(Activation {
+            template,
+            ip: 0,
+            frame,
+        });
     }
 
     /// Bind `name` to `value` in the *current* frame, shadowing any binding

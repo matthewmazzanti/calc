@@ -826,8 +826,8 @@ fn the_fetch_sigil_pushes_a_binding_unapplied() {
 
 #[test]
 fn a_bind_element_binds_like_set() {
-    // What `{x: …}` emits. It only occurs inside a template, which doesn't run
-    // until V3, so the element is applied directly here.
+    // What `{x: …}` emits, applied on its own — the parameter tests cover it
+    // in place, this one pins the element's own behavior.
     let program = [
         Element::Literal(Value::Int(3)),
         Element::Bind(Rc::from("x")),
@@ -846,13 +846,121 @@ fn a_bind_element_binds_like_set() {
 
 #[test]
 fn the_parsed_but_unevaluated_surface_names_its_milestone() {
-    // The parser accepts all of v2; the evaluator catches up in V3 (functions)
-    // and V5 (dicts, attributes). Until then these are honest about which.
-    assert_eq!(run_err("{dup *}"), ErrorKind::Unimplemented("functions"));
+    // The parser accepts all of v2; the evaluator catches up at V5 for dicts
+    // and attributes. Until then these are honest about which.
     assert_eq!(run_err("('x 1)"), ErrorKind::Unimplemented("dicts"));
     assert_eq!(
         run_err("3 .x"),
         ErrorKind::Unimplemented("attribute access")
+    );
+}
+
+// --- V3: functions ---
+
+#[test]
+fn a_template_instantiates_into_a_function() {
+    // `{ }` is a *value*, not a call: evaluating one pairs the template with
+    // the frame the code is running in and leaves it on the stack.
+    assert_eq!(run("{dup *}").stack().len(), 1);
+    assert_eq!(run("{dup *}").stack()[0].to_string(), "{dup *}");
+    // Two instantiations of the same template in the same scope are the same
+    // value — the template is shared, not re-parsed (§5).
+    assert_eq!(run("{dup *} {dup *} =").stack(), &[true]);
+}
+
+#[test]
+fn call_applies_the_function_on_top() {
+    assert_eq!(run("3 {dup *} call").stack(), &[Value::Int(9)]);
+    // A value is a nullary function that pushes itself, so calling one is a
+    // push rather than an error (§1).
+    assert_eq!(run("3 call").stack(), &[Value::Int(3)]);
+    // Builtins reach the same seam, so primitive-vs-function is invisible.
+    assert_eq!(run("3 4 &+ call").stack(), &[Value::Int(7)]);
+}
+
+#[test]
+fn a_word_bound_to_a_function_runs_when_applied() {
+    assert_eq!(run("{dup *} 'sq set  4 sq").stack(), &[Value::Int(16)]);
+    // `&sq` fetches it instead, unapplied — application's reflective inverse.
+    assert_eq!(
+        run("{dup *} 'sq set  4 &sq call").stack(),
+        &[Value::Int(16)]
+    );
+}
+
+#[test]
+fn parameters_bind_into_the_calls_own_frame() {
+    assert_eq!(run("3 4 {w h: w h *} call").stack(), &[Value::Int(12)]);
+    // The names read bottom to top, so the rightmost took the top of stack.
+    assert_eq!(run("10 3 {a b: a b -} call").stack(), &[Value::Int(7)]);
+    // And they are *locals*: the call's frame is gone once it returns.
+    assert_eq!(
+        run_err("3 {n: n} call n"),
+        ErrorKind::UnboundName("n".into())
+    );
+}
+
+#[test]
+fn a_callee_sees_its_definitions_scope_not_its_callers() {
+    // §8's example, exactly: `f` resolves `y` through *its* chain. No uplevel,
+    // no dynamic override — the call frame's parent is the captured env.
+    let source = "{y 1 +} 'f set  {3 'y set f} 'a set  7 'y set  a";
+    assert_eq!(run(source).stack(), &[Value::Int(8)]);
+}
+
+#[test]
+fn if_applies_one_of_two_functions() {
+    assert_eq!(run("true {1} {2} if").stack(), &[Value::Int(1)]);
+    assert_eq!(run("false {1} {2} if").stack(), &[Value::Int(2)]);
+    // A branch is an ordinary value, so it need not be a function.
+    assert_eq!(run("true 1 2 if").stack(), &[Value::Int(1)]);
+    // No truthiness — the condition is a genuine boolean.
+    assert_eq!(
+        run_err("1 {1} {2} if"),
+        ErrorKind::TypeError {
+            expected: "bool",
+            found: "number"
+        }
+    );
+}
+
+#[test]
+fn binding_is_late_so_recursion_needs_no_declaration() {
+    // The closure captured the session frame before `fac` was bound into it,
+    // and resolves the name when it *runs* — which is the whole reason the
+    // captured environment is an id rather than a copy of the bindings.
+    let fac = "{n: n 1 <= {1} {n 1 - fac n *} if} 'fac set";
+    assert_eq!(run(&format!("{fac}  5 fac")).stack(), &[Value::Int(120)]);
+}
+
+#[test]
+fn a_tail_call_replaces_an_exhausted_activation() {
+    // The mechanism, directly: a call made when the caller has nothing left to
+    // run takes its place rather than stacking on it. Iteration here is
+    // recursion over combinators, so without this an unbounded loop grows the
+    // activation stack without bound.
+    let body: Rc<[Element]> = Rc::from(vec![Element::Word(Rc::from("dup"))]);
+    let mut engine = Engine::new();
+    engine.push_call(Rc::clone(&body), 1);
+    engine.push_call(Rc::clone(&body), 1); // caller mid-template: stacks
+    let depth = engine.calls.len();
+    assert_eq!(depth, 2);
+
+    engine.calls.last_mut().unwrap().ip = body.len(); // now in tail position
+    engine.push_call(body, 1);
+    assert_eq!(engine.calls.len(), depth, "a tail call grew the stack");
+}
+
+#[test]
+fn deep_recursion_completes() {
+    // End to end. The loop is explicit, so depth costs heap rather than Rust
+    // stack either way — what this pins is that the whole path (parameters,
+    // `if`, late-bound self-reference, returning) survives being run 20000
+    // times over.
+    let countdown = "{n: n 0 <= {0} {n 1 - countdown} if} 'countdown set";
+    assert_eq!(
+        run(&format!("{countdown}  20000 countdown")).stack(),
+        &[Value::Int(0)]
     );
 }
 

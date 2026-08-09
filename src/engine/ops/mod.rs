@@ -14,6 +14,7 @@ use super::{Primitive, Value};
 mod arith;
 mod compare;
 mod constant;
+mod control;
 mod env;
 mod logic;
 mod seq;
@@ -37,6 +38,7 @@ pub(crate) fn primitives() -> impl Iterator<Item = &'static Primitive> {
         .iter()
         .chain(compare::PRIMITIVES)
         .chain(logic::PRIMITIVES)
+        .chain(control::PRIMITIVES)
         .chain(stack::PRIMITIVES)
         .chain(seq::PRIMITIVES)
         .chain(env::PRIMITIVES)
