@@ -11,13 +11,14 @@
 //! half-consumed when it fails (it pops before it type-checks), and a batch may
 //! have bound names before failing, so there is no "operands intact on error"
 //! guarantee. Instead the caller takes a [`State`] before applying and puts it
-//! back on failure — a value copy of the stack and the module frame's bindings.
+//! back on failure — a value copy of the stack and the whole environment.
 //!
-//! **Not a copy of the engine.** Frames are shared handles, so a clone would
-//! share the very thing a rollback has to preserve; `Engine` is deliberately not
-//! `Clone`. Restoring assigns values *into* the live frame, which keeps its
-//! identity — and identity is what late binding rests on, since a closure that
-//! captured the module frame must go on seeing the live one (§8).
+//! Putting it back is an *assignment*, because a closure names its frame by
+//! [`FrameId`] rather than pointing at it: an old [`Env`] means exactly what it
+//! meant, and every frame is covered rather than only the one the REPL mutates
+//! (`memory-model.md` §0). `Engine` is deliberately not `Clone` — a copy would
+//! duplicate the frame-id counter, and two engines minting the same id is the
+//! one thing the model cannot survive.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -30,7 +31,7 @@ mod token;
 mod value;
 
 pub use error::{CalcError, ErrorKind, Outcome, ParseError, ParseErrorKind, Trace};
-pub use frame::{Frame, FrameRef, State};
+pub use frame::{Bindings, Env, FrameId, State};
 pub use program::{parse, Element, Region};
 pub use token::Span;
 pub use value::{MarkKind, Value};
@@ -83,23 +84,30 @@ impl std::fmt::Display for Primitive {
 /// The calculator engine: the RPN stack, plus (later) evaluation settings such
 /// as angle mode, display precision, or named registers.
 ///
-/// [`Engine::apply`] consumes `self` and threads it through the batch;
-/// individual ops take `&mut self` and mutate in place. The caller keeps its own
-/// copy for undo and commits the result only on `Ok` — see the `history` module.
-/// Deliberately **not `Clone`**: cloning would share the module frame rather
-/// than copy it, so "apply to a copy and keep it on success" cannot work. The
-/// transaction is [`Engine::state`] / [`Engine::restore`] instead — see
-/// [`State`] for why the frame's *identity* has to survive a rollback.
+/// Ops take `&mut self` and mutate in place; the caller wraps a batch in a
+/// [`State`] taken beforehand and puts it back on failure — see the module docs.
+///
+/// Deliberately **not `Clone`**. The snapshot is [`Engine::state`], which copies
+/// only what a line can change; an engine copy would also duplicate the id
+/// counter, and two engines minting the same [`FrameId`] is the one thing the
+/// model cannot survive.
 #[derive(Debug)]
 pub struct Engine {
     stack: Stack,
     /// The call stack — see [`Activation`]. Empty except while [`Engine::run`]
     /// is inside a batch.
     calls: Vec<Activation>,
+    /// Every frame that exists. Cloned wholesale by [`Engine::state`], which is
+    /// cheap because frames are shared and copied on write.
+    env: Env,
     /// The module frame: the REPL's own scope, where top-level binding lands.
     /// Its parent is the global frame holding the prelude, so the chain from
     /// here reaches every builtin (§8).
-    module: FrameRef,
+    module: FrameId,
+    /// The next frame id to hand out. **Outside the snapshot on purpose**: undo
+    /// must not rewind it, or a later line would mint an id that a value in the
+    /// discarded future still names (`memory-model.md` §0.4).
+    next_frame: FrameId,
 }
 
 /// One level of the **dynamic** call stack: a template, and how far through it
@@ -127,13 +135,23 @@ fn prelude() -> HashMap<Rc<str>, Value> {
         .collect()
 }
 
+/// The global frame's id. Every chain ends here, and it is the one frame that
+/// will never be a collection candidate — reachable as a root from everywhere.
+const GLOBAL: FrameId = 0;
+/// The module frame's id — the REPL's scope, installed under the global frame.
+const MODULE: FrameId = 1;
+
 impl Default for Engine {
     fn default() -> Self {
-        let global = Frame::root(prelude());
+        let mut env = Env::default();
+        env.insert(GLOBAL, None, prelude());
+        env.insert(MODULE, Some(GLOBAL), Bindings::new());
         Self {
             stack: Stack::new(),
             calls: Vec::new(),
-            module: Frame::child(&global),
+            env,
+            module: MODULE,
+            next_frame: MODULE + 1,
         }
     }
 }
@@ -406,35 +424,54 @@ impl Engine {
     /// the floor. Returns a clone (an `Rc` bump for heap values), leaving the
     /// binding in place. `get` and `&f` reach builtins through this too.
     pub(crate) fn lookup(&self, name: &str) -> Option<Value> {
-        frame::lookup(self.frame(), name)
+        self.env.lookup(self.frame(), name)
     }
 
     /// The frame lookup starts from and binding lands in. Always the module
     /// frame today; once a call allocates a frame it becomes the running
     /// activation's, which is the whole of what "current" will mean.
-    fn frame(&self) -> &FrameRef {
-        &self.module
+    fn frame(&self) -> FrameId {
+        self.module
     }
 
-    /// The module frame — the REPL's scope. Exposed for the test that pins
-    /// rollback's identity guarantee; nothing else needs a frame directly.
-    #[cfg(test)]
-    pub(crate) fn module_frame(&self) -> FrameRef {
-        Rc::clone(&self.module)
+    /// Allocate a frame enclosed by `parent`, and return its id. Every
+    /// application makes one (§5), so this is the allocation the collector will
+    /// eventually have to answer for — and the one lazy allocation would skip
+    /// when a call neither binds nor captures.
+    ///
+    /// The id comes from a counter that no snapshot rewinds, so an id is unique
+    /// for the life of the session even across an undo.
+    // Nothing calls this until applying a function does; it exists now so the id
+    // discipline it enforces is testable before there is a caller to get it wrong.
+    #[allow(dead_code)]
+    pub(crate) fn new_frame(&mut self, parent: Option<FrameId>) -> FrameId {
+        let id = self.next_frame;
+        self.next_frame += 1;
+        self.env.insert(id, parent, Bindings::new());
+        id
     }
 
     /// Everything a line can change, copied by value — take one before applying
-    /// a batch, put it back if the batch fails.
+    /// a batch, put it back if the batch fails. Cloning the environment is a
+    /// pointer bump per frame; the frames stay shared until one of the two
+    /// versions writes to one, and then only that frame is copied.
     pub fn state(&self) -> State {
-        State::of(&self.stack, &self.module)
+        State {
+            stack: self.stack.clone(),
+            env: self.env.clone(),
+        }
     }
 
-    /// Undo a failed (or undone) line: put the stack and bindings back, and drop
-    /// any half-run call stack. The module frame keeps its identity, so closures
-    /// that captured it are unaffected — see [`State`].
+    /// Undo a failed (or undone) line: put the stack and environment back, and
+    /// drop any half-run call stack.
+    ///
+    /// An assignment, not a repair. A closure names its frame by id, so an old
+    /// environment means exactly what it meant — and *every* frame is covered,
+    /// not just the one the REPL mutates. The id counter is untouched, so no
+    /// later frame can take an id a discarded value still names.
     pub fn restore(&mut self, state: &State) {
         self.stack.clone_from(&state.stack);
-        state.restore_into(&self.module);
+        self.env.clone_from(&state.env);
         self.calls.clear();
     }
 
@@ -455,7 +492,7 @@ impl Engine {
     /// further out (including a prelude builtin). Binding never walks the chain,
     /// so a shadowed builtin is still there to fall back to.
     pub(crate) fn bind(&mut self, name: Rc<str>, value: Value) {
-        self.frame().borrow_mut().bind(name, value);
+        self.env.bind(self.module, name, value);
     }
 }
 

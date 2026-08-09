@@ -326,18 +326,21 @@ fn a_failed_batch_is_rolled_back_from_a_state() {
 }
 
 #[test]
-fn a_restore_keeps_the_frame_it_restores_into() {
-    // The identity that rollback must preserve: same frame, new contents.
+fn a_restore_is_an_assignment_and_ids_do_not_rewind() {
+    // Rollback puts an old environment back wholesale — no repair, because a
+    // frame is named by id and an old `Env` means exactly what it meant. What
+    // must *not* rewind is the id counter: a frame minted after an undo has to
+    // get a fresh id, or it would take one a discarded value still names.
     let mut engine = Engine::new();
     let before = engine.state();
     engine.apply(&parse("1 'x set").unwrap()).unwrap();
-    let frame = engine.module_frame();
+    let minted = engine.new_frame(None);
     engine.restore(&before);
-    assert!(
-        Rc::ptr_eq(&frame, &engine.module_frame()),
-        "restore replaced the frame instead of its bindings"
-    );
     assert_eq!(engine.lookup("x"), None);
+    assert!(
+        engine.new_frame(None) > minted,
+        "the id counter rewound with the state"
+    );
 }
 
 #[test]

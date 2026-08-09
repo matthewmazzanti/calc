@@ -223,7 +223,27 @@ This retires the per-token `Element::parse` model. It is the largest single piec
   letting pasted input overflow the Rust stack and abort the session. The cap is
   an implementation bound, not a language rule.
 
-### Memory model — chosen representation (supersedes the arena in V3/V4 below)
+### Memory model — chosen representation
+
+> **Superseded — see `memory-model.md` §0.** Frames are now **indirected and
+> copy-on-write**: a closure holds a `FrameId`, the engine holds
+> `HashMap<FrameId, Rc<Frame>>`, and `set` goes through `Rc::make_mut`. Undo drove
+> it: a snapshot is a clone of that map, so rollback is a value assignment rather
+> than a restore-into-a-live-frame, and it covers every frame instead of only the
+> module frame.
+>
+> Three things below stop being true. **There are no cycles** — the closure→frame
+> edge is a non-owning id, so `'square {dup *} =` stores a number inside frame 1
+> rather than an `Rc` back to it; V4 becomes an optional `retain(reachable)`
+> filter, not a cycle collector, with no `Weak` registry and no
+> neutralize-before-free. **There is no `RefCell`** — `make_mut` needs `&mut`, so
+> exclusivity is compiler-checked. And **frames are not promptly reclaimed**:
+> dropping a `Function` frees only its template, which is the price of undo and
+> is paid in every model (this document's own collector already had to root the
+> whole history timeline).
+>
+> The `Rc`-spine prose below is kept for the reasoning it carries — the cycle
+> theorem, why data wants a refcount, why the two populations differ.
 
 The frame representation converged on the **`Rc`-spine split** (`src/rc_heap.rs`;
 see `memory-model.md`'s top note), *not* the slotmap arena the V3/V4 prose below

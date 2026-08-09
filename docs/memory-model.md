@@ -1,17 +1,18 @@
 # Memory model
 
-> **Update (2026-08-08): direction changed.** The implementation converged on the
-> **`Rc`-spine split**, not arena-first — see `src/rc_heap.rs`. `Rc<immutable>` for
-> all data (self-managing, prompt drop, no cycles) with a single `Rc<RefCell<Frame>>`
-> carve-out for frames and a `Weak`-registry + neutralize collector for frame
-> cycles. This is §§3–8 (the split) below, chosen over arena-first (§"The arena-first
-> direction") for whole-system representational uniformity: one counting mechanism
-> (`Rc` RAII, compiler-maintained) everywhere, with the sensitive tracing quarantined
-> in one boundary-time collector, rather than an arena + hand-rolled count + free-queue
-> as a second representational world just for frames. Sole trade given up:
-> arena-first's intrinsic id-space (enumeration now rides the `Weak` registry,
-> read-only, assigning ids at walk time). The arena-first sections remain as the
-> considered-and-declined alternative.
+> **Update: direction changed again — see [§0](#0-the-chosen-model--indirected-frames-and-copy-on-write).**
+> The model is now **indirected frames with copy-on-write**: a closure holds a
+> `FrameId`, the engine holds a map from id to `Rc<Frame>`, and mutation goes
+> through `Rc::make_mut`. Driven by **undo**, which the earlier designs treated as
+> a consumer of the memory model rather than a constraint on it.
+>
+> It supersedes both prior directions and, unusually, keeps what each was reaching
+> for: `Rc` everywhere and no second counting mechanism (the `Rc`-spine's goal),
+> and non-owning inter-frame edges with an addressable id space (arena-first's).
+> The one substitution that buys both — a closure holding an *id* rather than a
+> pointer — also removes cycle collection, `RefCell`, and the neutralize dance
+> entirely. §§1–2 remain the analysis it rests on; everything from
+> "The arena-first direction" onward is the record of how we got here.
 
 One arena for everything; refcounting recreated over it; tracing as the
 correctness authority.
@@ -134,7 +135,164 @@ it (see §4 for why non-owning ids matter so much).
 
 ---
 
-## The arena-first direction (chosen)
+## 0. The chosen model — indirected frames and copy-on-write
+
+```rust
+type FrameId = u32;                              // monotonic, never reused
+
+struct Frame { parent: Option<FrameId>, bindings: HashMap<Rc<str>, Value> }
+struct Env   { frames: HashMap<FrameId, Rc<Frame>> }
+
+enum Value {
+    Int(i64), Num(f64), Bool(bool),              // inline leaves
+    Str(Rc<String>), List(Rc<Vec<Value>>),       // data: Rc + COW, as §2.2
+    Function { template: Rc<[Element]>, env: FrameId },   // ← an id, not a pointer
+}
+
+struct Engine { stack: Vec<Value>, env: Env, module: FrameId, next: FrameId, … }
+struct State  { stack: Vec<Value>, env: Env }    // a snapshot: clone the map
+```
+
+Everything follows from the one substitution: **a closure names its environment
+by id rather than pointing at it.**
+
+### 0.1 The id is what makes copy-on-write correct for frames
+
+COW on frames looks obviously wrong, and against a pointer it is:
+
+> A closure captured the module frame, so the frame is never uniquely owned, so
+> the next `set` clones it — and the closure is left holding the old copy,
+> unable to see the new binding. Late binding dies.
+
+That argument depends *entirely* on the closure holding the frame. Once it holds
+an id, the only `Rc<Frame>` holders are the map versions themselves:
+
+| strong count | `Rc::make_mut` does | why it is correct |
+|---|---|---|
+| 1 (live map only) | mutates in place | no snapshot exists to observe the old value |
+| 2+ (live + snapshots) | clones; live map takes the new frame | the snapshot keeps the old frame, as it must |
+
+and in both cases the closure resolves its id **through the live map**, so it
+sees the current contents either way. It never held the thing that got cloned.
+
+Same mechanism, opposite verdict. This is why the model is uniform: `make_mut`
+is now the *only* mutation rule in the system — `map`/`cons`/`put` on data (§2.2)
+and `set` on a frame are the same operation, mutate-when-unique.
+
+It is also `Rc::make_mut`, not interior mutability: mutation needs `&mut` to the
+`Rc`, so exclusivity is compiler-checked. **No `RefCell`** — no borrow-flag cost,
+no borrow panics, and no `Debug` cycle (an id prints as a number).
+
+### 0.2 Cycles cannot form
+
+The ownership graph is strictly layered:
+
+```
+Env ⊃ Rc<Frame> ⊃ Value ⊃ Rc<data>       owning, acyclic by construction
+Value → FrameId                           non-owning, and the only edge back
+```
+
+So §1's governing fact — refcounting loses cycles with no recovery — no longer
+has a population to apply to. The definition cycle that motivated the whole
+collector, `'square {dup *} =` binding a closure into the frame it captured,
+stores the *number* 1 inside frame 1. Self-reference, not self-ownership.
+
+**This is not a preference; the alternative is closed.** To free a frame when its
+last `Function` drops, the id must become an owning handle — and then frame 1's
+count includes the reference from the `Fn` stored inside frame 1, and it never
+reaches zero. Refcounted frames and self-referential definitions cannot both
+reclaim. The id model doesn't count better; it asks a different question.
+
+### 0.3 A recursive bind, traced
+
+`'fac {n: … fac …} =` at the REPL, starting from
+
+```
+env = { 0: {parent:None,    bindings:{+,dup,…}},    ← global
+        1: {parent:Some(0), bindings:{}} }          ← module
+module = 1
+```
+
+| step | effect |
+|---|---|
+| `'fac` | push the name |
+| `{n: …}` | instantiate: `Fn{template:T, env:1}` — pair the template with the *current* frame's id. Nothing is allocated in `env`. |
+| `=` | bind in frame 1: `make_mut` → `1: {parent:Some(0), bindings:{fac: Fn{T, env:1}}}` |
+
+Then `5 fac`:
+
+1. Look up `fac` from frame 1 → `Fn{T, env:1}`.
+2. Apply: allocate frame 2 with `parent: Some(1)` — **the function's captured
+   env, never the caller** — and push an activation over `T`.
+3. `n:` binds into frame 2.
+4. The body reaches `fac`: miss in 2, found in 1.
+
+Step 4 is the point. The closure captured id 1 *before* `fac` existed, and
+resolution happens at call time against the live map — so late binding, mutual
+recursion, and "a template instantiated on line 3 sees the definition on line 40"
+all hold for the same reason. The recursive call allocates frame 3 with parent
+**1**, not 2, so the chain never deepens with recursion depth.
+
+### 0.4 Undo is the reason, and it is now structural
+
+A snapshot is `State { stack, env }` — cloning the map is one `Rc` bump per
+frame, and unchanged frames stay shared. Undo assigns the map back. No
+restore-into-a-live-frame, no identity to preserve by hand, and **every** frame is
+covered rather than just the module frame, so the guarantee doesn't rest on §8's
+"only the current frame is mutable" holding forever (the debt §8 flags for
+continuations and generators).
+
+Two things must sit *outside* the snapshot:
+
+- **`next: FrameId`** — monotonic and never reset by undo. If it rolled back, a
+  post-undo line would mint an id that a value in the discarded future still
+  names. Kept outside, a stale id resolves to *nothing* rather than to the wrong
+  frame — what slotmap's generational keys buy, for free.
+- The reachability filter's roots must include **the data stack**, since a
+  closure on the stack (or inside a list — §4.1's invariant 2) may be the only
+  thing keeping its frame alive.
+
+### 0.5 Reclamation, honestly
+
+Three mechanisms, and one of them is a correction to the obvious reading:
+
+1. **`Rc` on data** — prompt, unchanged, cascades normally (§2.2).
+2. **`Rc` on frames, via the map** — when a version dies (an evicted undo state,
+   a cleared redo future), its map drops, and any frame no surviving version
+   references is freed by refcount. This is what bounds undo's memory with no
+   collector involvement at all.
+3. **A reachability filter on the current version** — mark from `stack + module +
+   calls`, retain what's reachable, run before commit.
+
+**Frames are not promptly reclaimed, and dropping a `Function` frees nothing but
+its template.** The id is not counted, so nothing local can tell the frame it lost
+a reference; its map entry survives until (2) or (3). That is the price, and it is
+the right one to pay because **undo forbids prompt reclamation in any model** — a
+state you can return to must keep its objects alive. The `Rc`-spine design has the
+same retention; it merely expresses it as a rule the collector must remember
+("roots must span the whole history timeline") rather than as structure.
+
+What (3) is *not* is a cycle collector. No `Weak` registry, no
+neutralize-before-free (§6), no ordering hazard — it is `retain(reachable)`, and
+it is optional: skipping it leaks map entries but nothing dangles. **V4 stops
+being "write a cycle collector" and becomes "add a filter."**
+
+Lazy frame allocation (§7.2) is what keeps its job small, and it earns more here
+than it did: a call needs a frame only if it **binds** or **captures**, so
+`+ * dup swap` and the non-binding combinators allocate nothing.
+
+### 0.6 What this costs
+
+- A map lookup per frame hop, rather than a pointer deref.
+- A snapshot is O(frames) pointer bumps — cheaper than the `Rc`-spine's
+  `State`, which copied the module frame's *bindings*.
+- A bind on a snapshotted frame clones that frame's binding map. A persistent map
+  inside the frame would make it O(log n); a `HashMap` is the right starting
+  point at calculator scale.
+
+---
+
+## The arena-first direction (superseded — see §0)
 
 The split (§§3–8) puts data in `Rc` and only frames in an arena. Arena-first makes
 the opposite call: **one arena holds everything**, and the `Rc`-behaviour data
