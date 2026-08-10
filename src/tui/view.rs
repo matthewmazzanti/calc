@@ -64,8 +64,9 @@ fn command_line(app: &App) -> Line<'_> {
 
 /// The stack, shallowest visible level first, deeper levels below, the selected
 /// level highlighted and labels dimmed. A stack taller than [`MAX_STACK_ROWS`]
-/// scrolls under the window, so the first row is `app.top()` rather than level 1
-/// — and the level labels say so, which is how you can tell you are scrolled.
+/// scrolls under the window, so the first row is `app.top()` rather than level 1.
+/// Only what lies *below* is marked, and with a count: what lies above is
+/// already counted by the first row's level number.
 fn stack_lines(app: &App) -> Vec<Line<'static>> {
     let depth = app.depth();
     if depth == 0 {
@@ -81,15 +82,11 @@ fn stack_lines(app: &App) -> Vec<Line<'static>> {
         }
     });
 
-    let above = app.more_above().then(ellipsis).into_iter();
-    let below = app.more_below().then(ellipsis).into_iter();
-    above.chain(values).chain(below).collect()
-}
-
-/// The marker for a stack that continues past the window, indented to sit under
-/// the level labels.
-fn ellipsis() -> Line<'static> {
-    Line::from("  ...").dim()
+    let hidden = app.hidden_below();
+    let more = (hidden > 0)
+        .then(|| Line::from(format!(" ... {hidden} more")).dim())
+        .into_iter();
+    values.chain(more).collect()
 }
 
 /// The info line: the current error, a note, or the last command run. Mode is

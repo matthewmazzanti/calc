@@ -479,23 +479,18 @@ impl App {
         (self.top + MAX_STACK_ROWS as usize - 1).min(self.depth())
     }
 
-    /// Whether the stack continues past the window, in either direction — each
-    /// is worth a `...` row, and a row to draw it in.
-    pub(super) fn more_above(&self) -> bool {
-        self.top > 1
+    /// How many levels lie below the window, 0 when the deepest is on screen.
+    /// Worth a row of its own to report, where what lies *above* is not: the
+    /// first row's level number already counts it.
+    pub(super) fn hidden_below(&self) -> usize {
+        self.depth() - self.visible_last()
     }
 
-    pub(super) fn more_below(&self) -> bool {
-        self.visible_last() < self.depth()
-    }
-
-    /// Rows the stack area needs: one per visible value, plus one for each
-    /// `...`. The markers are *extra* rather than taking a value's place —
-    /// hiding a value to report that values are hidden defeats itself.
+    /// Rows the stack area needs: one per visible value, plus one for the count
+    /// of what is below. That row is *extra* rather than taking a value's place
+    /// — hiding a value to report that values are hidden defeats itself.
     pub(super) fn stack_rows(&self) -> usize {
-        self.depth().clamp(1, MAX_STACK_ROWS as usize)
-            + usize::from(self.more_above())
-            + usize::from(self.more_below())
+        self.depth().clamp(1, MAX_STACK_ROWS as usize) + usize::from(self.hidden_below() > 0)
     }
 
     pub(super) fn notice(&self) -> Option<&Notice> {
@@ -1096,35 +1091,29 @@ mod tests {
     }
 
     #[test]
-    fn the_markers_track_which_way_the_stack_continues() {
+    fn the_marker_counts_what_is_below_the_window() {
         let rows = MAX_STACK_ROWS as usize;
         let mut app = deep(15);
-        assert!(!app.more_above()); // at the top of the stack
-        assert!(app.more_below());
+        assert_eq!(app.hidden_below(), 5); // 15 deep, 10 on screen
         assert_eq!(app.stack_rows(), rows + 1);
 
-        // Walking one past the window scrolls by one, leaving stack in both
-        // directions. Note it takes a *scroll* to get here: `k` from the bottom
-        // would only move the cursor inside the window, not the window.
+        // Scrolling by one uncovers one. It takes a *scroll* to change this:
+        // moving the cursor inside the window leaves the count alone.
         for _ in 0..rows {
             ch(&mut app, 'j');
         }
         assert_eq!(app.top, 2);
-        assert!(app.more_above());
-        assert!(app.more_below());
-        assert_eq!(app.stack_rows(), rows + 2);
+        assert_eq!(app.hidden_below(), 4);
 
         ch(&mut app, 'G');
-        assert!(app.more_above());
-        assert!(!app.more_below()); // at the bottom
-        assert_eq!(app.stack_rows(), rows + 1);
+        assert_eq!(app.hidden_below(), 0); // the deepest is on screen
+        assert_eq!(app.stack_rows(), rows); // and the row goes with it
     }
 
     #[test]
-    fn a_stack_inside_the_window_has_no_markers() {
+    fn a_stack_inside_the_window_has_no_marker() {
         let app = deep(3);
-        assert!(!app.more_above());
-        assert!(!app.more_below());
+        assert_eq!(app.hidden_below(), 0);
         assert_eq!(app.stack_rows(), 3);
     }
 
