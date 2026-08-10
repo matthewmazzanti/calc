@@ -16,6 +16,10 @@ pub(super) enum Mode {
     /// Edit the command line. Every key is typed verbatim — no auto-push, no
     /// mid-entry parsing — and the whole buffer is evaluated on Enter.
     Insert,
+    /// Type a meta-operation, reached from normal with `:`. These are things
+    /// done *to* the calculator rather than with it — they are not words, they
+    /// cannot appear in a program, and they are not undoable.
+    Command,
 }
 
 /// A transient message for the info bar, cleared on the next keypress.
@@ -346,6 +350,9 @@ pub(super) struct App {
     mode: Mode,
     /// The command line: buffer, caret, and the committed lines `^P`/`^N` walk.
     input: LineEditor,
+    /// Command mode's own line. Separate so `:` cannot eat a half-typed
+    /// expression, and so recall doesn't mix meta-operations with arithmetic.
+    command: LineEditor,
     /// Selected stack level in normal mode, 1-based from the top (level 1 is
     /// the top of stack). Kept clamped to the stack, or 1 when empty.
     cursor: usize,
@@ -368,6 +375,7 @@ impl App {
             }),
             mode: Mode::Insert,
             input: LineEditor::default(),
+            command: LineEditor::default(),
             cursor: 1,
             last: None,
             notice: None,
@@ -385,13 +393,14 @@ impl App {
         self.mode
     }
 
-    pub(super) fn input(&self) -> &str {
-        self.input.text()
+    /// The buffer the current mode is typing into.
+    pub(super) fn line(&self) -> &str {
+        self.active().text()
     }
 
-    /// The caret column within the command line, for the terminal cursor.
+    /// The caret column within that buffer, for the terminal cursor.
     pub(super) fn caret_col(&self) -> usize {
-        self.input.caret_col()
+        self.active().caret_col()
     }
 
     pub(super) fn cursor(&self) -> usize {
@@ -439,6 +448,7 @@ impl App {
         match self.mode {
             Mode::Normal => self.handle_normal(key),
             Mode::Insert => self.handle_insert(key),
+            Mode::Command => self.handle_command(key),
         }
         self.clamp_cursor();
     }
@@ -448,6 +458,22 @@ impl App {
     /// The live engine: the history's current snapshot.
     fn engine(&self) -> &Engine {
         &self.history.current().engine
+    }
+
+    /// The line editor the current mode types into. Normal mode keeps showing
+    /// the insert buffer, so only command mode diverts.
+    fn active(&self) -> &LineEditor {
+        match self.mode {
+            Mode::Command => &self.command,
+            Mode::Normal | Mode::Insert => &self.input,
+        }
+    }
+
+    fn active_mut(&mut self) -> &mut LineEditor {
+        match self.mode {
+            Mode::Command => &mut self.command,
+            Mode::Normal | Mode::Insert => &mut self.input,
+        }
     }
 
     /// Keep the cursor on a real level (or 1 when the stack is empty).
@@ -493,6 +519,8 @@ impl App {
             }
             // Repeat the last change, vim's `.`.
             KeyCode::Char('.') => self.repeat(),
+            // Meta-operations, vim's `:`.
+            KeyCode::Char(':') => self.mode = Mode::Command,
             _ => {}
         }
     }
@@ -528,29 +556,84 @@ impl App {
     fn handle_edit(&mut self, key: KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let editor = self.active_mut();
         match key.code {
-            KeyCode::Backspace => self.input.backspace(),
-            KeyCode::Delete => self.input.delete(),
-            KeyCode::Home => self.input.move_home(),
-            KeyCode::End => self.input.move_end(),
-            KeyCode::Left if ctrl || alt => self.input.move_word_left(),
-            KeyCode::Right if ctrl || alt => self.input.move_word_right(),
-            KeyCode::Left => self.input.move_left(),
-            KeyCode::Right => self.input.move_right(),
-            KeyCode::Char('a') if ctrl => self.input.move_home(),
-            KeyCode::Char('e') if ctrl => self.input.move_end(),
-            KeyCode::Char('b') if ctrl => self.input.move_left(),
-            KeyCode::Char('f') if ctrl => self.input.move_right(),
-            KeyCode::Char('b') if alt => self.input.move_word_left(),
-            KeyCode::Char('f') if alt => self.input.move_word_right(),
-            KeyCode::Char('u') if ctrl => self.input.kill_to_start(),
-            KeyCode::Char('k') if ctrl => self.input.kill_to_end(),
-            KeyCode::Char('w') if ctrl => self.input.kill_word_left(),
-            KeyCode::Char('p') if ctrl => self.input.recall_prev(),
-            KeyCode::Char('n') if ctrl => self.input.recall_next(),
+            KeyCode::Backspace => editor.backspace(),
+            KeyCode::Delete => editor.delete(),
+            KeyCode::Home => editor.move_home(),
+            KeyCode::End => editor.move_end(),
+            KeyCode::Left if ctrl || alt => editor.move_word_left(),
+            KeyCode::Right if ctrl || alt => editor.move_word_right(),
+            KeyCode::Left => editor.move_left(),
+            KeyCode::Right => editor.move_right(),
+            KeyCode::Char('a') if ctrl => editor.move_home(),
+            KeyCode::Char('e') if ctrl => editor.move_end(),
+            KeyCode::Char('b') if ctrl => editor.move_left(),
+            KeyCode::Char('f') if ctrl => editor.move_right(),
+            KeyCode::Char('b') if alt => editor.move_word_left(),
+            KeyCode::Char('f') if alt => editor.move_word_right(),
+            KeyCode::Char('u') if ctrl => editor.kill_to_start(),
+            KeyCode::Char('k') if ctrl => editor.kill_to_end(),
+            KeyCode::Char('w') if ctrl => editor.kill_word_left(),
+            KeyCode::Char('p') if ctrl => editor.recall_prev(),
+            KeyCode::Char('n') if ctrl => editor.recall_next(),
             _ => return false,
         }
         true
+    }
+
+    /// Command mode: readline editing over its own buffer, Enter to run, Esc to
+    /// bail. Ordinary characters type themselves, as in insert mode.
+    fn handle_command(&mut self, key: KeyEvent) {
+        if self.handle_edit(key) {
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.command.clear();
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Enter => self.run_command(),
+            KeyCode::Char(c) => self.command.insert(c),
+            _ => {}
+        }
+    }
+
+    /// Run the meta-operation on the command line and return to normal. An
+    /// unknown name keeps the buffer and stays put, so it can be fixed.
+    fn run_command(&mut self) {
+        match self.command.text().trim().to_string().as_str() {
+            "" => self.command.clear(),
+            "clear" => {
+                self.clear();
+                self.command.commit();
+            }
+            other => {
+                self.notice = Some(Notice::Note(format!("unknown command: {other}")));
+                return;
+            }
+        }
+        self.mode = Mode::Normal;
+    }
+
+    /// `:clear` — start over: a fresh engine, so bindings and the prelude reset
+    /// with the stack, an empty timeline, and nothing to repeat.
+    ///
+    /// **Deliberately not an [`Action`].** An action is a change recorded on the
+    /// timeline; this discards the timeline, so there is no state to undo back
+    /// to and no snapshot that would mean anything. That is the point of it
+    /// being a meta-operation rather than a word.
+    ///
+    /// The command line's own history survives, and so does the insert buffer's:
+    /// those record what you *typed*, which the calculator forgetting its stack
+    /// has no bearing on.
+    fn clear(&mut self) {
+        self.history = History::new(Snapshot {
+            engine: Engine::new(),
+            cmd: None,
+        });
+        self.last = None;
+        self.cursor = 1;
     }
 
     /// Parse and run the command-line buffer. On success it clears; on error
@@ -686,8 +769,10 @@ mod tests {
     /// The command line rendered as `text|caret`, so a test asserts the buffer
     /// and the caret position together.
     fn line(app: &App) -> String {
-        let col = app.input.caret_col();
-        let text = app.input.text();
+        // The buffer the *mode* is typing into, so a command-mode assertion is
+        // about the line actually on screen.
+        let col = app.active().caret_col();
+        let text = app.active().text();
         let at = text.char_indices().nth(col).map_or(text.len(), |(i, _)| i);
         format!("{}|{}", &text[..at], &text[at..])
     }
@@ -1394,6 +1479,108 @@ mod tests {
         press(&mut app, KeyCode::Enter); // commits the whole line regardless
         assert_eq!(app.stack(), &[12.0]);
         assert_eq!(line(&app), "|"); // buffer and caret cleared
+    }
+
+    // --- Command mode. ---
+
+    #[test]
+    fn colon_opens_command_mode_without_disturbing_the_buffer() {
+        // Separate buffers: `:` must not eat a half-typed expression.
+        let mut app = App::new();
+        typ(&mut app, "3 4 +");
+        press(&mut app, KeyCode::Esc);
+
+        ch(&mut app, ':');
+        assert_eq!(app.mode, Mode::Command);
+        assert_eq!(line(&app), "|"); // command mode's own line, empty
+        typ(&mut app, "cle");
+        assert_eq!(line(&app), "cle|");
+
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(line(&app), "3 4 +|"); // the expression is still there
+    }
+
+    #[test]
+    fn clear_starts_over() {
+        let mut app = App::new();
+        run(&mut app, "1 'x set");
+        run(&mut app, "2 3 +");
+        press(&mut app, KeyCode::Esc);
+        ch(&mut app, 'j'); // move the cursor off the top
+
+        ch(&mut app, ':');
+        typ(&mut app, "clear");
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.stack().is_empty());
+        assert_eq!(app.engine().lookup("x"), None); // a fresh engine, not a fresh stack
+        assert_eq!(app.cursor, 1);
+        assert!(app.last.is_none()); // nothing to repeat
+    }
+
+    #[test]
+    fn clear_is_not_undoable() {
+        // It discards the timeline rather than adding to it, so there is no
+        // state to go back to — which is why it is a meta-operation and not an
+        // `Action`.
+        let mut app = App::new();
+        run(&mut app, "1 2 3");
+        press(&mut app, KeyCode::Esc);
+        ch(&mut app, ':');
+        typ(&mut app, "clear");
+        press(&mut app, KeyCode::Enter);
+
+        ch(&mut app, 'u');
+        assert!(app.stack().is_empty());
+        assert!(matches!(app.notice, Some(Notice::Note(_)))); // "nothing to undo"
+    }
+
+    #[test]
+    fn clear_keeps_what_you_typed() {
+        // Line history records typing, not calculator state, so it survives.
+        let mut app = App::new();
+        run(&mut app, "1 2 3");
+        press(&mut app, KeyCode::Esc);
+        ch(&mut app, ':');
+        typ(&mut app, "clear");
+        press(&mut app, KeyCode::Enter);
+
+        ch(&mut app, 'i');
+        ctrl(&mut app, 'p');
+        assert_eq!(line(&app), "1 2 3|");
+    }
+
+    #[test]
+    fn an_unknown_command_stays_put_to_be_fixed() {
+        let mut app = App::new();
+        run(&mut app, "1 2");
+        press(&mut app, KeyCode::Esc);
+        ch(&mut app, ':');
+        typ(&mut app, "clesr");
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.mode, Mode::Command);
+        assert_eq!(line(&app), "clesr|");
+        assert_eq!(app.stack(), &[1.0, 2.0]);
+        let Some(Notice::Note(note)) = &app.notice else {
+            panic!("expected a note");
+        };
+        assert_eq!(note, "unknown command: clesr");
+    }
+
+    #[test]
+    fn command_mode_has_its_own_recall() {
+        let mut app = App::new();
+        press(&mut app, KeyCode::Esc);
+        ch(&mut app, ':');
+        typ(&mut app, "clear");
+        press(&mut app, KeyCode::Enter);
+
+        ch(&mut app, ':');
+        ctrl(&mut app, 'p');
+        assert_eq!(line(&app), "clear|");
     }
 
     // --- Dot-repeat. ---

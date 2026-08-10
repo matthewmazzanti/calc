@@ -33,20 +33,24 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
     frame.render_widget(Paragraph::new(info_line(app)), info_area);
 }
 
-/// The command-line prompt for a mode: `>` for insert, `:` for normal, `'` for
-/// quote (literal entry).
+/// The command-line prompt for a mode: `>` for insert, `:` for command. Normal
+/// gets blank rather than a marker — the row still shows the insert buffer you
+/// left behind, and a prompt there would advertise an input the mode doesn't
+/// take. Normal is legible from the highlighted stack level instead.
 fn prompt(mode: Mode) -> &'static str {
     match mode {
         Mode::Insert => "> ",
-        Mode::Normal => ": ",
+        Mode::Command => ": ",
+        Mode::Normal => "  ",
     }
 }
 
-/// The command line: the teal mode prompt followed by the input buffer.
+/// The command line: the teal mode prompt followed by whichever buffer the mode
+/// is typing into.
 fn command_line(app: &App) -> Line<'_> {
     Line::from(vec![
         Span::styled(prompt(app.mode()), Style::new().fg(Color::Cyan)),
-        Span::raw(app.input()),
+        Span::raw(app.line()),
     ])
 }
 

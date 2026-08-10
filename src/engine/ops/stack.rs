@@ -18,11 +18,11 @@
 //! sits: `dup`/`drop` at 1, `swap` at 2, `rot` at 3 — though rot has no `-at`
 //! at all, being a span operation already.
 //!
-//! Every word here is one of those, at a level or at a constant — `clear` is
-//! the lone exception, being the machine's stack reset. A "copy X and place it
-//! at Y" takes two indices rather than one and so belongs to no family: `tuck`
-//! and `dupd` were exactly that, and are gone. They spell out as `swap over`
-//! and `over swap`.
+//! Every word here is one of those, at a level or at a constant — with no
+//! exceptions left. A "copy X and place it at Y" takes two indices rather than
+//! one and so belongs to no family: `tuck` and `dupd` were exactly that, and are
+//! gone, spelling out as `swap over` and `over swap`. `clear` left too, being a
+//! decision a person makes rather than a step a program takes.
 //!
 //! This is the one word module that reaches into the stack `Vec`; the rest are
 //! built on the machine's `pop`/`push` API, and stay that way. Holding the
@@ -169,9 +169,6 @@ pub(super) static PRIMITIVES: &[Primitive] = &[
     Primitive { name: "unrot-to", run: |e| indexed(e, unrot_to) },
     Primitive { name: "rot",    run: |e| rot_to(e, 3) },   // a b c -- b c a
     Primitive { name: "unrot",  run: |e| unrot_to(e, 3) }, // a b c -- c a b
-
-    // The machine's stack reset.
-    Primitive { name: "clear",  run: Engine::clear },
 ];
 
 /// Run an indexed shuffle with its 1-based level popped off the stack.

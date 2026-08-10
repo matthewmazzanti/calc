@@ -679,8 +679,15 @@ fn rot_brings_third_to_top() {
 }
 
 #[test]
-fn clear_empties_the_stack() {
-    assert!(run("1 2 3 clear").stack().is_empty());
+fn clear_is_not_a_word() {
+    // Emptying the stack is a decision a person makes, not a step a program
+    // takes — from a program it is almost always a bug, and one that destroys
+    // the evidence. The engine has no method for it either: the TUI's `:clear`
+    // starts a *fresh engine*, so there is nothing here to expose.
+    assert_eq!(
+        run_err("1 2 3 clear"),
+        ErrorKind::UnboundName("clear".to_string())
+    );
 }
 
 #[test]

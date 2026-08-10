@@ -81,9 +81,9 @@ fn event_loop(mut terminal: Terminal<CrosstermBackend<Stdout>>, app: &mut App) -
             height = wanted;
         }
 
-        // A beam cursor while editing the command line, a block otherwise.
+        // A beam cursor wherever a line is being edited, a block otherwise.
         let cursor_style = match app.mode() {
-            Mode::Insert => SetCursorStyle::SteadyBar,
+            Mode::Insert | Mode::Command => SetCursorStyle::SteadyBar,
             Mode::Normal => SetCursorStyle::DefaultUserShape,
         };
         execute!(io::stdout(), cursor_style)?;

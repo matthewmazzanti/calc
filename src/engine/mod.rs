@@ -461,12 +461,6 @@ impl Engine {
         Ok(())
     }
 
-    /// `clear`: empty the stack.
-    pub(crate) fn clear(&mut self) -> Result<(), ErrorKind> {
-        self.stack.clear();
-        Ok(())
-    }
-
     /// Resolve a bare word: a user binding (which shadows) pushes its value;
     /// otherwise a builtin from the prelude is applied; otherwise `UnboundName`.
     /// For a plain value this "application" is just a push — a value is a
