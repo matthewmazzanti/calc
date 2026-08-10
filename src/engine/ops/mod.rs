@@ -29,9 +29,6 @@ mod list;
 mod number;
 mod stack;
 
-// `dup`, which the TUI's empty-Enter dispatches directly.
-pub(crate) use stack::DUP;
-
 /// Every primitive across the group tables, in order — the source the prelude
 /// binds into the global frame. Adding a module is one row.
 pub(crate) fn primitives() -> impl Iterator<Item = &'static Primitive> {

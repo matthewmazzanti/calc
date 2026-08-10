@@ -5,15 +5,9 @@
 
 use crate::engine::{Engine, ErrorKind, Primitive};
 
-/// `dup`, named so the TUI can dispatch it directly for the empty-Enter shortcut.
-pub(crate) const DUP: Primitive = Primitive {
-    name: "dup",
-    run: dup,
-};
-
 #[rustfmt::skip]
 pub(super) static PRIMITIVES: &[Primitive] = &[
-    DUP,                                                   // a -- a a
+    Primitive { name: "dup",    run: |e| e.pick_at(1) },   // a -- a a
     Primitive { name: "drop",   run: |e| e.drop_at(1) },   // a --
     Primitive { name: "swap",   run: |e| e.swap_at(1) },   // a b -- b a
     Primitive { name: "over",   run: |e| e.pick_at(2) },   // a b -- a b a
@@ -32,10 +26,6 @@ pub(super) static PRIMITIVES: &[Primitive] = &[
     Primitive { name: "swapn",  run: |e| indexed(e, Engine::swap_at) },
     Primitive { name: "clear",  run: Engine::clear },
 ];
-
-fn dup(e: &mut Engine) -> Result<(), ErrorKind> {
-    e.pick_at(1)
-}
 
 /// `tuck` ( a b -- b a b ): tuck a copy of the top below the second.
 fn tuck(e: &mut Engine) -> Result<(), ErrorKind> {

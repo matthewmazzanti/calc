@@ -35,10 +35,6 @@ pub use program::{parse, Element, Region, Template};
 pub use token::Span;
 pub use value::{MarkKind, Value};
 
-// `dup` is dispatched directly by the TUI's empty-Enter; every other word is
-// reached by resolving it, which is what makes them all rebindable.
-pub(crate) use ops::DUP;
-
 /// The stack of values, bottom-to-top: the top of stack is the last element.
 /// Internal — the public handle is [`Engine`].
 type Stack = Vec<Value>;
@@ -394,11 +390,11 @@ impl Engine {
         }
     }
 
-    /// Run a primitive — invoke its dispatch target. Reached by
-    /// [`Engine::resolve_word`] (bare-word application), or called directly by
-    /// the TUI for its empty-Enter `dup`. The behavior lives in the [`ops`]
-    /// modules, not here.
-    pub(crate) fn run_builtin(&mut self, primitive: &Primitive) -> Result<(), ErrorKind> {
+    /// Run a primitive — invoke its dispatch target. Reached only by resolving a
+    /// bare word, so every primitive is rebindable; a caller that wants a
+    /// specific op regardless of the vocabulary calls the machine method it is
+    /// built on. The behavior lives in the [`ops`] modules, not here.
+    fn run_builtin(&mut self, primitive: &Primitive) -> Result<(), ErrorKind> {
         (primitive.run)(self)
     }
 

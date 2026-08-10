@@ -5,7 +5,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::engine::{self, CalcError, Element, Engine, ErrorKind, Outcome, Value, DUP};
+use crate::engine::{self, CalcError, Element, Engine, ErrorKind, Outcome, Value};
 use crate::history::History;
 
 /// Vim-style editing modes.
@@ -368,40 +368,19 @@ impl App {
             KeyCode::Char('j') | KeyCode::Down => self.cursor += 1,
             KeyCode::Char('k') | KeyCode::Up => self.cursor = self.cursor.saturating_sub(1),
 
-            // Cursor-relative stack edits. These call the engine's stack ops
-            // *directly* (not as a program element through `apply`), so a stack
-            // edit always hits the stack rather than being read as a word.
+            // Cursor-relative stack edits. Each names the machine method it
+            // wants, so a stack edit always hits the stack rather than going
+            // through word resolution and being read as a (rebindable) word.
             KeyCode::Char('x') | KeyCode::Char('d') => {
-                let level = self.cursor;
-                self.edit(cursor_label("drop", "dropn", level), move |e| {
-                    e.drop_at(level)
-                });
+                self.shuffle("drop", "dropn", 1, Engine::drop_at);
             }
-            KeyCode::Char('s') => {
-                let level = self.cursor;
-                self.edit(cursor_label("swap", "swapn", level), move |e| {
-                    e.swap_at(level)
-                });
-            }
+            KeyCode::Char('s') => self.shuffle("swap", "swapn", 1, Engine::swap_at),
             // Ctrl-R redoes (vim-style); a bare `r` rotates at the cursor.
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => self.redo(),
-            KeyCode::Char('r') => {
-                let level = self.cursor;
-                let label = if level == 3 {
-                    "rot".to_string()
-                } else {
-                    format!("rolln {level}")
-                };
-                self.edit(label, move |e| e.roll_at(level));
-            }
+            KeyCode::Char('r') => self.shuffle("rot", "rolln", 3, Engine::roll_at),
             KeyCode::Char('u') => self.undo(),
             // Copy the selected value to the top.
-            KeyCode::Enter => {
-                let level = self.cursor;
-                self.edit(cursor_label("dup", "pickn", level), move |e| {
-                    e.pick_at(level)
-                });
-            }
+            KeyCode::Enter => self.shuffle("dup", "pickn", 1, Engine::pick_at),
             _ => {}
         }
     }
@@ -419,7 +398,7 @@ impl App {
             // once). With an empty buffer it duplicates the top of stack.
             KeyCode::Enter => {
                 if self.input.text().trim().is_empty() {
-                    self.edit("dup".to_string(), |e| e.run_builtin(&DUP));
+                    self.edit("dup".to_string(), |e| e.pick_at(1));
                 } else {
                     self.commit_input();
                 }
@@ -488,6 +467,27 @@ impl App {
         }
     }
 
+    /// A cursor-relative stack edit: run `op` at the selected level as one undo
+    /// unit, labelled with the word that names it. `fixed_at` is the level the
+    /// fixed shuffle is defined for — `drop` *is* `dropn 1` and `rot` *is*
+    /// `rolln 3` — so the info bar reads `drop` on the top of stack and
+    /// `dropn 3` further down.
+    fn shuffle(
+        &mut self,
+        fixed: &str,
+        wordn: &str,
+        fixed_at: usize,
+        op: fn(&mut Engine, usize) -> Result<(), ErrorKind>,
+    ) {
+        let level = self.cursor;
+        let label = if level == fixed_at {
+            fixed.to_string()
+        } else {
+            format!("{wordn} {level}")
+        };
+        self.edit(label, move |e| op(e, level));
+    }
+
     /// Apply an in-place engine op (the cursor stack edits) as one undo unit,
     /// adapting the `&mut` op into the consuming transform `update` expects. A
     /// bare `ErrorKind` becomes a trace-less `CalcError`.
@@ -541,17 +541,6 @@ impl App {
 impl Default for App {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Info-bar label for a cursor stack edit at `level`: the fixed-shuffle word
-/// when the level names one (level 1 == top), else the N-suffixed word plus the
-/// level — so editing the top reads `drop`, deeper reads `dropn 3`.
-fn cursor_label(fixed: &str, wordn: &str, level: usize) -> String {
-    if level == 1 {
-        fixed.to_string()
-    } else {
-        format!("{wordn} {level}")
     }
 }
 
@@ -942,6 +931,32 @@ mod tests {
         ch(&mut app, 'u');
         assert_eq!(app.stack(), &[1.0]); // same values either side of the undo
         assert_eq!(app.cmd(), "1"); // but back to the state the `1` line made
+    }
+
+    #[test]
+    fn a_cursor_edit_is_labelled_by_the_word_that_names_it() {
+        // The fixed shuffle is the one defined at that level — `drop` *is*
+        // `dropn 1`, `rot` *is* `rolln 3` — so the same key labels differently
+        // depending on where the cursor sits.
+        let mut app = stacked("1 2 3");
+        ch(&mut app, 'x'); // cursor at the top
+        assert_eq!(app.cmd(), "drop");
+        ch(&mut app, 'u');
+
+        ch(&mut app, 'j');
+        ch(&mut app, 'j'); // cursor at level 3
+        ch(&mut app, 'x');
+        assert_eq!(app.cmd(), "dropn 3");
+
+        // The drop shrank the stack, so the cursor was clamped to level 2;
+        // undoing restores the depth but not the cursor, hence the `j`.
+        ch(&mut app, 'u');
+        assert_eq!(app.cursor, 2);
+        ch(&mut app, 'j');
+
+        ch(&mut app, 'r'); // rot is rolln 3, so at level 3 it is plain `rot`
+        assert_eq!(app.cmd(), "rot");
+        assert_eq!(app.stack(), &[2.0, 3.0, 1.0]);
     }
 
     #[test]
