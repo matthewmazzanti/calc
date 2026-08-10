@@ -624,10 +624,6 @@ impl Engine {
 
     /// Move the top value down to `level` — the inverse of [`Engine::roll_at`].
     /// `unrot` = 3, `rolldn`.
-    // Exposed for completeness rather than for a caller: this interface is the
-    // set of edits the machine offers, and `roll_at`/`rolld_at` are inverses.
-    // Nothing in the TUI binds it yet — normal mode has no `unrot` key.
-    #[allow(dead_code)]
     pub fn rolld_at(&mut self, level: usize) -> Result<(), ErrorKind> {
         ops::stack::rolld_at(self, level)
     }

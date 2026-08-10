@@ -248,6 +248,9 @@ pub(super) enum Action {
     Swap(usize),
     /// Move the value at a level up to the top. Level 3 is `rot`.
     Roll(usize),
+    /// Move the top value down to a level — the inverse of [`Action::Roll`].
+    /// Level 3 is `unrot`.
+    Rolld(usize),
     /// A line that was parsed and run — kept as the program, not the text.
     /// `^P` is the way back to what you typed; this is the way back to what it
     /// did, so a repeat costs no re-parse and can't fail differently.
@@ -262,6 +265,7 @@ impl Action {
             Self::Drop(level) => engine.drop_at(*level).map_err(CalcError::from),
             Self::Swap(level) => engine.swap_at(*level).map_err(CalcError::from),
             Self::Roll(level) => engine.roll_at(*level).map_err(CalcError::from),
+            Self::Rolld(level) => engine.rolld_at(*level).map_err(CalcError::from),
             Self::Cmd(program) => engine.apply(program),
         }
     }
@@ -275,6 +279,7 @@ impl Action {
             Self::Drop(_) => Self::Drop(level),
             Self::Swap(_) => Self::Swap(level),
             Self::Roll(_) => Self::Roll(level),
+            Self::Rolld(_) => Self::Rolld(level),
             Self::Cmd(program) => Self::Cmd(program.clone()),
         }
     }
@@ -296,6 +301,8 @@ impl std::fmt::Display for Action {
             Self::Swap(level) => write!(f, "swapn {level}"),
             Self::Roll(3) => f.write_str("rot"),
             Self::Roll(level) => write!(f, "rolln {level}"),
+            Self::Rolld(3) => f.write_str("unrot"),
+            Self::Rolld(level) => write!(f, "rolldn {level}"),
             Self::Cmd(program) => {
                 for (i, element) in program.iter().enumerate() {
                     if i > 0 {
@@ -463,11 +470,17 @@ impl App {
             KeyCode::Char('s') => {
                 self.update(Action::Swap(self.cursor));
             }
-            // Ctrl-R redoes (vim-style); a bare `r` rotates at the cursor.
-            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => self.redo(),
-            KeyCode::Char('r') => {
+            // `h`/`l` are the roll pair, and inverses of each other: `h` brings
+            // the selected value up to the top, `l` sends the top back down to
+            // the selection. On the cursor's own level both are no-ops.
+            KeyCode::Char('h') => {
                 self.update(Action::Roll(self.cursor));
             }
+            KeyCode::Char('l') => {
+                self.update(Action::Rolld(self.cursor));
+            }
+            // Ctrl-R redoes, vim-style.
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => self.redo(),
             KeyCode::Char('u') => self.undo(),
             // Copy the selected value to the top.
             KeyCode::Enter => {
@@ -840,9 +853,44 @@ mod tests {
         let mut app = stacked("1 2 3");
         ch(&mut app, 'j');
         ch(&mut app, 'j'); // cursor at level 3 (the value 1)
-        ch(&mut app, 'r');
+        ch(&mut app, 'h');
         assert_eq!(app.stack(), &[2.0, 3.0, 1.0]);
         assert_eq!(app.cursor, 3); // cursor stays put, not reset to the top
+    }
+
+    #[test]
+    fn normal_unroll_sends_the_top_down_to_the_cursor() {
+        let mut app = stacked("1 2 3");
+        ch(&mut app, 'j');
+        ch(&mut app, 'j'); // cursor at level 3, where the top should land
+        ch(&mut app, 'l');
+        assert_eq!(app.stack(), &[3.0, 1.0, 2.0]);
+        assert_eq!(cmd(&app), "unrot"); // unrot *is* rolldn 3
+    }
+
+    #[test]
+    fn roll_and_unroll_are_inverses_at_the_same_level() {
+        // `h` brings the selected value up, `l` puts the top back where the
+        // cursor is — so at a fixed level they undo each other.
+        let mut app = stacked("1 2 3 4");
+        ch(&mut app, 'j');
+        ch(&mut app, 'j'); // cursor at level 3 (the value 2)
+        ch(&mut app, 'h');
+        assert_eq!(app.stack(), &[1.0, 3.0, 4.0, 2.0]);
+        ch(&mut app, 'l');
+        assert_eq!(app.stack(), &[1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn r_no_longer_rolls() {
+        // The roll moved to `h`; a bare `r` is unbound, and must not fall
+        // through to anything else.
+        let mut app = stacked("1 2 3");
+        ch(&mut app, 'j');
+        ch(&mut app, 'j');
+        ch(&mut app, 'r');
+        assert_eq!(app.stack(), &[1.0, 2.0, 3.0]);
+        assert!(app.notice.is_none());
     }
 
     #[test]
@@ -852,7 +900,7 @@ mod tests {
         ch(&mut app, 'j'); // cursor at level 3
         ch(&mut app, 's'); // swap at cursor
         assert_eq!(app.cursor, 3);
-        ch(&mut app, 'r'); // rotate at cursor
+        ch(&mut app, 'h'); // rotate at cursor
         assert_eq!(app.cursor, 3);
     }
 
@@ -1034,7 +1082,7 @@ mod tests {
         assert_eq!(app.cursor, 2);
         ch(&mut app, 'j');
 
-        ch(&mut app, 'r'); // rot is rolln 3, so at level 3 it is plain `rot`
+        ch(&mut app, 'h'); // rot is rolln 3, so at level 3 it is plain `rot`
         assert_eq!(cmd(&app), "rot");
         assert_eq!(app.stack(), &[2.0, 3.0, 1.0]);
     }

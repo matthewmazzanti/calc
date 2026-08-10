@@ -35,7 +35,8 @@ Some examples to try:
 - Your current stack is always visible
 - Fully transactional errors - divide by zero resets you to before the last REPL line
 - Linear undo/redo, full internal engine is snapshotted after the return of each repl line
-- Vim keybindings (esc to enter normal mode, hjkl to move around the stack)
+- Vim keybindings (esc for normal mode, `j`/`k` to move up and down the stack,
+  `x`/`s`/`h`/`l` to drop, swap and roll at the cursor, `.` to repeat)
 - Readline editing on the command line, with `^P`/`^N` to step back and forth
   through the lines you've run — recall, edit, re-run
 

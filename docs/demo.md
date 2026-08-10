@@ -48,7 +48,9 @@ This is the part `-c` can't show, so it earns screen time.
 - Type `1 2 3 4` and Enter.
 - **Esc** → normal mode. The cursor lands on level 1.
 - **j / k** (or arrows) walk the cursor down and up the stack.
-- **x** drops at the cursor. **s** swaps. **r** rotates to top.
+- **x** drops at the cursor. **s** swaps. **h** rolls the selected value up to
+  the top, **l** sends the top back down to it.
+- **.** repeats the last change, re-aimed at wherever the cursor is now.
 - **u** undoes, **Ctrl-R** redoes — and undo reverts a *whole committed line*,
   not one keystroke.
 - **i** returns to insert mode.
