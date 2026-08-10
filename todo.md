@@ -8,6 +8,13 @@
     forward stack on a new edit after an undo, branch it, so no state is ever
     lost. Needs a tree of states with per-node children + navigation
     (`g-`/`g+`-style time travel, not just linear undo/redo).
+- [x] **The history *is* the state** — `App` no longer holds an engine beside
+  `history`; the current snapshot's engine is the live one, so there is no
+  invariant to maintain by hand and undo/redo are just cursor moves. A snapshot
+  is taken per **user action**, not per value change: a line that leaves the
+  engine looking identical still gets its own point, because what earns an undo
+  step is that you *did* something. The change itself is a value (`Action`),
+  which is also what `.` repeats and what labels the info bar.
 
 ## Engine / evaluation
 - [ ] **Unbounded ints** — `Value::Int` is `i64`, so `+ - *` promote to `f64`
@@ -40,16 +47,29 @@
   the `concatenative-language` branch. Ops are un-parameterized: the indexed
   words (`dup-at`/`dup-to`/`drop-at`/`drop-to`/`swap-at`/`swap-to`/`rot-to`/
   `unrot-to`) pop their 1-based level off
-  the stack (via `Engine::indexed`), and the fixed shuffles (`dup`/`swap`/`rot`
-  …) are their own no-arg builtins. The cursor UI took the "separate path"
-  answer: it calls the `*_at(level)` engine methods directly rather than
-  emitting an op, so a stack edit never routes through word resolution.
+  the stack (via the free `indexed` in `ops/stack.rs`), and the fixed shuffles
+  (`dup`/`swap`/`rot` …) are those same ops at a written-in level. The cursor UI
+  took the "separate path" answer: it calls the engine's exposed level methods
+  directly rather than emitting an op, so a stack edit never routes through word
+  resolution — and therefore cannot be intercepted by rebinding `dup`.
 - [x] **TUI passes programs, not strings** — `eval(&str)` is off the engine;
   parsing is now a free `engine::parse(&str) -> Result<Vec<Command>, ErrorKind>`
   the TUI calls before `apply(&[Command])`. Parse errors (no engine/trace to
   show) surface as a plain note; runtime errors keep the full trace. `apply`
   borrows the program (see the reasoning: callers need it after, single-command
   ops stay alloc-free, the trace clone is cold-path only).
+- [x] **Standardise the stack ops** — every word is now an indexed op or one of
+  them at a constant level, with no exceptions. Two ways to name a target:
+  `-at` is the operation *positioned at* a level, `-to` the one *spanning* the
+  top down to it — so the old `dropn`-vs-`2drop` trap (depth vs width under
+  names giving no hint which) cannot be restated. Where both exist they coincide
+  at the family's arity, and that is where the bare word sits: `dup`/`drop` at 1,
+  `swap` at 2, `rot` at 3. `swap-at` reaches for the *top* rather than the
+  neighbour below, which makes level 1 the degenerate case instead of level
+  `depth` and removes a failure mode. Rot is `-to` only: its ends-only form is
+  `swap-at` under another name. `tuck`/`dupd` are gone (two indices, so no
+  family) and so is `clear` (a decision a person makes, not a step a program
+  takes — it is `:clear` now). Full table in `ops/stack.rs`.
 - [ ] **Variables / let bindings** — survey Forth (and RPL/HP48 local vars,
   `LSTO`/`→`) for approaches before committing to a model. Question: named
   registers vs. a proper binding scope; how they interact with undo.
@@ -62,29 +82,78 @@
 
 ## TUI
 - [x] **Basic readline editing** — a `LineEditor` (text + a caret byte-offset)
-  replaces the append-only buffer, shared by insert and quote modes via a
-  `handle_edit` helper. Bindings: `^A`/`^E`/Home/End (line start/end), `^B`/`^F` +
-  arrows (move char), `^W` (kill word back), `^U`/`^K` (kill to start/end),
-  Alt-`b`/`f` + `^`/Alt-arrows (move word), Delete (delete-forward). `^D` still
-  quits (kept as-is), so it is *not* wired to readline's delete-forward/EOF.
-  Full readline (kill ring, incremental history search) later.
-- [x] **Quote mode** — a third `Mode::Quote`, opened from insert on an empty
-  buffer with `'` (mid-entry `'` stays a literal char). Every key — operators and
-  space included — is typed verbatim with no auto-push and no mid-entry parsing;
-  Enter evaluates the whole line at once via `commit_input` and drops back to
-  insert (staying in quote if the line fails to parse). Esc bails to insert,
-  keeping the buffer. Prompt is `'`, beam cursor like insert. Still a natural
-  home for the structured literals below (complex `(re, im)`, matrix `[…]`) and
-  future HP48-style `'…'` symbolic/name entry.
-- [x] **Command-line history** — a `LineHistory` beside the `LineEditor`: the
-  committed lines plus the position of a `^P`/`^N` walk through them, recalled as
-  typed (not `describe`'s canonical form). Only lines that *ran* are recorded,
-  consecutive duplicates collapse, and the buffer the walk started from is
-  stashed as a draft that `^N` restores on stepping past the newest entry.
-  Capped at 256 like `MAX_UNDO`. Distinct from undo (that reverts *stack state*;
-  this recalls *text you typed*). Still open: arrows as aliases for `^P`/`^N`,
-  incremental search (`^R`), and a `LASTARG`-style recall of the args the last
-  command consumed.
+  replaces the append-only buffer, shared by insert and command modes via a
+  `handle_edit` helper over whichever editor the mode is typing into.
+  Bindings: `^A`/`^E`/Home/End (line start/end), `^B`/`^F` + arrows (move char),
+  `^W` (kill word back), `^U`/`^K` (kill to start/end), Alt-`b`/`f` +
+  `^`/Alt-arrows (move word), Delete (delete-forward). `^D` still quits (kept
+  as-is), so it is *not* wired to readline's delete-forward/EOF. What is still
+  missing is tracked below.
+- [x] **Quote mode — built, then removed.** A third `Mode::Quote` opened from
+  insert with `'` on an empty buffer. It died because insert mode stopped
+  auto-pushing: once every key is typed verbatim there, quote mode did nothing
+  insert didn't, and claiming `'` cost the most common line in the language —
+  `'name {…} =` was the one thing you could not type. Pinned by
+  `a_sigil_can_lead_a_line`. The structured literals it was going to host
+  (complex `(re, im)`, matrix `[…]`) need no mode of their own for the same
+  reason.
+- [x] **Command-line history** — the committed lines and a `^P`/`^N` walk over
+  them, recalled **as typed** rather than in canonical form. Only lines that
+  *ran* are recorded, consecutive duplicates collapse, and the buffer the walk
+  started from is stashed as a draft that `^N` restores past the newest entry.
+  Capped at 256 like `MAX_UNDO`. Distinct from undo: that reverts *stack state*,
+  this recalls *text you typed* — which is why `:clear` wipes the stack and the
+  timeline but leaves the history alone. Lives **inside** `LineEditor` rather
+  than beside it, so recording a line and clearing the buffer are one method and
+  cannot come apart.
+- [x] **Command mode** — normal, `:`, a line of meta-operations: things done *to*
+  the calculator rather than with it. `:clear` starts over (fresh engine, so
+  bindings and prelude reset with the stack; empty timeline; nothing to repeat)
+  and `:q`/`:quit` exit. Deliberately not `Action`s — an action is a change
+  recorded on the timeline, and `:clear` discards the timeline, so there is
+  nothing to undo back to. Its own `LineEditor`, so `:` cannot eat a half-typed
+  expression and its recall doesn't mix meta-operations with arithmetic.
+- [x] **Dot-repeat** — `.` repeats the last change. The repeat register is *not*
+  part of the timeline: `u` then `.` does again what you last did rather than
+  what the undo landed on, and undoing to the start still leaves it loaded. A
+  shuffle re-aims at the cursor's current level, vim's rule that `.` replays the
+  command wherever you are rather than storing a position; a typed line replays
+  verbatim, which is vim's other rule (counts are stored, motions are not).
+- [x] **Normal-mode keys settled** — `j`/`k` move, `x`/`d` drop, `s` swaps with
+  the top, `h`/`l` rotate the span up and down, Enter dups, `u`/`^R` undo and
+  redo, `.` repeats, `:` opens command mode, `i` returns to insert. A bare `r`
+  is unbound (it was the rotate; `^R` keeps redo). Each stack key **floors** to
+  the shallowest level where its operation means something — `swap` at 2,
+  `rot`/`unrot` at 3 — so a key never silently does nothing, and never takes an
+  undo point for a no-op. On a stack too shallow for the floor it errors, which
+  beats unexplained silence.
+- [x] **Undo lands on the site of the change** — vim's rule that `u` leaves you
+  at the restored text. Read off the `Action` in the snapshot, so no new state.
+  A line has no single site and leaves the cursor alone.
+- [x] **Exit leaves the frame intact** — the prompt used to land *inside* the
+  final frame, because a newline descends from the cursor and the cursor sits on
+  the command line, the frame's top row. Drops to the last row first, so the
+  newline falls off the bottom and scrolls if it must.
+- [ ] **Context-aware Enter** — an incomplete line should continue, not fail.
+  `[ 1 2` and `{dup *` are unfinished, not wrong, and the parser already draws
+  the line: `UnclosedOpen` means more input can fix it, `UnmatchedClose` means it
+  cannot. Open: an accumulating `pending` buffer with a continuation prompt
+  (cheap, keeps `LineEditor` single-line, no going back to edit earlier
+  fragments) versus a real multi-line buffer (caret becomes row+column, `view`
+  renders N rows, `desired_height` counts them, every readline binding needs a
+  line-relative-vs-buffer-relative ruling).
+- [ ] **The rest of readline** — arrows as aliases for `^P`/`^N`, incremental
+  search (`^R`), a kill ring with yank, and a `LASTARG`-style recall of the args
+  the last command consumed. Note what a line-reader crate would and wouldn't
+  buy: `rustyline`/`reedline` have these but own the terminal and the event
+  loop, which is incompatible with the inline viewport and with `handle_key`
+  being a pure state machine; `tui-input` fits the architecture but is the part
+  already written.
+- [ ] **Per-entry history edits** — editing a recalled line currently leaves the
+  walk position alone, so stepping past the newest entry restores the pre-walk
+  draft and drops the edit. Readline instead keeps an edit per entry until the
+  line is accepted; that wants an overlay beside `lines`, cleared on commit.
+  Documented on `LineEditor` as a deliberate non-choice.
 - [x] **Reclaim the info line** — only reserve its row when there's something to
   show (an error, or a `cmd`); otherwise give the row back to the stack. Ties
   into the dynamic viewport height (`CHROME_ROWS` would become conditional).
@@ -108,13 +177,13 @@
   form is wanted once modules exist.
 
 ## Project / packaging
-- [ ] **README, license, publish to GitHub** — write a README (what it is, the
-  RPN/modal model, build via `nix develop` + `cargo run`, the instruction set),
-  pick a license (MIT or Apache-2.0, or dual like most Rust crates), and push to
-  a public GitHub repo.
+- [x] **README, license, publish to GitHub** — `readme.md`, `LICENSE`, and a
+  `publish` remote at `github.com/matthewmazzanti/calc` alongside `origin`.
 
 ## Deferred (from earlier)
-- [ ] Negative-literal entry — a change-sign key (leading `-` is subtraction).
+- [x] Negative-literal entry — no change-sign key needed after all. The number
+  grammar claims a leading `-`, so `-3` is a literal while a lone `-` is still
+  subtraction: `5 -3 +` and `5 3 -` both give 2.
 - [ ] Indicator when the stack is taller than the visible rows (cap is 10).
 
 ## Iteration and the native boundary (designed, not merged)
