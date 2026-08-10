@@ -13,7 +13,7 @@ pub(crate) const DUP: Primitive = Primitive {
 
 #[rustfmt::skip]
 pub(super) static PRIMITIVES: &[Primitive] = &[
-    DUP,                                                    // a -- a a
+    DUP,                                                   // a -- a a
     Primitive { name: "drop",   run: |e| e.drop_at(1) },   // a --
     Primitive { name: "swap",   run: |e| e.swap_at(1) },   // a b -- b a
     Primitive { name: "over",   run: |e| e.pick_at(2) },   // a b -- a b a

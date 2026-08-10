@@ -27,14 +27,44 @@ pub(super) enum Notice {
     Note(String),
 }
 
-/// The command-line editor: the text buffer plus a caret within it. The caret
-/// is a byte offset into `text`, always kept on a char boundary (`text.len()`
-/// is end-of-line). This is what makes the readline-style moves and kills
-/// possible — before it, entry was append-only.
+/// How many past command lines are kept. Same reasoning as `MAX_UNDO`: a long
+/// session shouldn't grow without bound.
+const MAX_HISTORY: usize = 256;
+
+/// The command line: the buffer you are editing, and the lines already
+/// committed that a `^P`/`^N` walk brings back into it.
+///
+/// **The buffer.** `caret` is a byte offset into `text`, always kept on a char
+/// boundary (`text.len()` is end-of-line). This is what makes the readline-style
+/// moves and kills possible — before it, entry was append-only.
+///
+/// **The history.** Text recall, not undo: undo reverts *stack state*, this
+/// brings back *what you typed* so it can be edited and run again. A walk is a
+/// temporary view over `lines` — `at` is the entry on display, and `draft` is
+/// the buffer the walk began from, so browsing away and back leaves a half-typed
+/// line intact.
+///
+/// One struct because the two are one thing to the user, and because recording a
+/// line and clearing the buffer have to happen together — that pairing is
+/// [`commit`](Self::commit), and it is the only way a line enters `lines`.
+///
+/// The editing methods deliberately leave `at` alone: typing into a recalled
+/// line does *not* end the walk, so `^P` keeps stepping from where you were.
+/// The edit is lost if you then walk forward past the newest entry, since
+/// `draft` holds the line as it was before the walk. Readline instead keeps an
+/// edit per entry until the line is accepted; that wants an overlay beside
+/// `lines`, and isn't done here.
 #[derive(Default)]
 pub(super) struct LineEditor {
     text: String,
     caret: usize,
+    /// Committed lines, oldest first.
+    lines: Vec<String>,
+    /// Index into `lines` of the entry on display, or `None` when the buffer is
+    /// the user's own draft (not browsing).
+    at: Option<usize>,
+    /// The buffer as it was when the walk began.
+    draft: String,
 }
 
 impl LineEditor {
@@ -44,7 +74,7 @@ impl LineEditor {
 
     /// Replace the whole line, caret at the end — how a recalled history entry
     /// lands in the buffer, ready to edit or re-run.
-    fn set(&mut self, text: String) {
+    fn replace(&mut self, text: String) {
         self.text = text;
         self.caret = self.text.len();
     }
@@ -147,73 +177,56 @@ impl LineEditor {
             .trim_start_matches(|c: char| !c.is_whitespace());
         self.caret + (tail.len() - rest.len())
     }
-}
 
-/// How many past command lines are kept. Same reasoning as `MAX_UNDO`: a long
-/// session shouldn't grow without bound.
-const MAX_HISTORY: usize = 256;
+    // --- History: committing a line, and the `^P`/`^N` walk back over them. ---
 
-/// The lines already committed, plus the position of a `^P`/`^N` walk through
-/// them. This is text recall, not undo: undo reverts *state*, this brings back
-/// *what you typed* so it can be edited and run again.
-///
-/// A walk is a temporary view over `lines`. `at` is the entry currently on
-/// display, and `draft` is the buffer the walk started from — stepping forward
-/// past the newest entry restores it, so browsing away and back leaves a
-/// half-typed line intact.
-#[derive(Default)]
-pub(super) struct LineHistory {
-    /// Committed lines, oldest first.
-    lines: Vec<String>,
-    /// Index into `lines` of the entry on display, or `None` when the buffer is
-    /// the user's own draft (not browsing).
-    at: Option<usize>,
-    /// The buffer as it was when the walk began.
-    draft: String,
-}
-
-impl LineHistory {
-    /// Record a committed line and end any walk. A line identical to the most
-    /// recent one isn't recorded again — re-running an entry a few times
-    /// shouldn't push the rest of the history out of reach.
-    fn record(&mut self, line: &str) {
-        if self.lines.last().map(String::as_str) != Some(line) {
-            self.lines.push(line.to_string());
+    /// Record the buffer as a committed line and clear it for the next one, so a
+    /// line is in the history exactly when it has left the buffer. Ends any
+    /// walk. A line identical to the most recent one isn't recorded again —
+    /// re-running an entry a few times shouldn't push the rest out of reach.
+    fn commit(&mut self) {
+        if self.lines.last() != Some(&self.text) {
+            self.lines.push(self.text.clone());
             if self.lines.len() > MAX_HISTORY {
                 self.lines.remove(0);
             }
         }
+        self.clear();
         self.at = None;
         self.draft.clear();
     }
 
-    /// Step back one entry (`^P`), returning the line to show. `current` is the
-    /// buffer being left behind; it is stashed as the draft when a walk starts.
-    /// Returns `None` at the oldest entry, or when there is no history at all.
-    fn prev(&mut self, current: &str) -> Option<String> {
+    /// Step back one entry (`^P`). At the oldest entry — or with no history at
+    /// all — the buffer is left alone. Starting a walk stashes the buffer being
+    /// left behind as the draft.
+    fn recall_prev(&mut self) {
         let at = match self.at {
-            None => {
-                self.draft = current.to_string();
-                self.lines.len().checked_sub(1)?
-            }
-            Some(0) => return None,
+            None => match self.lines.len().checked_sub(1) {
+                Some(newest) => {
+                    self.draft = self.text.clone();
+                    newest
+                }
+                None => return,
+            },
+            Some(0) => return,
             Some(i) => i - 1,
         };
         self.at = Some(at);
-        Some(self.lines[at].clone())
+        self.replace(self.lines[at].clone());
     }
 
-    /// Step forward one entry (`^N`), returning the line to show. Past the
-    /// newest entry the walk ends and the stashed draft comes back. Returns
-    /// `None` when not browsing.
-    fn next(&mut self) -> Option<String> {
-        let i = self.at? + 1;
+    /// Step forward one entry (`^N`). Past the newest entry the walk ends and
+    /// the stashed draft comes back. Does nothing when not browsing.
+    fn recall_next(&mut self) {
+        let Some(i) = self.at.map(|i| i + 1) else {
+            return;
+        };
         if i < self.lines.len() {
             self.at = Some(i);
-            Some(self.lines[i].clone())
+            self.replace(self.lines[i].clone());
         } else {
             self.at = None;
-            Some(std::mem::take(&mut self.draft))
+            self.replace(self.draft.clone());
         }
     }
 }
@@ -240,10 +253,8 @@ struct Snapshot {
 pub(super) struct App {
     history: History<Snapshot>,
     mode: Mode,
-    /// The command-line buffer and caret.
+    /// The command line: buffer, caret, and the committed lines `^P`/`^N` walk.
     input: LineEditor,
-    /// Committed lines, recalled into `input` with `^P`/`^N`.
-    lines: LineHistory,
     /// Selected stack level in normal mode, 1-based from the top (level 1 is
     /// the top of stack). Kept clamped to the stack, or 1 when empty.
     cursor: usize,
@@ -261,7 +272,6 @@ impl App {
             }),
             mode: Mode::Insert,
             input: LineEditor::default(),
-            lines: LineHistory::default(),
             cursor: 1,
             notice: None,
             should_quit: false,
@@ -445,27 +455,11 @@ impl App {
             KeyCode::Char('u') if ctrl => self.input.kill_to_start(),
             KeyCode::Char('k') if ctrl => self.input.kill_to_end(),
             KeyCode::Char('w') if ctrl => self.input.kill_word_left(),
-            KeyCode::Char('p') if ctrl => self.recall_prev(),
-            KeyCode::Char('n') if ctrl => self.recall_next(),
+            KeyCode::Char('p') if ctrl => self.input.recall_prev(),
+            KeyCode::Char('n') if ctrl => self.input.recall_next(),
             _ => return false,
         }
         true
-    }
-
-    /// Recall the previous committed line into the buffer (`^P`). At the oldest
-    /// entry — or with no history — the buffer is left alone.
-    fn recall_prev(&mut self) {
-        if let Some(line) = self.lines.prev(self.input.text()) {
-            self.input.set(line);
-        }
-    }
-
-    /// Recall the next committed line (`^N`), or the draft the walk started
-    /// from once it steps past the newest entry.
-    fn recall_next(&mut self) {
-        if let Some(line) = self.lines.next() {
-            self.input.set(line);
-        }
     }
 
     /// Parse and run the command-line buffer. On success it clears; on error
@@ -484,10 +478,10 @@ impl App {
             }
         };
         if self.update(describe(&program), |engine| engine.apply(&program)) {
-            // The line as typed, not `describe`'s canonical form — recall is
-            // meant to give back exactly what you wrote.
-            self.lines.record(self.input.text());
-            self.input.clear();
+            // Records the line as typed, not `describe`'s canonical form —
+            // recall is meant to give back exactly what you wrote — and clears
+            // the buffer in the same move.
+            self.input.commit();
             true
         } else {
             false
@@ -1140,6 +1134,29 @@ mod tests {
     }
 
     #[test]
+    fn editing_a_recalled_line_does_not_end_the_walk() {
+        // Now that the buffer and the history are one struct, this is a choice
+        // rather than an accident: the editing methods leave `at` alone, so `^P`
+        // keeps stepping from where the walk was. The edit lives only in the
+        // buffer — stepping back onto the entry shows it as committed, and
+        // stepping past the newest restores the pre-walk draft.
+        let mut app = App::new();
+        run(&mut app, "1");
+        run(&mut app, "2");
+        typ(&mut app, "half typed");
+
+        ctrl(&mut app, 'p');
+        typ(&mut app, "0"); // edit the recalled "2"
+        assert_eq!(line(&app), "20|");
+        ctrl(&mut app, 'p'); // steps on from "2", not back to the newest
+        assert_eq!(line(&app), "1|");
+        ctrl(&mut app, 'n'); // "2" as committed; the edit was not kept
+        assert_eq!(line(&app), "2|");
+        ctrl(&mut app, 'n'); // past the newest: the draft, not the edit
+        assert_eq!(line(&app), "half typed|");
+    }
+
+    #[test]
     fn committing_ends_the_walk() {
         let mut app = App::new();
         run(&mut app, "1");
@@ -1163,7 +1180,7 @@ mod tests {
         assert_eq!(line(&app), "1|");
         ctrl(&mut app, 'p'); // no run of duplicates to wade through
         assert_eq!(line(&app), "1|");
-        assert_eq!(app.lines.lines, vec!["1".to_string()]);
+        assert_eq!(app.input.lines, vec!["1".to_string()]);
     }
 
     #[test]
@@ -1178,7 +1195,7 @@ mod tests {
         press(&mut app, KeyCode::Enter); // empty Enter -> dup
         ctrl(&mut app, 'p');
         assert_eq!(line(&app), "7|");
-        assert_eq!(app.lines.lines, vec!["7".to_string()]);
+        assert_eq!(app.input.lines, vec!["7".to_string()]);
     }
 
     #[test]
@@ -1187,7 +1204,7 @@ mod tests {
         for i in 0..(MAX_HISTORY + 10) {
             run(&mut app, &format!("{i} drop"));
         }
-        assert_eq!(app.lines.lines.len(), MAX_HISTORY);
+        assert_eq!(app.input.lines.len(), MAX_HISTORY);
         // The oldest entries fell off the front; the newest is still first back.
         ctrl(&mut app, 'p');
         assert_eq!(line(&app), format!("{} drop|", MAX_HISTORY + 9));
