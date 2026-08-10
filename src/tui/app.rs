@@ -536,18 +536,16 @@ impl App {
     }
 
     /// Parse and run the command-line buffer. On success it clears; on error
-    /// (parse or runtime) the buffer is kept so the user can fix it. Returns
-    /// whether it succeeded.
-    fn commit_input(&mut self) -> bool {
-        if self.input.text().trim().is_empty() {
-            self.input.clear();
-            return true;
-        }
+    /// (parse or runtime) the buffer is kept so the user can fix it.
+    ///
+    /// The buffer is non-empty here — the caller decides that, because an empty
+    /// Enter is a different action rather than a degenerate case of this one.
+    fn commit_input(&mut self) {
         let program = match engine::parse(self.input.text()) {
             Ok(program) => program,
             Err(error) => {
                 self.notice = Some(Notice::Note(syntax_note(self.input.text(), &error)));
-                return false;
+                return;
             }
         };
         if self.update(Action::Cmd(program)) {
@@ -555,9 +553,6 @@ impl App {
             // form — it is meant to give back exactly what you wrote — and
             // clears the buffer in the same move.
             self.input.commit();
-            true
-        } else {
-            false
         }
     }
 
