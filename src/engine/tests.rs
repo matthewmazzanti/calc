@@ -709,7 +709,7 @@ fn fixed_shuffles() {
     assert_eq!(run("1 2 tuck").stack(), &[2.0, 1.0, 2.0]);
     assert_eq!(run("1 2 dupd").stack(), &[1.0, 1.0, 2.0]);
     assert_eq!(run("1 2 dup2").stack(), &[1.0, 2.0, 1.0, 2.0]);
-    assert_eq!(run("1 2 3 2drop").stack(), &[1.0]);
+    assert_eq!(run("1 2 3 drop2").stack(), &[1.0]);
 }
 
 #[test]
@@ -736,6 +736,19 @@ fn the_dup_family_diverges_above_level_one() {
 }
 
 #[test]
+fn the_drop_family_splits_the_same_way() {
+    // The pair that motivated the scheme: `dropn` and `2drop` were depth and
+    // width under names that gave no hint which, and Forth spells the width one
+    // `ndrop`. Level 1 agrees, and above it the word says which it means.
+    assert_eq!(run("1 2 1 drop-at").stack(), run("1 2 drop").stack());
+    assert_eq!(run("1 2 1 drop-to").stack(), run("1 2 drop").stack());
+    assert_eq!(run("1 2 3 2 drop-at").stack(), run("1 2 3 nip").stack());
+    assert_eq!(run("1 2 3 2 drop-to").stack(), run("1 2 3 drop2").stack());
+    assert_eq!(run("1 2 3 3 drop-to").stack(), run("1 2 3 drop3").stack());
+    assert_eq!(run("1 2 3 3 drop-to").stack(), &[] as &[Value]);
+}
+
+#[test]
 fn pick_is_factors_fixed_level_three_not_forths_indexed_one() {
     // Worth pinning because the conventions disagree and ours fails *silently*.
     // Forth's `pick` is indexed and consumes its index: `1 2 3 2 pick` leaves
@@ -759,7 +772,9 @@ fn indexed_words_take_their_level_off_the_stack() {
     assert_eq!(run("1 2 3 2 dup-to").stack(), &[1.0, 2.0, 3.0, 2.0, 3.0]);
     assert_eq!(run("1 2 3 3 rolln").stack(), &[2.0, 3.0, 1.0]);
     assert_eq!(run("1 2 3 3 rolldn").stack(), &[3.0, 1.0, 2.0]);
-    assert_eq!(run("1 2 3 2 dropn").stack(), &[1.0, 3.0]);
+    assert_eq!(run("1 2 3 2 drop-at").stack(), &[1.0, 3.0]);
+    // `drop-to` clears the whole run down to that level, not the one item at it.
+    assert_eq!(run("1 2 3 2 drop-to").stack(), &[1.0]);
     assert_eq!(run("1 2 3 2 swapn").stack(), &[2.0, 1.0, 3.0]);
 }
 
@@ -802,7 +817,9 @@ fn indexed_words_are_named_for_their_index() {
     // rest still carry the older `n` suffix. They're bound in the prelude and
     // render as their word (a captured primitive Displays by name).
     let base = prelude();
-    for name in ["dup-at", "dup-to", "rolln", "rolldn", "dropn", "swapn"] {
+    for name in [
+        "dup-at", "dup-to", "drop-at", "drop-to", "rolln", "rolldn", "swapn",
+    ] {
         let bound = base.get(name).expect("indexed word bound in the prelude");
         assert_eq!(bound.to_string(), name);
     }

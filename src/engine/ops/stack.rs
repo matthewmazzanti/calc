@@ -1,21 +1,22 @@
 //! Stack-shuffle words, and the level-indexed surgery they are all built on.
 //!
-//! This module *owns* the surgery — `dup_at`/`dup_to`/`drop_at`/`swap_at`/
+//! This module *owns* the surgery — `dup_at`/`dup_to`/`drop_at`/`drop_to`/`swap_at`/
 //! `roll_at`/`rolld_at`, levels 1-based with level 1 the top of stack. [`Engine`]
 //! re-exposes what the TUI's cursor edits drive, so a caller outside the
 //! vocabulary can ask for one directly; the definitions are here, with the words.
 //!
 //! **The indexed word is the general form; every fixed shuffle is one of them
-//! with its level written in** — `drop` is level 1 of `dropn`, `rot` is level 3
+//! with its level written in** — `drop` is level 1 of `drop-at`, `rot` is level 3
 //! of `rolln`. The table is grouped by family with the indexed forms at the head
 //! of each, so a group reads as one operation and the names it answers to.
 //!
-//! Two ways to name a target, and `dup` has both: `-at` takes the single item
-//! *at* a level (`over` is `2 dup-at`), `-to` takes the whole run from the top
-//! down *to* it (`dup2` is `2 dup-to`). They coincide at level 1, which is why a
-//! bare `dup` needs no qualifier.
+//! Two ways to name a target, and `dup`/`drop` have both: `-at` takes the single
+//! item *at* a level (`over` is `2 dup-at`, `nip` is `2 drop-at`), `-to` takes
+//! the whole run from the top down *to* it (`dup2` is `2 dup-to`, `drop2` is
+//! `2 drop-to`). They coincide at level 1, which is why bare `dup` and `drop`
+//! need no qualifier.
 //!
-//! `tuck`/`dupd`/`2drop` are pop/push rearrangements no index names, and
+//! `tuck`/`dupd` are pop/push rearrangements no index names, and
 //! `clear` is the machine's stack reset.
 //!
 //! This is the one word module that reaches into the stack `Vec`; the rest are
@@ -55,10 +56,23 @@ pub(in crate::engine) fn dup_to(e: &mut Engine, level: usize) -> Result<(), Erro
     Ok(())
 }
 
-/// Remove the value at `level` (`drop` = 1, `nip` = 2, `dropn`).
+/// Remove the value **at** `level` (`drop` = 1, `nip` = 2, `drop-at`).
 pub(in crate::engine) fn drop_at(e: &mut Engine, level: usize) -> Result<(), ErrorKind> {
     let i = index_of_level(e, level).ok_or(ErrorKind::StackUnderflow)?;
     e.stack.remove(i);
+    Ok(())
+}
+
+/// Remove every value from the top down **to** `level` — levels `1..=level`
+/// (`drop` = 1, `drop2` = 2, `drop-to`).
+///
+/// The same two ways of naming a target as the dup family, and the reason this
+/// pair had to exist: `dropn` and `2drop` were *depth* and *width* under names
+/// that gave no hint which, and Forth spells the width one `ndrop`. Now the word
+/// says it — `2 drop-at` is `nip`, `2 drop-to` is `drop2`.
+pub(in crate::engine) fn drop_to(e: &mut Engine, level: usize) -> Result<(), ErrorKind> {
+    let start = index_of_level(e, level).ok_or(ErrorKind::StackUnderflow)?;
+    e.stack.truncate(start);
     Ok(())
 }
 
@@ -103,12 +117,13 @@ pub(super) static PRIMITIVES: &[Primitive] = &[
     Primitive { name: "dup2",   run: |e| dup_to(e, 2) },   // a b -- a b a b
     Primitive { name: "dup3",   run: |e| dup_to(e, 3) },   // a b c -- a b c a b c
 
-    // Remove. `2drop` is the width form the dup family spells `dup-to`, still
-    // hardcoded because there is no `drop-to` yet.
-    Primitive { name: "dropn",  run: |e| indexed(e, drop_at) },
+    // Remove. No traditional name for `-at` at level 3, so none is invented.
+    Primitive { name: "drop-at", run: |e| indexed(e, drop_at) },
+    Primitive { name: "drop-to", run: |e| indexed(e, drop_to) },
     Primitive { name: "drop",   run: |e| drop_at(e, 1) },  // a --
     Primitive { name: "nip",    run: |e| drop_at(e, 2) },  // a b -- b
-    Primitive { name: "2drop",  run: two_drop },           // a b --
+    Primitive { name: "drop2",  run: |e| drop_to(e, 2) },  // a b --
+    Primitive { name: "drop3",  run: |e| drop_to(e, 3) },  // a b c --
 
     // Exchange. Self-inverse, so there is no `un` half.
     Primitive { name: "swapn",  run: |e| indexed(e, swap_at) },
@@ -144,13 +159,6 @@ fn dupd(e: &mut Engine) -> Result<(), ErrorKind> {
     e.push(a.clone());
     e.push(a);
     e.push(b);
-    Ok(())
-}
-
-/// `2drop` ( a b -- ): drop the top two.
-fn two_drop(e: &mut Engine) -> Result<(), ErrorKind> {
-    e.pop()?;
-    e.pop()?;
     Ok(())
 }
 

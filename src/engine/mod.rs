@@ -607,7 +607,7 @@ impl Engine {
         ops::stack::dup_at(self, level)
     }
 
-    /// Remove the value at `level` (`drop` = 1, `nip` = 2, `dropn`).
+    /// Remove the value at `level` (`drop` = 1, `nip` = 2, `drop-at`).
     pub fn drop_at(&mut self, level: usize) -> Result<(), ErrorKind> {
         ops::stack::drop_at(self, level)
     }

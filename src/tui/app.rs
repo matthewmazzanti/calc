@@ -236,13 +236,13 @@ impl LineEditor {
 /// same fact read in two directions: what happened, and what to do again.
 ///
 /// The level a shuffle ran at is part of the change rather than context around
-/// it: the label has to name it (`dropn 3` reads wrong without it), and a repeat
+/// it: the label has to name it (`drop-at 3` reads wrong without it), and a repeat
 /// has to know what it is re-aiming.
 #[derive(Debug, Clone)]
 pub(super) enum Action {
     /// Copy the value at a level to the top. Level 1 is `dup`, level 2 `over`.
     Dup(usize),
-    /// Remove the value at a level. Level 1 is `drop`.
+    /// Remove the value at a level. Level 1 is `drop`, level 2 `nip`.
     Drop(usize),
     /// Exchange a level with the one just below it. Level 1 is `swap`.
     Swap(usize),
@@ -286,7 +286,7 @@ impl Action {
 }
 
 /// The info-bar label. A shuffle reads as the fixed word at the level that word
-/// names — `drop` *is* `dropn 1`, `rot` *is* `rolln 3`, which is why the level
+/// names — `drop` *is* `drop-at 1`, `rot` *is* `rolln 3`, which is why the level
 /// is matched in the pattern — and as the `n`-suffixed word plus the level
 /// anywhere else. A `Cmd` reads as its canonical program text, which is not
 /// necessarily the text that was typed.
@@ -298,7 +298,8 @@ impl std::fmt::Display for Action {
             Self::Dup(3) => f.write_str("pick"),
             Self::Dup(level) => write!(f, "dup-at {level}"),
             Self::Drop(1) => f.write_str("drop"),
-            Self::Drop(level) => write!(f, "dropn {level}"),
+            Self::Drop(2) => f.write_str("nip"),
+            Self::Drop(level) => write!(f, "drop-at {level}"),
             Self::Swap(1) => f.write_str("swap"),
             Self::Swap(level) => write!(f, "swapn {level}"),
             Self::Roll(3) => f.write_str("rot"),
@@ -1066,7 +1067,7 @@ mod tests {
     #[test]
     fn a_cursor_edit_is_labelled_by_the_word_that_names_it() {
         // The fixed shuffle is the one defined at that level — `drop` *is*
-        // `dropn 1`, `rot` *is* `rolln 3` — so the same key labels differently
+        // `drop-at 1`, `rot` *is* `rolln 3` — so the same key labels differently
         // depending on where the cursor sits.
         let mut app = stacked("1 2 3");
         ch(&mut app, 'x'); // cursor at the top
@@ -1076,7 +1077,7 @@ mod tests {
         ch(&mut app, 'j');
         ch(&mut app, 'j'); // cursor at level 3
         ch(&mut app, 'x');
-        assert_eq!(cmd(&app), "dropn 3");
+        assert_eq!(cmd(&app), "drop-at 3");
 
         // The drop shrank the stack, so the cursor was clamped to level 2;
         // undoing restores the depth but not the cursor, hence the `j`.
@@ -1407,7 +1408,7 @@ mod tests {
         ch(&mut app, 'j'); // cursor at level 3, the value 1
         ch(&mut app, '.');
         assert_eq!(app.stack(), &[2.0, 3.0]);
-        assert_eq!(cmd(&app), "dropn 3"); // relabelled for where it landed
+        assert_eq!(cmd(&app), "drop-at 3"); // relabelled for where it landed
     }
 
     #[test]
