@@ -523,8 +523,9 @@ fn a_line_leaves_no_residue_of_its_execution() {
     // An activation is what is *currently executing*, so between lines there
     // are none — it pops when exhausted, and a failure clears what is left.
     // That is what lets equality mean "the same state" rather than "the same
-    // state and the same last line", which the no-op check depends on: without
-    // it every command would record an undo point.
+    // state and the same last line": a line that ends where it started must
+    // leave nothing behind for the next line to trip over, and a failed line
+    // least of all.
     let mut engine = Engine::new();
     let rest = engine.clone();
     engine.apply(&parse("1 drop").unwrap()).unwrap();

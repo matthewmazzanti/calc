@@ -233,11 +233,11 @@ struct Snapshot {
     cmd: String,
 }
 
-/// The whole UI state. The engine is the live calculator; `history` holds value
-/// copies of it — the non-empty `(past…, current, future…)` list — whose current
-/// entry always matches the engine.
+/// The whole UI state. `history` *is* the calculator: its current entry holds
+/// the live engine, with the states behind and ahead of it in the same
+/// non-empty `(past…, current, future…)` list. There is no second live engine
+/// beside it to be kept in step.
 pub(super) struct App {
-    engine: Engine,
     history: History<Snapshot>,
     mode: Mode,
     /// The command-line buffer and caret.
@@ -254,13 +254,11 @@ pub(super) struct App {
 
 impl App {
     pub(super) fn new() -> Self {
-        let engine = Engine::new();
         Self {
             history: History::new(Snapshot {
-                engine: engine.clone(),
+                engine: Engine::new(),
                 cmd: String::new(),
             }),
-            engine,
             mode: Mode::Insert,
             input: LineEditor::default(),
             lines: LineHistory::default(),
@@ -339,9 +337,9 @@ impl App {
 
     // --- Internals. ---
 
-    /// The live engine (history's current snapshot).
+    /// The live engine: the history's current snapshot.
     fn engine(&self) -> &Engine {
-        &self.engine
+        &self.history.current().engine
     }
 
     /// Keep the cursor on a real level (or 1 when the stack is empty).
@@ -503,43 +501,44 @@ impl App {
         self.update(cmd, |engine| f(engine).map_err(CalcError::from));
     }
 
-    /// Run a transform against the live engine as one transaction: copy the
-    /// engine first, and on failure put the copy back. On success — if the state
-    /// actually changed — commit it with its `cmd` as an undo point. Returns
-    /// success.
+    /// Run a transform against a copy of the live engine and, on success, commit
+    /// the copy as the new current state, labelled with `cmd`. Returns success.
+    ///
+    /// **One user action is one snapshot.** What earns an undo point is that the
+    /// user *did* something, not that the value changed: a line whose engine
+    /// comes out looking identical still gets its own point, and still relabels
+    /// the info bar. Undo then walks the things you did, which is what the user
+    /// is actually tracking — and a `cmd` never goes stale against a state it
+    /// didn't produce.
+    ///
+    /// The transaction is structural rather than a save/restore pair: the
+    /// transform runs against a copy, so failure has nothing to put back.
     fn update(&mut self, cmd: String, f: impl FnOnce(&mut Engine) -> Outcome) -> bool {
-        let before = self.engine.clone();
-        match f(&mut self.engine) {
-            Ok(()) if self.engine == before => true, // a no-op is not a new state
+        let mut next = self.engine().clone();
+        match f(&mut next) {
             Ok(()) => {
-                self.history.commit(Snapshot {
-                    engine: self.engine.clone(),
-                    cmd,
-                });
+                self.history.commit(Snapshot { engine: next, cmd });
                 true
             }
             Err(e) => {
-                self.engine = before;
                 self.notice = Some(Notice::Error(e));
                 false
             }
         }
     }
 
-    /// Restore the previous snapshot (engine and its `cmd`) as the live state.
+    /// Step back to the previous snapshot — engine and `cmd` together. Moving
+    /// the history's cursor *is* moving the live state, so there is nothing to
+    /// copy back.
     fn undo(&mut self) {
-        if self.history.undo() {
-            self.engine = self.history.current().engine.clone();
-        } else {
+        if !self.history.undo() {
             self.notice = Some(Notice::Note("nothing to undo".to_string()));
         }
     }
 
-    /// Re-apply the most recently undone snapshot.
+    /// Step forward to the most recently undone snapshot.
     fn redo(&mut self) {
-        if self.history.redo() {
-            self.engine = self.history.current().engine.clone();
-        } else {
+        if !self.history.redo() {
             self.notice = Some(Notice::Note("nothing to redo".to_string()));
         }
     }
@@ -932,6 +931,23 @@ mod tests {
         let mut app = stacked("1 2 3");
         ch(&mut app, 'x'); // drop at cursor (level 1)
         assert_eq!(app.cmd(), "drop");
+    }
+
+    #[test]
+    fn a_line_that_changes_nothing_is_still_an_undo_point() {
+        // One user action is one snapshot. `dup drop` leaves the engine looking
+        // exactly as it was, but the user still ran a line — so it labels the
+        // info bar, and undo steps back over it rather than through it.
+        let mut app = App::new();
+        run(&mut app, "1");
+        run(&mut app, "dup drop");
+        assert_eq!(app.stack(), &[1.0]);
+        assert_eq!(app.cmd(), "dup drop");
+
+        press(&mut app, KeyCode::Esc);
+        ch(&mut app, 'u');
+        assert_eq!(app.stack(), &[1.0]); // same values either side of the undo
+        assert_eq!(app.cmd(), "1"); // but back to the state the `1` line made
     }
 
     #[test]

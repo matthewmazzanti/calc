@@ -74,8 +74,9 @@ pub struct Env {
     frames: SlotMap<FrameId, Rc<Frame>>,
 }
 
-/// `SlotMap` has no `PartialEq`, and [`Engine`](super::Engine)'s no-op check
-/// needs one. Compares live frames only — two environments that reached the same
+/// `SlotMap` has no `PartialEq`, and comparing whole [`Engine`](super::Engine)s
+/// needs one — the residue and rollback tests state their property as "the same
+/// state". Compares live frames only — two environments that reached the same
 /// bindings are equal whatever slots and generations they happen to occupy.
 impl PartialEq for Env {
     fn eq(&self, other: &Self) -> bool {
