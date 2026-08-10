@@ -5,7 +5,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::engine::{self, CalcError, Element, Engine, ErrorKind, Outcome, Value};
+use crate::engine::{self, CalcError, Element, Engine, Outcome, Value};
 use crate::history::History;
 
 /// Vim-style editing modes.
@@ -231,7 +231,85 @@ impl LineEditor {
     }
 }
 
-/// A calculator state paired with the command that produced it. This is the
+/// A change the user made. One type serves two jobs — it is what a [`Snapshot`]
+/// records as having produced it, and what `.` re-applies — because they are the
+/// same fact read in two directions: what happened, and what to do again.
+///
+/// The level a shuffle ran at is part of the change rather than context around
+/// it: the label has to name it (`dropn 3` reads wrong without it), and a repeat
+/// has to know what it is re-aiming.
+#[derive(Debug, Clone)]
+pub(super) enum Action {
+    /// Copy the value at a level to the top. Level 1 is `dup`.
+    Pick(usize),
+    /// Remove the value at a level. Level 1 is `drop`.
+    Drop(usize),
+    /// Exchange a level with the one just below it. Level 1 is `swap`.
+    Swap(usize),
+    /// Move the value at a level up to the top. Level 3 is `rot`.
+    Roll(usize),
+    /// A line that was parsed and run — kept as the program, not the text.
+    /// `^P` is the way back to what you typed; this is the way back to what it
+    /// did, so a repeat costs no re-parse and can't fail differently.
+    Cmd(Vec<Element>),
+}
+
+impl Action {
+    /// Apply the change to an engine.
+    fn run(&self, engine: &mut Engine) -> Outcome {
+        match self {
+            Self::Pick(level) => engine.pick_at(*level).map_err(CalcError::from),
+            Self::Drop(level) => engine.drop_at(*level).map_err(CalcError::from),
+            Self::Swap(level) => engine.swap_at(*level).map_err(CalcError::from),
+            Self::Roll(level) => engine.roll_at(*level).map_err(CalcError::from),
+            Self::Cmd(program) => engine.apply(program),
+        }
+    }
+
+    /// The same change re-aimed at `level` — how `.` repeats a shuffle where the
+    /// cursor is *now* rather than where it first ran. A `Cmd` has no level to
+    /// move, so it repeats as it was.
+    fn at(&self, level: usize) -> Self {
+        match self {
+            Self::Pick(_) => Self::Pick(level),
+            Self::Drop(_) => Self::Drop(level),
+            Self::Swap(_) => Self::Swap(level),
+            Self::Roll(_) => Self::Roll(level),
+            Self::Cmd(program) => Self::Cmd(program.clone()),
+        }
+    }
+}
+
+/// The info-bar label. A shuffle reads as the fixed word at the level that word
+/// names — `drop` *is* `dropn 1`, `rot` *is* `rolln 3`, which is why the level
+/// is matched in the pattern — and as the `n`-suffixed word plus the level
+/// anywhere else. A `Cmd` reads as its canonical program text, which is not
+/// necessarily the text that was typed.
+impl std::fmt::Display for Action {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pick(1) => f.write_str("dup"),
+            Self::Pick(level) => write!(f, "pickn {level}"),
+            Self::Drop(1) => f.write_str("drop"),
+            Self::Drop(level) => write!(f, "dropn {level}"),
+            Self::Swap(1) => f.write_str("swap"),
+            Self::Swap(level) => write!(f, "swapn {level}"),
+            Self::Roll(3) => f.write_str("rot"),
+            Self::Roll(level) => write!(f, "rolln {level}"),
+            Self::Cmd(program) => {
+                for (i, element) in program.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(" ")?;
+                    }
+                    write!(f, "{element}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// A calculator state paired with the change that produced it. This is the
 /// unit of history, so undo/redo restore the state *and* the info-bar label
 /// together — each one remembers how it was reached.
 ///
@@ -242,8 +320,9 @@ impl LineEditor {
 #[derive(Debug)]
 struct Snapshot {
     engine: Engine,
-    /// The command that produced `engine` (empty for the initial state).
-    cmd: String,
+    /// The change that produced `engine` — `None` only for the initial state,
+    /// which nothing produced.
+    cmd: Option<Action>,
 }
 
 /// The whole UI state. `history` *is* the calculator: its current entry holds
@@ -258,6 +337,11 @@ pub(super) struct App {
     /// Selected stack level in normal mode, 1-based from the top (level 1 is
     /// the top of stack). Kept clamped to the stack, or 1 when empty.
     cursor: usize,
+    /// The last change made, for `.` to repeat. A register, *not* part of the
+    /// timeline: `undo`/`redo` move through history without touching it, so `u`
+    /// then `.` repeats what you last did rather than what the undo landed on —
+    /// and undoing all the way back to the start still leaves it loaded.
+    last: Option<Action>,
     /// Transient error/note for the current keypress, shown in the info bar.
     notice: Option<Notice>,
     should_quit: bool,
@@ -268,11 +352,12 @@ impl App {
         Self {
             history: History::new(Snapshot {
                 engine: Engine::new(),
-                cmd: String::new(),
+                cmd: None,
             }),
             mode: Mode::Insert,
             input: LineEditor::default(),
             cursor: 1,
+            last: None,
             notice: None,
             should_quit: false,
         }
@@ -305,9 +390,10 @@ impl App {
         self.notice.as_ref()
     }
 
-    /// The command that produced the current state, for the info bar.
-    pub(super) fn cmd(&self) -> &str {
-        &self.history.current().cmd
+    /// The change that produced the current state, for the info bar. `None` at
+    /// the initial state, which nothing produced.
+    pub(super) fn cmd(&self) -> Option<&Action> {
+        self.history.current().cmd.as_ref()
     }
 
     /// The live stack.
@@ -322,7 +408,7 @@ impl App {
     /// Whether the info line has anything to show — an error/note, or a last
     /// command. When it doesn't, its row is given back to the stack.
     pub(super) fn has_info(&self) -> bool {
-        self.notice.is_some() || !self.cmd().is_empty()
+        self.notice.is_some() || self.cmd().is_some()
     }
 
     /// Advance the whole UI by one keypress. This is the single entry point for
@@ -372,15 +458,23 @@ impl App {
             // wants, so a stack edit always hits the stack rather than going
             // through word resolution and being read as a (rebindable) word.
             KeyCode::Char('x') | KeyCode::Char('d') => {
-                self.shuffle("drop", "dropn", 1, Engine::drop_at);
+                self.update(Action::Drop(self.cursor));
             }
-            KeyCode::Char('s') => self.shuffle("swap", "swapn", 1, Engine::swap_at),
+            KeyCode::Char('s') => {
+                self.update(Action::Swap(self.cursor));
+            }
             // Ctrl-R redoes (vim-style); a bare `r` rotates at the cursor.
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => self.redo(),
-            KeyCode::Char('r') => self.shuffle("rot", "rolln", 3, Engine::roll_at),
+            KeyCode::Char('r') => {
+                self.update(Action::Roll(self.cursor));
+            }
             KeyCode::Char('u') => self.undo(),
             // Copy the selected value to the top.
-            KeyCode::Enter => self.shuffle("dup", "pickn", 1, Engine::pick_at),
+            KeyCode::Enter => {
+                self.update(Action::Pick(self.cursor));
+            }
+            // Repeat the last change, vim's `.`.
+            KeyCode::Char('.') => self.repeat(),
             _ => {}
         }
     }
@@ -398,7 +492,7 @@ impl App {
             // once). With an empty buffer it duplicates the top of stack.
             KeyCode::Enter => {
                 if self.input.text().trim().is_empty() {
-                    self.edit("dup".to_string(), |e| e.pick_at(1));
+                    self.update(Action::Pick(1));
                 } else {
                     self.commit_input();
                 }
@@ -456,10 +550,10 @@ impl App {
                 return false;
             }
         };
-        if self.update(describe(&program), |engine| engine.apply(&program)) {
-            // Records the line as typed, not `describe`'s canonical form —
-            // recall is meant to give back exactly what you wrote — and clears
-            // the buffer in the same move.
+        if self.update(Action::Cmd(program)) {
+            // Recall records the line as *typed*, not the program's canonical
+            // form — it is meant to give back exactly what you wrote — and
+            // clears the buffer in the same move.
             self.input.commit();
             true
         } else {
@@ -467,36 +561,22 @@ impl App {
         }
     }
 
-    /// A cursor-relative stack edit: run `op` at the selected level as one undo
-    /// unit, labelled with the word that names it. `fixed_at` is the level the
-    /// fixed shuffle is defined for — `drop` *is* `dropn 1` and `rot` *is*
-    /// `rolln 3` — so the info bar reads `drop` on the top of stack and
-    /// `dropn 3` further down.
-    fn shuffle(
-        &mut self,
-        fixed: &str,
-        wordn: &str,
-        fixed_at: usize,
-        op: fn(&mut Engine, usize) -> Result<(), ErrorKind>,
-    ) {
-        let level = self.cursor;
-        let label = if level == fixed_at {
-            fixed.to_string()
-        } else {
-            format!("{wordn} {level}")
-        };
-        self.edit(label, move |e| op(e, level));
+    /// `.`: do the last change again. A shuffle is re-aimed at the cursor's
+    /// current level — `x`, move, `.` drops where you are *now*, the way `dw`,
+    /// move, `.` deletes where you are now — so `.` repeats the operation, not
+    /// the coordinates. Repeating a whole line runs it again as it was.
+    fn repeat(&mut self) {
+        match self.last.clone() {
+            Some(action) => {
+                self.update(action.at(self.cursor));
+            }
+            None => self.notice = Some(Notice::Note("nothing to repeat".to_string())),
+        }
     }
 
-    /// Apply an in-place engine op (the cursor stack edits) as one undo unit,
-    /// adapting the `&mut` op into the consuming transform `update` expects. A
-    /// bare `ErrorKind` becomes a trace-less `CalcError`.
-    fn edit(&mut self, cmd: String, f: impl FnOnce(&mut Engine) -> Result<(), ErrorKind>) {
-        self.update(cmd, |engine| f(engine).map_err(CalcError::from));
-    }
-
-    /// Run a transform against a copy of the live engine and, on success, commit
-    /// the copy as the new current state, labelled with `cmd`. Returns success.
+    /// Run `action` against a copy of the live engine and, on success, commit the
+    /// copy as the new current state and load `action` into the repeat register.
+    /// Returns success.
     ///
     /// **One user action is one snapshot.** What earns an undo point is that the
     /// user *did* something, not that the value changed: a line whose engine
@@ -507,11 +587,18 @@ impl App {
     ///
     /// The transaction is structural rather than a save/restore pair: the
     /// transform runs against a copy, so failure has nothing to put back.
-    fn update(&mut self, cmd: String, f: impl FnOnce(&mut Engine) -> Outcome) -> bool {
+    fn update(&mut self, action: Action) -> bool {
         let mut next = self.engine().clone();
-        match f(&mut next) {
+        match action.run(&mut next) {
             Ok(()) => {
-                self.history.commit(Snapshot { engine: next, cmd });
+                // The register and the snapshot get the same change: one is what
+                // to do again, the other what was done. Only the register
+                // survives an undo.
+                self.last = Some(action.clone());
+                self.history.commit(Snapshot {
+                    engine: next,
+                    cmd: Some(action),
+                });
                 true
             }
             Err(e) => {
@@ -556,18 +643,16 @@ fn syntax_note(source: &str, error: &engine::ParseError) -> String {
     )
 }
 
-/// Join a program into its canonical text (`10 0 /`), for the info bar's `cmd`.
-fn describe(program: &[Element]) -> String {
-    program
-        .iter()
-        .map(Element::to_string)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::ErrorKind;
+
+    /// The info-bar label for the state the app is in, or `""` when there is
+    /// none — the rendering `view` does, so assertions read as what is shown.
+    fn cmd(app: &App) -> String {
+        app.cmd().map(Action::to_string).unwrap_or_default()
+    }
 
     fn press(app: &mut App, code: KeyCode) {
         app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
@@ -794,7 +879,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
         assert_eq!(app.stack(), &[1.0, 2.0]); // redone
                                               // The restored snapshot carries the command that produced it.
-        assert_eq!(app.cmd(), "drop");
+        assert_eq!(cmd(&app), "drop");
     }
 
     #[test]
@@ -888,10 +973,10 @@ mod tests {
         let mut app = App::new();
         typ(&mut app, "3");
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.cmd(), "3"); // the committed line
+        assert_eq!(cmd(&app), "3"); // the committed line
         typ(&mut app, "4 +");
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.cmd(), "4 +");
+        assert_eq!(cmd(&app), "4 +");
         assert_eq!(app.stack(), &[7.0]);
     }
 
@@ -913,7 +998,7 @@ mod tests {
     fn info_bar_records_cursor_ops() {
         let mut app = stacked("1 2 3");
         ch(&mut app, 'x'); // drop at cursor (level 1)
-        assert_eq!(app.cmd(), "drop");
+        assert_eq!(cmd(&app), "drop");
     }
 
     #[test]
@@ -925,12 +1010,12 @@ mod tests {
         run(&mut app, "1");
         run(&mut app, "dup drop");
         assert_eq!(app.stack(), &[1.0]);
-        assert_eq!(app.cmd(), "dup drop");
+        assert_eq!(cmd(&app), "dup drop");
 
         press(&mut app, KeyCode::Esc);
         ch(&mut app, 'u');
         assert_eq!(app.stack(), &[1.0]); // same values either side of the undo
-        assert_eq!(app.cmd(), "1"); // but back to the state the `1` line made
+        assert_eq!(cmd(&app), "1"); // but back to the state the `1` line made
     }
 
     #[test]
@@ -940,13 +1025,13 @@ mod tests {
         // depending on where the cursor sits.
         let mut app = stacked("1 2 3");
         ch(&mut app, 'x'); // cursor at the top
-        assert_eq!(app.cmd(), "drop");
+        assert_eq!(cmd(&app), "drop");
         ch(&mut app, 'u');
 
         ch(&mut app, 'j');
         ch(&mut app, 'j'); // cursor at level 3
         ch(&mut app, 'x');
-        assert_eq!(app.cmd(), "dropn 3");
+        assert_eq!(cmd(&app), "dropn 3");
 
         // The drop shrank the stack, so the cursor was clamped to level 2;
         // undoing restores the depth but not the cursor, hence the `j`.
@@ -955,7 +1040,7 @@ mod tests {
         ch(&mut app, 'j');
 
         ch(&mut app, 'r'); // rot is rolln 3, so at level 3 it is plain `rot`
-        assert_eq!(app.cmd(), "rot");
+        assert_eq!(cmd(&app), "rot");
         assert_eq!(app.stack(), &[2.0, 3.0, 1.0]);
     }
 
@@ -967,7 +1052,7 @@ mod tests {
         ch(&mut app, 'x'); // drop -> cmd "drop"
         ch(&mut app, 'u'); // undo -> [1,2,3], whose origin was "3"
         assert_eq!(app.stack(), &[1.0, 2.0, 3.0]);
-        assert_eq!(app.cmd(), "3");
+        assert_eq!(cmd(&app), "3");
     }
 
     // --- Readline-style command-line editing. ---
@@ -1248,5 +1333,71 @@ mod tests {
         press(&mut app, KeyCode::Enter); // commits the whole line regardless
         assert_eq!(app.stack(), &[12.0]);
         assert_eq!(line(&app), "|"); // buffer and caret cleared
+    }
+
+    // --- Dot-repeat. ---
+
+    #[test]
+    fn dot_repeats_the_operation_not_the_coordinates() {
+        // A shuffle is re-aimed at the cursor, the way `dw`, move, `.` deletes
+        // where you are now rather than where you were.
+        let mut app = stacked("1 2 3 4");
+        ch(&mut app, 'x'); // drop the top
+        assert_eq!(app.stack(), &[1.0, 2.0, 3.0]);
+
+        ch(&mut app, 'j');
+        ch(&mut app, 'j'); // cursor at level 3, the value 1
+        ch(&mut app, '.');
+        assert_eq!(app.stack(), &[2.0, 3.0]);
+        assert_eq!(cmd(&app), "dropn 3"); // relabelled for where it landed
+    }
+
+    #[test]
+    fn dot_repeats_a_whole_line() {
+        let mut app = App::new();
+        run(&mut app, "2 3 +"); // -> [5]
+        press(&mut app, KeyCode::Esc);
+        ch(&mut app, '.');
+        assert_eq!(app.stack(), &[5.0, 5.0]);
+        assert_eq!(cmd(&app), "2 3 +");
+    }
+
+    #[test]
+    fn dot_is_not_moved_by_undo() {
+        // The register is not part of the timeline. After `u` the *state* came
+        // from the `3` line, but the last thing the user *did* is the drop, and
+        // that is what `.` does again — repeating `3` would push a 3 instead.
+        let mut app = stacked("1 2 3");
+        ch(&mut app, 'x'); // drop -> [1, 2]
+        ch(&mut app, 'u'); // -> [1, 2, 3]
+        assert_eq!(cmd(&app), "3");
+
+        ch(&mut app, '.');
+        assert_eq!(app.stack(), &[1.0, 2.0]);
+        assert_eq!(cmd(&app), "drop");
+    }
+
+    #[test]
+    fn dot_with_nothing_to_repeat_says_so() {
+        let mut app = App::new();
+        press(&mut app, KeyCode::Esc); // normal mode, nothing done yet
+        ch(&mut app, '.');
+        assert!(app.stack().is_empty());
+        assert!(matches!(app.notice, Some(Notice::Note(_))));
+    }
+
+    #[test]
+    fn a_failed_change_does_not_load_the_register() {
+        // Only a change that happened is repeatable. The swap underflows on a
+        // one-value stack, so `.` still holds the drop — had the failure loaded
+        // the register, `.` would attempt a swap and leave the stack alone.
+        let mut app = stacked("1 2");
+        ch(&mut app, 'x'); // drop -> [1]
+        ch(&mut app, 's'); // swap wants two values: underflow
+        assert!(matches!(app.notice, Some(Notice::Error(_))));
+
+        ch(&mut app, '.');
+        assert!(app.stack().is_empty()); // the drop ran again
+        assert_eq!(cmd(&app), "drop");
     }
 }

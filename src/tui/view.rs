@@ -76,11 +76,13 @@ fn info_line(app: &App) -> Line<'_> {
     match app.notice() {
         Some(Notice::Error(e)) => error_line(e),
         Some(Notice::Note(note)) => Line::from(Span::styled(note.as_str(), Style::new().red())),
-        None if app.cmd().is_empty() => Line::default(),
-        None => Line::from(vec![
-            Span::styled("cmd: ", Style::new().dim()),
-            Span::raw(app.cmd()),
-        ]),
+        None => match app.cmd() {
+            None => Line::default(),
+            Some(action) => Line::from(vec![
+                Span::styled("cmd: ", Style::new().dim()),
+                Span::raw(action.to_string()),
+            ]),
+        },
     }
 }
 
