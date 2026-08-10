@@ -119,14 +119,21 @@
   shuffle re-aims at the cursor's current level, vim's rule that `.` replays the
   command wherever you are rather than storing a position; a typed line replays
   verbatim, which is vim's other rule (counts are stored, motions are not).
-- [x] **Normal-mode keys settled** — `j`/`k` move, `x`/`d` drop, `s` swaps with
-  the top, `h`/`l` rotate the span up and down, Enter dups, `u`/`^R` undo and
-  redo, `.` repeats, `:` opens command mode, `i` returns to insert. A bare `r`
+- [x] **Normal-mode keys settled** — `j`/`k` move and `g`/`G` jump to the ends,
+  `x`/`d` drop, `s` swaps with the top, `h`/`l` rotate the span up and down,
+  Enter dups, `u`/`^R` undo and redo, `.` repeats, `:` opens command mode, `i`
+  returns to insert. A bare `r`
   is unbound (it was the rotate; `^R` keeps redo). Each stack key **floors** to
   the shallowest level where its operation means something — `swap` at 2,
   `rot`/`unrot` at 3 — so a key never silently does nothing, and never takes an
   undo point for a no-op. On a stack too shallow for the floor it errors, which
   beats unexplained silence.
+- [x] **Stack scrolling** — a stack taller than `MAX_STACK_ROWS` used to draw
+  its first ten levels and nothing else, so the cursor simply left the screen at
+  level 11. It now scrolls under a fixed window that follows the cursor by the
+  least amount that brings it back, and re-clamps when the stack changes size
+  beneath it. `top` is view state rather than calculator state: undo doesn't
+  restore it, `:clear` resets it. `g`/`G` jump to the ends of the stack.
 - [x] **Undo lands on the site of the change** — vim's rule that `u` leaves you
   at the restored text. Read off the `Action` in the snapshot, so no new state.
   A line has no single site and leaves the cursor alone.
@@ -184,7 +191,12 @@
 - [x] Negative-literal entry — no change-sign key needed after all. The number
   grammar claims a leading `-`, so `-3` is a literal while a lone `-` is still
   subtraction: `5 -3 +` and `5 3 -` both give 2.
-- [ ] Indicator when the stack is taller than the visible rows (cap is 10).
+- [x] Indicator when the stack is taller than the visible rows — a dimmed
+  `... n more` row below the window, counting what is off screen. Nothing marks
+  the other direction: the first visible row's level number already counts what
+  is above it, so a marker there would restate the labels. The row is extra
+  rather than replacing a value, since hiding a value to report that values are
+  hidden defeats itself.
 
 ## Iteration and the native boundary (designed, not merged)
 
