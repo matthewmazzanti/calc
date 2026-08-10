@@ -706,10 +706,26 @@ fn fixed_shuffles() {
     assert_eq!(run("1 2 3 rot").stack(), &[2.0, 3.0, 1.0]);
     assert_eq!(run("1 2 3 unrot").stack(), &[3.0, 1.0, 2.0]);
     assert_eq!(run("1 2 nip").stack(), &[2.0]);
-    assert_eq!(run("1 2 tuck").stack(), &[2.0, 1.0, 2.0]);
-    assert_eq!(run("1 2 dupd").stack(), &[1.0, 1.0, 2.0]);
     assert_eq!(run("1 2 dup2").stack(), &[1.0, 2.0, 1.0, 2.0]);
     assert_eq!(run("1 2 3 drop2").stack(), &[1.0]);
+}
+
+#[test]
+fn tuck_and_dupd_are_gone() {
+    // They took two indices — a source and a destination — so they belonged to
+    // no single-index family, and `dupd` was the last word wearing a `d` suffix
+    // whose other members were deliberately never bound. Spelled out they are
+    // two words each.
+    assert_eq!(
+        run_err("1 2 tuck"),
+        ErrorKind::UnboundName("tuck".to_string())
+    );
+    assert_eq!(
+        run_err("1 2 dupd"),
+        ErrorKind::UnboundName("dupd".to_string())
+    );
+    assert_eq!(run("1 2 swap over").stack(), &[2.0, 1.0, 2.0]); // was `tuck`
+    assert_eq!(run("1 2 over swap").stack(), &[1.0, 1.0, 2.0]); // was `dupd`
 }
 
 #[test]

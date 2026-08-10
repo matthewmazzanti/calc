@@ -18,8 +18,11 @@
 //! sits: `dup`/`drop` at 1, `swap` at 2, `rot` at 3 — though rot has no `-at`
 //! at all, being a span operation already.
 //!
-//! `tuck`/`dupd` are pop/push rearrangements no index names, and
-//! `clear` is the machine's stack reset.
+//! Every word here is one of those, at a level or at a constant — `clear` is
+//! the lone exception, being the machine's stack reset. A "copy X and place it
+//! at Y" takes two indices rather than one and so belongs to no family: `tuck`
+//! and `dupd` were exactly that, and are gone. They spell out as `swap over`
+//! and `over swap`.
 //!
 //! This is the one word module that reaches into the stack `Vec`; the rest are
 //! built on the machine's `pop`/`push` API, and stay that way. Holding the
@@ -167,31 +170,9 @@ pub(super) static PRIMITIVES: &[Primitive] = &[
     Primitive { name: "rot",    run: |e| rot_to(e, 3) },   // a b c -- b c a
     Primitive { name: "unrot",  run: |e| unrot_to(e, 3) }, // a b c -- c a b
 
-    // Rearrangements no index names, and the machine's stack reset.
-    Primitive { name: "tuck",   run: tuck },               // a b -- b a b
-    Primitive { name: "dupd",   run: dupd },               // a b -- a a b
+    // The machine's stack reset.
     Primitive { name: "clear",  run: Engine::clear },
 ];
-
-/// `tuck` ( a b -- b a b ): tuck a copy of the top below the second.
-fn tuck(e: &mut Engine) -> Result<(), ErrorKind> {
-    let b = e.pop()?;
-    let a = e.pop()?;
-    e.push(b.clone());
-    e.push(a);
-    e.push(b);
-    Ok(())
-}
-
-/// `dupd` ( a b -- a a b ): duplicate the second element.
-fn dupd(e: &mut Engine) -> Result<(), ErrorKind> {
-    let b = e.pop()?;
-    let a = e.pop()?;
-    e.push(a.clone());
-    e.push(a);
-    e.push(b);
-    Ok(())
-}
 
 /// Run an indexed shuffle with its 1-based level popped off the stack.
 fn indexed(
