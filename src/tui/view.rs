@@ -63,14 +63,17 @@ fn command_line(app: &App) -> Line<'_> {
     ])
 }
 
-/// The stack, top-aligned: level 1 (top of stack) first, deeper levels below,
-/// the selected level highlighted and labels dimmed. Capped at the visible rows.
+/// The stack, shallowest visible level first, deeper levels below, the selected
+/// level highlighted and labels dimmed. A stack taller than [`MAX_STACK_ROWS`]
+/// scrolls under the window, so the first row is `app.top()` rather than level 1
+/// — and the level labels say so, which is how you can tell you are scrolled.
 fn stack_lines(app: &App) -> Vec<Line<'static>> {
     let depth = app.depth();
     if depth == 0 {
         return vec![Line::from("(empty)").dim()];
     }
-    (1..=depth.min(MAX_STACK_ROWS as usize))
+    let last = (app.top() + MAX_STACK_ROWS as usize - 1).min(depth);
+    (app.top()..=last)
         .map(|level| {
             let value = &app.stack()[depth - level];
             let label = format!("{level:>3}: ");

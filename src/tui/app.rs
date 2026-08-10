@@ -8,6 +8,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::engine::{self, CalcError, Element, Engine, Outcome, Value};
 use crate::history::History;
 
+use super::MAX_STACK_ROWS;
+
 /// Vim-style editing modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Mode {
@@ -409,6 +411,12 @@ pub(super) struct App {
     /// Selected stack level in normal mode, 1-based from the top (level 1 is
     /// the top of stack). Kept clamped to the stack, or 1 when empty.
     cursor: usize,
+    /// Shallowest level on screen — the stack scrolls under a fixed window when
+    /// it outgrows [`MAX_STACK_ROWS`]. Derived from the cursor rather than
+    /// stored per state: it is where you are *looking*, not part of the
+    /// calculator, so undo doesn't restore it and `:clear` resets it with the
+    /// rest of the view.
+    top: usize,
     /// The last change made, for `.` to repeat. A register, *not* part of the
     /// timeline: `undo`/`redo` move through history without touching it, so `u`
     /// then `.` repeats what you last did rather than what the undo landed on —
@@ -430,6 +438,7 @@ impl App {
             input: LineEditor::default(),
             command: LineEditor::default(),
             cursor: 1,
+            top: 1,
             last: None,
             notice: None,
             should_quit: false,
@@ -458,6 +467,11 @@ impl App {
 
     pub(super) fn cursor(&self) -> usize {
         self.cursor
+    }
+
+    /// The shallowest level on screen.
+    pub(super) fn top(&self) -> usize {
+        self.top
     }
 
     pub(super) fn notice(&self) -> Option<&Notice> {
@@ -504,6 +518,7 @@ impl App {
             Mode::Command => self.handle_command(key),
         }
         self.clamp_cursor();
+        self.follow_cursor();
     }
 
     // --- Internals. ---
@@ -535,6 +550,22 @@ impl App {
         self.cursor = if d == 0 { 1 } else { self.cursor.clamp(1, d) };
     }
 
+    /// Scroll the window the least amount that brings the cursor back into it,
+    /// the way a text editor follows the caret: stepping off an edge moves the
+    /// view by one, and a jump lands the cursor on whichever edge it came from.
+    /// Also re-clamps after the stack changes size under a fixed window.
+    fn follow_cursor(&mut self) {
+        let rows = MAX_STACK_ROWS as usize;
+        if self.cursor < self.top {
+            self.top = self.cursor;
+        } else if self.cursor >= self.top + rows {
+            self.top = self.cursor - rows + 1;
+        }
+        // The last window that is still full: never scroll past the bottom.
+        let last = self.depth().saturating_sub(rows) + 1;
+        self.top = self.top.clamp(1, last);
+    }
+
     fn handle_normal(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('i') => self.mode = Mode::Insert,
@@ -544,6 +575,11 @@ impl App {
             // `k`/up moves back toward the top.
             KeyCode::Char('j') | KeyCode::Down => self.cursor += 1,
             KeyCode::Char('k') | KeyCode::Up => self.cursor = self.cursor.saturating_sub(1),
+            // Vim's ends-of-buffer, which here are the ends of the stack: `g`
+            // to the top of stack, `G` to the deepest level. Single `g` rather
+            // than `gg` — there is no other `g` command to disambiguate from.
+            KeyCode::Char('g') => self.cursor = 1,
+            KeyCode::Char('G') => self.cursor = self.depth().max(1),
 
             // Cursor-relative stack edits. Each names the machine method it
             // wants, so a stack edit always hits the stack rather than going
@@ -691,6 +727,7 @@ impl App {
         });
         self.last = None;
         self.cursor = 1;
+        self.top = 1;
     }
 
     /// Parse and run the command-line buffer. On success it clears; on error
@@ -1002,6 +1039,75 @@ mod tests {
         ch(&mut app, 'j'); // clamped at the base
         assert_eq!(app.cursor, 3);
         ch(&mut app, 'k'); // back up toward the top
+        assert_eq!(app.cursor, 2);
+    }
+
+    /// A stack deeper than the window, for the scrolling tests.
+    fn deep(n: usize) -> App {
+        let mut app = App::new();
+        let values: Vec<String> = (1..=n).map(|i| i.to_string()).collect();
+        run(&mut app, &values.join(" "));
+        press(&mut app, KeyCode::Esc);
+        app
+    }
+
+    #[test]
+    fn the_window_follows_the_cursor_past_the_row_cap() {
+        let rows = MAX_STACK_ROWS as usize;
+        let mut app = deep(15);
+        assert_eq!(app.top, 1); // nothing to scroll yet
+
+        for _ in 0..rows - 1 {
+            ch(&mut app, 'j'); // to the last visible level
+        }
+        assert_eq!(app.cursor, rows);
+        assert_eq!(app.top, 1); // still in view, so still no scroll
+
+        ch(&mut app, 'j');
+        assert_eq!(app.cursor, rows + 1);
+        assert_eq!(app.top, 2); // moved by exactly one
+
+        ch(&mut app, 'k');
+        assert_eq!(app.top, 2); // back inside the window, so it stays put
+    }
+
+    #[test]
+    fn g_and_capital_g_jump_to_the_ends() {
+        let rows = MAX_STACK_ROWS as usize;
+        let mut app = deep(15);
+
+        ch(&mut app, 'G');
+        assert_eq!(app.cursor, 15);
+        assert_eq!(app.top, 15 - rows + 1); // the deepest level is the last row
+
+        ch(&mut app, 'g');
+        assert_eq!(app.cursor, 1);
+        assert_eq!(app.top, 1);
+    }
+
+    #[test]
+    fn a_short_stack_never_scrolls() {
+        let mut app = deep(3);
+        ch(&mut app, 'G');
+        assert_eq!(app.cursor, 3);
+        assert_eq!(app.top, 1);
+    }
+
+    #[test]
+    fn the_window_recovers_when_the_stack_shrinks_under_it() {
+        // Scrolled to the bottom, then a line empties most of the stack: the
+        // window has to come back up or it would be looking past the end.
+        let mut app = deep(15);
+        ch(&mut app, 'G');
+        assert!(app.top > 1);
+
+        ch(&mut app, 'i');
+        typ(&mut app, "13 drop-to");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+
+        assert_eq!(app.depth(), 2);
+        assert_eq!(app.top, 1);
         assert_eq!(app.cursor, 2);
     }
 
