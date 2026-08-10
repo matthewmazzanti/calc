@@ -608,6 +608,10 @@ impl App {
                 self.clear();
                 self.command.commit();
             }
+            "q" | "quit" => {
+                self.should_quit = true;
+                self.command.commit();
+            }
             other => {
                 self.notice = Some(Notice::Note(format!("unknown command: {other}")));
                 return;
@@ -1568,6 +1572,18 @@ mod tests {
             panic!("expected a note");
         };
         assert_eq!(note, "unknown command: clesr");
+    }
+
+    #[test]
+    fn quit_from_command_mode() {
+        for command in ["q", "quit"] {
+            let mut app = App::new();
+            press(&mut app, KeyCode::Esc);
+            ch(&mut app, ':');
+            typ(&mut app, command);
+            press(&mut app, KeyCode::Enter);
+            assert!(app.should_quit, ":{command} should quit");
+        }
     }
 
     #[test]

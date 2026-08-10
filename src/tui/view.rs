@@ -33,24 +33,33 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
     frame.render_widget(Paragraph::new(info_line(app)), info_area);
 }
 
-/// The command-line prompt for a mode: `>` for insert, `:` for command. Normal
-/// gets blank rather than a marker — the row still shows the insert buffer you
-/// left behind, and a prompt there would advertise an input the mode doesn't
-/// take. Normal is legible from the highlighted stack level instead.
+/// The command-line prompt for a mode: `>` for entry, `:` for command. Normal
+/// keeps insert's `>` because it is the same line for the same purpose — `i`
+/// resumes editing exactly the text sitting there — and says so by being dim
+/// rather than by changing glyph.
 fn prompt(mode: Mode) -> &'static str {
     match mode {
-        Mode::Insert => "> ",
+        Mode::Insert | Mode::Normal => "> ",
         Mode::Command => ": ",
-        Mode::Normal => "  ",
     }
 }
 
-/// The command line: the teal mode prompt followed by whichever buffer the mode
-/// is typing into.
+/// The command line: the mode's prompt followed by whichever buffer it is typing
+/// into, teal while that buffer is live and dim while it is parked. Normal mode
+/// is the parked case — the text is still there and still yours, but the keys
+/// are going to the stack, so dimming it is the honest rendering.
 fn command_line(app: &App) -> Line<'_> {
+    let style = match app.mode() {
+        Mode::Normal => Style::new().dim(),
+        Mode::Insert | Mode::Command => Style::new().fg(Color::Cyan),
+    };
+    let text = match app.mode() {
+        Mode::Normal => Style::new().dim(),
+        Mode::Insert | Mode::Command => Style::new(),
+    };
     Line::from(vec![
-        Span::styled(prompt(app.mode()), Style::new().fg(Color::Cyan)),
-        Span::raw(app.line()),
+        Span::styled(prompt(app.mode()), style),
+        Span::styled(app.line(), text),
     ])
 }
 
