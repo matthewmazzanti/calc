@@ -88,9 +88,16 @@
 - [x] **Reclaim the info line** — only reserve its row when there's something to
   show (an error, or a `cmd`); otherwise give the row back to the stack. Ties
   into the dynamic viewport height (`CHROME_ROWS` would become conditional).
-- [ ] **SIGWINCH / resize** — confirm terminal resize is handled. ratatui
-  autoresizes on `draw`, but our inline viewport is recreated on stack-height
-  changes only; a width/height change from the WM may need explicit handling.
+- [x] **SIGWINCH / resize** — handled already, no code of ours involved. The
+  two halves the doubt was about turn out to meet: crossterm delivers
+  `Event::Resize`, which wakes the blocking `event::read()`; the loop ignores it
+  (it isn't a `Key`) but falls through to the next `terminal.draw()`, and
+  ratatui's `autoresize` recomputes the inline viewport there. `resize_terminal`
+  is only for *our* height changes; the terminal's own are ratatui's.
+  Confirmed in tmux: narrowing the window clipped the `cmd:` line and widening
+  it back restored it in full **with no keypress sent** — a terminal cannot
+  un-clip cells, so only a redraw explains it. Height changes and continued
+  editing across both were fine.
 
 ## CLI
 - [x] **`-c EXPRESSION`** — evaluate one expression non-interactively and print
