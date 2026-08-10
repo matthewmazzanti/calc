@@ -275,43 +275,96 @@ impl Action {
         }
     }
 
+    /// The level a shuffle acted on — the *site* of the change, for placing the
+    /// stack cursor after an undo. A `Cmd` has no single site: a line may touch
+    /// any number of levels, or none.
+    fn level(&self) -> Option<usize> {
+        match self {
+            Self::Dup(level)
+            | Self::Drop(level)
+            | Self::Swap(level)
+            | Self::Rot(level)
+            | Self::Unrot(level) => Some(*level),
+            Self::Cmd(_) => None,
+        }
+    }
+
+    // --- Cursor-relative constructors. ---
+    //
+    // Each snaps its level up to the shallowest one where the operation means
+    // something *it* means: a rotate at level 1 is the identity and at 2 is
+    // `swap`, so the first level that is genuinely a rotate is 3. Without the
+    // floor, `h` near the top of the stack silently does nothing — or worse,
+    // silently does a swap — and still takes an undo point for it.
+    //
+    // The floor lives here rather than at the key bindings so that `.` gets it
+    // too: re-aiming at the cursor has to land somewhere the operation exists.
+
+    /// Copy the value at `level` (or the top) to the top.
+    fn dup_at(level: usize) -> Self {
+        Self::Dup(level.max(1))
+    }
+
+    /// Remove the value at `level` (or the top).
+    fn drop_at(level: usize) -> Self {
+        Self::Drop(level.max(1))
+    }
+
+    /// Exchange `level` with the top. Level 1 would be the identity.
+    fn swap_at(level: usize) -> Self {
+        Self::Swap(level.max(2))
+    }
+
+    /// Rotate the span up. Level 1 is the identity, level 2 is `swap`.
+    fn rot_to(level: usize) -> Self {
+        Self::Rot(level.max(3))
+    }
+
+    /// Rotate the span down. Same floor, being the inverse.
+    fn unrot_to(level: usize) -> Self {
+        Self::Unrot(level.max(3))
+    }
+
     /// The same change re-aimed at `level` — how `.` repeats a shuffle where the
-    /// cursor is *now* rather than where it first ran. A `Cmd` has no level to
-    /// move, so it repeats as it was.
+    /// cursor is *now* rather than where it first ran, floored as at
+    /// construction. A `Cmd` has no level to move, so it repeats as it was.
     fn at(&self, level: usize) -> Self {
         match self {
-            Self::Dup(_) => Self::Dup(level),
-            Self::Drop(_) => Self::Drop(level),
-            Self::Swap(_) => Self::Swap(level),
-            Self::Rot(_) => Self::Rot(level),
-            Self::Unrot(_) => Self::Unrot(level),
+            Self::Dup(_) => Self::dup_at(level),
+            Self::Drop(_) => Self::drop_at(level),
+            Self::Swap(_) => Self::swap_at(level),
+            Self::Rot(_) => Self::rot_to(level),
+            Self::Unrot(_) => Self::unrot_to(level),
             Self::Cmd(program) => Self::Cmd(program.clone()),
         }
     }
 }
 
-/// The info-bar label. A shuffle reads as the fixed word at the level that word
-/// names — `drop` *is* `drop-at 1`, `rot` *is* `rot-to 3`, which is why the level
-/// is matched in the pattern — and as the `n`-suffixed word plus the level
-/// anywhere else. A `Cmd` reads as its canonical program text, which is not
-/// necessarily the text that was typed.
+/// The info-bar label, **written as a program you could type**. A shuffle reads
+/// as the fixed word at the level that word names — `drop` *is* `1 drop-at`,
+/// `rot` *is* `3 rot-to`, which is why the level is matched in the pattern — and
+/// as the level followed by the indexed word anywhere else. Operand first: an
+/// indexed word pops its level off the stack, so `3 drop-at` is what you would
+/// enter, and `drop-at 3` is not a thing the language would accept.
+///
+/// A `Cmd` reads as its canonical program text, which is not necessarily the
+/// text that was typed.
 impl std::fmt::Display for Action {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Dup(1) => f.write_str("dup"),
             Self::Dup(2) => f.write_str("over"),
             Self::Dup(3) => f.write_str("pick"),
-            Self::Dup(level) => write!(f, "dup-at {level}"),
+            Self::Dup(level) => write!(f, "{level} dup-at"),
             Self::Drop(1) => f.write_str("drop"),
             Self::Drop(2) => f.write_str("nip"),
-            Self::Drop(level) => write!(f, "drop-at {level}"),
-            Self::Swap(1) => f.write_str("swap"),
+            Self::Drop(level) => write!(f, "{level} drop-at"),
             Self::Swap(2) => f.write_str("swap"),
-            Self::Swap(level) => write!(f, "swap-at {level}"),
+            Self::Swap(level) => write!(f, "{level} swap-at"),
             Self::Rot(3) => f.write_str("rot"),
-            Self::Rot(level) => write!(f, "rot-to {level}"),
+            Self::Rot(level) => write!(f, "{level} rot-to"),
             Self::Unrot(3) => f.write_str("unrot"),
-            Self::Unrot(level) => write!(f, "unrot-to {level}"),
+            Self::Unrot(level) => write!(f, "{level} unrot-to"),
             Self::Cmd(program) => {
                 for (i, element) in program.iter().enumerate() {
                     if i > 0 {
@@ -496,26 +549,26 @@ impl App {
             // wants, so a stack edit always hits the stack rather than going
             // through word resolution and being read as a (rebindable) word.
             KeyCode::Char('x') | KeyCode::Char('d') => {
-                self.update(Action::Drop(self.cursor));
+                self.update(Action::drop_at(self.cursor));
             }
             KeyCode::Char('s') => {
-                self.update(Action::Swap(self.cursor));
+                self.update(Action::swap_at(self.cursor));
             }
             // `h`/`l` are the rot pair, and inverses of each other: `h` brings
             // the selected value up to the top, `l` sends the top back down to
             // the selection. On the cursor's own level both are no-ops.
             KeyCode::Char('h') => {
-                self.update(Action::Rot(self.cursor));
+                self.update(Action::rot_to(self.cursor));
             }
             KeyCode::Char('l') => {
-                self.update(Action::Unrot(self.cursor));
+                self.update(Action::unrot_to(self.cursor));
             }
             // Ctrl-R redoes, vim-style.
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => self.redo(),
             KeyCode::Char('u') => self.undo(),
             // Copy the selected value to the top.
             KeyCode::Enter => {
-                self.update(Action::Dup(self.cursor));
+                self.update(Action::dup_at(self.cursor));
             }
             // Repeat the last change, vim's `.`.
             KeyCode::Char('.') => self.repeat(),
@@ -538,7 +591,7 @@ impl App {
             // once). With an empty buffer it duplicates the top of stack.
             KeyCode::Enter => {
                 if self.input.text().trim().is_empty() {
-                    self.update(Action::Dup(1));
+                    self.update(Action::dup_at(1));
                 } else {
                     self.commit_input();
                 }
@@ -711,15 +764,33 @@ impl App {
     /// Step back to the previous snapshot — engine and `cmd` together. Moving
     /// the history's cursor *is* moving the live state, so there is nothing to
     /// copy back.
+    ///
+    /// **The stack cursor lands on the site of the undone change**, which is
+    /// vim's rule: `u` leaves you at the restored text. Undoing a `drop-at 3`
+    /// puts you on level 3, where the value just came back — so `.` afterwards
+    /// repeats what you undid rather than retargeting at wherever clamping left
+    /// the cursor. A line has no single site, so it leaves the cursor alone.
     fn undo(&mut self) {
-        if !self.history.undo() {
+        // Read before stepping: the *current* snapshot is the one being undone.
+        let site = self.cmd().and_then(Action::level);
+        if self.history.undo() {
+            if let Some(level) = site {
+                self.cursor = level; // `clamp_cursor` bounds it to the stack
+            }
+        } else {
             self.notice = Some(Notice::Note("nothing to undo".to_string()));
         }
     }
 
-    /// Step forward to the most recently undone snapshot.
+    /// Step forward to the most recently undone snapshot, landing on the site of
+    /// the change it re-applies — read *after* stepping, since that snapshot is
+    /// the one being redone.
     fn redo(&mut self) {
-        if !self.history.redo() {
+        if self.history.redo() {
+            if let Some(level) = self.cmd().and_then(Action::level) {
+                self.cursor = level;
+            }
+        } else {
             self.notice = Some(Notice::Note("nothing to redo".to_string()));
         }
     }
@@ -1168,13 +1239,13 @@ mod tests {
         ch(&mut app, 'j');
         ch(&mut app, 'j'); // cursor at level 3
         ch(&mut app, 'x');
-        assert_eq!(cmd(&app), "drop-at 3");
+        assert_eq!(cmd(&app), "3 drop-at");
 
-        // The drop shrank the stack, so the cursor was clamped to level 2;
-        // undoing restores the depth but not the cursor, hence the `j`.
+        // The drop shrank the stack and clamped the cursor to level 2, but
+        // undoing puts it back on the site of the change — so we are still at
+        // level 3 without having to walk back.
         ch(&mut app, 'u');
-        assert_eq!(app.cursor, 2);
-        ch(&mut app, 'j');
+        assert_eq!(app.cursor, 3);
 
         ch(&mut app, 'h'); // rot is rot-to 3, so at level 3 it is plain `rot`
         assert_eq!(cmd(&app), "rot");
@@ -1186,12 +1257,95 @@ mod tests {
         // Dup has a shorthand at every level up to 3, so the label walks `dup`
         // -> `over` -> `pick` and only then falls back to the indexed word.
         let mut app = stacked("1 2 3 4");
-        for expected in ["dup", "over", "pick", "dup-at 4"] {
+        for expected in ["dup", "over", "pick", "4 dup-at"] {
             press(&mut app, KeyCode::Enter);
             assert_eq!(cmd(&app), expected);
             ch(&mut app, 'u'); // back to the four-value stack
             ch(&mut app, 'j'); // and one level deeper
         }
+    }
+
+    #[test]
+    fn a_cursor_edit_is_floored_to_where_it_means_something() {
+        // Each key snaps up to the shallowest level where its operation is
+        // itself: swap at 1 is the identity, rot at 1 is the identity and at 2
+        // is `swap`. So the key always does what it says rather than silently
+        // doing nothing — and never takes an undo point for a no-op.
+        let mut app = stacked("1 2 3");
+        ch(&mut app, 's'); // cursor at the top
+        assert_eq!(app.stack(), &[1.0, 3.0, 2.0]);
+        assert_eq!(cmd(&app), "swap");
+
+        let mut app = stacked("1 2 3");
+        ch(&mut app, 'h');
+        assert_eq!(app.stack(), &[2.0, 3.0, 1.0]);
+        assert_eq!(cmd(&app), "rot");
+
+        let mut app = stacked("1 2 3");
+        ch(&mut app, 'l');
+        assert_eq!(app.stack(), &[3.0, 1.0, 2.0]);
+        assert_eq!(cmd(&app), "unrot");
+    }
+
+    #[test]
+    fn a_floored_edit_on_a_shallow_stack_says_so() {
+        // Two values and a rotate wants three. An error naming the shortfall
+        // beats the silent no-op that an unfloored level 1 used to be.
+        let mut app = stacked("1 2");
+        ch(&mut app, 'h');
+        assert_eq!(app.stack(), &[1.0, 2.0]);
+        assert!(matches!(app.notice, Some(Notice::Error(_))));
+    }
+
+    #[test]
+    fn undo_lands_on_the_site_of_the_change() {
+        // Vim's rule: `u` leaves you at the restored text. Without it the drop's
+        // clamp would strand the cursor at 2, and `.` — which aims at the cursor
+        // by design — would repeat a *different* drop than the one undone.
+        let mut app = stacked("1 2 3");
+        ch(&mut app, 'j');
+        ch(&mut app, 'j'); // level 3
+        ch(&mut app, 'x');
+        assert_eq!(app.stack(), &[2.0, 3.0]);
+        assert_eq!(app.cursor, 2); // clamped by the shrink
+
+        ch(&mut app, 'u');
+        assert_eq!(app.stack(), &[1.0, 2.0, 3.0]);
+        assert_eq!(app.cursor, 3); // back where the value came from
+
+        ch(&mut app, '.');
+        assert_eq!(app.stack(), &[2.0, 3.0]); // the same drop, not a new one
+        assert_eq!(cmd(&app), "3 drop-at");
+    }
+
+    #[test]
+    fn redo_lands_on_the_site_too() {
+        let mut app = stacked("1 2 3");
+        ch(&mut app, 'j');
+        ch(&mut app, 'j'); // level 3
+        press(&mut app, KeyCode::Enter); // dup level 3 -> [1, 2, 3, 1]
+        ch(&mut app, 'u');
+        ch(&mut app, 'k'); // wander off to level 2
+        assert_eq!(app.cursor, 2);
+
+        ctrl(&mut app, 'r');
+        assert_eq!(app.stack(), &[1.0, 2.0, 3.0, 1.0]);
+        assert_eq!(app.cursor, 3); // the site of the change it re-applied
+    }
+
+    #[test]
+    fn undoing_a_line_leaves_the_cursor_alone() {
+        // A line may touch any number of levels, or none, so it has no site to
+        // land on and the cursor stays where the user put it.
+        let mut app = App::new();
+        run(&mut app, "1 2 3");
+        run(&mut app, "4");
+        press(&mut app, KeyCode::Esc);
+        ch(&mut app, 'j'); // level 2
+
+        ch(&mut app, 'u');
+        assert_eq!(app.stack(), &[1.0, 2.0, 3.0]);
+        assert_eq!(app.cursor, 2);
     }
 
     #[test]
@@ -1613,7 +1767,7 @@ mod tests {
         ch(&mut app, 'j'); // cursor at level 3, the value 1
         ch(&mut app, '.');
         assert_eq!(app.stack(), &[2.0, 3.0]);
-        assert_eq!(cmd(&app), "drop-at 3"); // relabelled for where it landed
+        assert_eq!(cmd(&app), "3 drop-at"); // relabelled for where it landed
     }
 
     #[test]
