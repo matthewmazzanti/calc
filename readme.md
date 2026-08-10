@@ -36,8 +36,13 @@ Some examples to try:
 - Fully transactional errors - divide by zero resets you to before the last REPL line
 - Linear undo/redo, full internal engine is snapshotted after the return of each repl line
 - Vim keybindings (esc to enter normal mode, hjkl to move around the stack)
+- Readline editing on the command line, with `^P`/`^N` to step back and forth
+  through the lines you've run — recall, edit, re-run
 
 ## The Calc language
 
 Calc runs as a lexical, late-bound, concatenative-ish language. First class functions,
 environments, closures.
+
+## Cool stuff
+
