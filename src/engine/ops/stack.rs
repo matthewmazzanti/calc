@@ -33,8 +33,10 @@ use crate::engine::{Engine, ErrorKind, Primitive};
 /// level — the shuffles move and copy marks like any other value, so a
 /// collection is not a sealed scope.
 fn index_of_level(e: &Engine, level: usize) -> Option<usize> {
-    let len = e.stack.len();
-    (1..=len).contains(&level).then(|| len - level)
+    if level == 0 {
+        return None; // 0 is not a level: they are 1-based
+    }
+    e.stack.len().checked_sub(level) // and deeper than the stack is out of range
 }
 
 /// Copy the value **at** `level` to the top (`dup` = 1, `over` = 2, `dup-at`).
