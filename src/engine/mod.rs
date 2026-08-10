@@ -602,9 +602,9 @@ impl Engine {
 /// defined in [`ops::stack`] alongside the words built on the same surgery;
 /// these are the machine's public face on it.
 impl Engine {
-    /// Copy the value at `level` to the top (`dup` = 1, `over` = 2, `pickn`).
-    pub fn pick_at(&mut self, level: usize) -> Result<(), ErrorKind> {
-        ops::stack::pick_at(self, level)
+    /// Copy the value at `level` to the top (`dup` = 1, `over` = 2, `dup-at`).
+    pub fn dup_at(&mut self, level: usize) -> Result<(), ErrorKind> {
+        ops::stack::dup_at(self, level)
     }
 
     /// Remove the value at `level` (`drop` = 1, `nip` = 2, `dropn`).

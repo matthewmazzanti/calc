@@ -315,7 +315,7 @@ fn power_is_an_ordinary_word_named_with_an_operator() {
 
 #[test]
 fn rounding_yields_integers() {
-    // Not `3.0` — a rounded value can feed `nth` or `pickn` directly.
+    // Not `3.0` — a rounded value can feed `nth` or `dup-at` directly.
     assert_eq!(run("3.7 floor").stack(), &[Value::Int(3)]);
     assert_eq!(run("-3.2 floor").stack(), &[Value::Int(-4)]);
     assert_eq!(run("3.2 ceil").stack(), &[Value::Int(4)]);
@@ -708,8 +708,42 @@ fn fixed_shuffles() {
     assert_eq!(run("1 2 nip").stack(), &[2.0]);
     assert_eq!(run("1 2 tuck").stack(), &[2.0, 1.0, 2.0]);
     assert_eq!(run("1 2 dupd").stack(), &[1.0, 1.0, 2.0]);
-    assert_eq!(run("1 2 2dup").stack(), &[1.0, 2.0, 1.0, 2.0]);
+    assert_eq!(run("1 2 dup2").stack(), &[1.0, 2.0, 1.0, 2.0]);
     assert_eq!(run("1 2 3 2drop").stack(), &[1.0]);
+}
+
+#[test]
+fn the_dup_family_agrees_at_level_one() {
+    // `-at` names one item by depth, `-to` a run by width. At level 1 they are
+    // the same item, which is what lets a bare `dup` belong to both families
+    // without saying which.
+    assert_eq!(run("1 2 1 dup-at").stack(), run("1 2 dup").stack());
+    assert_eq!(run("1 2 1 dup-to").stack(), run("1 2 dup").stack());
+}
+
+#[test]
+fn the_dup_family_diverges_above_level_one() {
+    // The whole point of the split: at level 2 one copies the single item there,
+    // the other copies everything down to it.
+    assert_eq!(run("1 2 2 dup-at").stack(), run("1 2 over").stack());
+    assert_eq!(run("1 2 2 dup-to").stack(), run("1 2 dup2").stack());
+    assert_eq!(run("1 2 3 3 dup-at").stack(), run("1 2 3 pick").stack());
+    assert_eq!(run("1 2 3 3 dup-to").stack(), run("1 2 3 dup3").stack());
+    assert_eq!(
+        run("1 2 3 3 dup-to").stack(),
+        &[1.0, 2.0, 3.0, 1.0, 2.0, 3.0]
+    );
+}
+
+#[test]
+fn pick_is_factors_fixed_level_three_not_forths_indexed_one() {
+    // Worth pinning because the conventions disagree and ours fails *silently*.
+    // Forth's `pick` is indexed and consumes its index: `1 2 3 2 pick` leaves
+    // `1 2 3 1`. Ours is a fixed level 3, so the `2` stays on the stack and
+    // shifts what level 3 means — level 3 of `1 2 3 2` is the `2` — leaving a
+    // different value *and* a different depth.
+    assert_eq!(run("1 2 3 pick").stack(), &[1.0, 2.0, 3.0, 1.0]);
+    assert_eq!(run("1 2 3 2 pick").stack(), &[1.0, 2.0, 3.0, 2.0, 2.0]);
 }
 
 #[test]
@@ -719,8 +753,10 @@ fn unrot_is_rot_inverted() {
 
 #[test]
 fn indexed_words_take_their_level_off_the_stack() {
-    // `3 pickn` copies level 3 to the top (the level itself is consumed).
-    assert_eq!(run("1 2 3 3 pickn").stack(), &[1.0, 2.0, 3.0, 1.0]);
+    // `3 dup-at` copies level 3 to the top (the level itself is consumed).
+    assert_eq!(run("1 2 3 3 dup-at").stack(), &[1.0, 2.0, 3.0, 1.0]);
+    // `dup-to` takes the whole run down to that level, not the one item at it.
+    assert_eq!(run("1 2 3 2 dup-to").stack(), &[1.0, 2.0, 3.0, 2.0, 3.0]);
     assert_eq!(run("1 2 3 3 rolln").stack(), &[2.0, 3.0, 1.0]);
     assert_eq!(run("1 2 3 3 rolldn").stack(), &[3.0, 1.0, 2.0]);
     assert_eq!(run("1 2 3 2 dropn").stack(), &[1.0, 3.0]);
@@ -753,18 +789,20 @@ fn a_non_integer_level_is_rejected_not_rounded() {
 
 #[test]
 fn a_level_out_of_range_underflows() {
-    assert_eq!(run_err("1 2 5 pickn"), ErrorKind::StackUnderflow);
+    assert_eq!(run_err("1 2 5 dup-at"), ErrorKind::StackUnderflow);
+    assert_eq!(run_err("1 2 5 dup-to"), ErrorKind::StackUnderflow);
     // A level of 0 is not a valid 1-based level either.
     assert_eq!(run_err("1 2 0 rolln"), ErrorKind::StackUnderflow);
 }
 
 #[test]
-fn indexed_words_are_n_suffixed() {
-    // The naming decision: the indexed shuffles carry an `n` suffix. They're
-    // bound in the prelude and render as their word (a captured primitive
-    // Displays by name).
+fn indexed_words_are_named_for_their_index() {
+    // The naming decision: an indexed shuffle says so in its name. The dup pair
+    // spells out which target it takes — `-at` one item, `-to` a run — and the
+    // rest still carry the older `n` suffix. They're bound in the prelude and
+    // render as their word (a captured primitive Displays by name).
     let base = prelude();
-    for name in ["pickn", "rolln", "rolldn", "dropn", "swapn"] {
+    for name in ["dup-at", "dup-to", "rolln", "rolldn", "dropn", "swapn"] {
         let bound = base.get(name).expect("indexed word bound in the prelude");
         assert_eq!(bound.to_string(), name);
     }

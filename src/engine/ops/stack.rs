@@ -1,13 +1,21 @@
 //! Stack-shuffle words, and the level-indexed surgery they are all built on.
 //!
-//! This module *owns* `pick_at`/`drop_at`/`swap_at`/`roll_at`/`rolld_at` —
-//! levels are 1-based, level 1 is the top of stack. [`Engine`] re-exposes the
-//! five as methods so a caller outside the vocabulary (the TUI's cursor edits)
-//! can ask for one directly; the definitions are here, with the words.
+//! This module *owns* the surgery — `dup_at`/`dup_to`/`drop_at`/`swap_at`/
+//! `roll_at`/`rolld_at`, levels 1-based with level 1 the top of stack. [`Engine`]
+//! re-exposes what the TUI's cursor edits drive, so a caller outside the
+//! vocabulary can ask for one directly; the definitions are here, with the words.
 //!
-//! The fixed shuffles are the ones at a constant level — `drop` is `dropn 1`,
-//! `rot` is `rolln 3` — and the `n`-suffixed variants pop their level off the
-//! stack first. `tuck`/`dupd`/`2dup`/`2drop` are pure pop/push rearrangements.
+//! **The indexed word is the general form; every fixed shuffle is one of them
+//! with its level written in** — `drop` is level 1 of `dropn`, `rot` is level 3
+//! of `rolln`. The table is grouped by family with the indexed forms at the head
+//! of each, so a group reads as one operation and the names it answers to.
+//!
+//! Two ways to name a target, and `dup` has both: `-at` takes the single item
+//! *at* a level (`over` is `2 dup-at`), `-to` takes the whole run from the top
+//! down *to* it (`dup2` is `2 dup-to`). They coincide at level 1, which is why a
+//! bare `dup` needs no qualifier.
+//!
+//! `tuck`/`dupd`/`2drop` are pop/push rearrangements no index names, and
 //! `clear` is the machine's stack reset.
 //!
 //! This is the one word module that reaches into the stack `Vec`; the rest are
@@ -26,11 +34,24 @@ fn index_of_level(e: &Engine, level: usize) -> Option<usize> {
     (1..=len).contains(&level).then(|| len - level)
 }
 
-/// Copy the value at `level` to the top (`dup` = 1, `over` = 2, `pickn`).
-pub(in crate::engine) fn pick_at(e: &mut Engine, level: usize) -> Result<(), ErrorKind> {
+/// Copy the value **at** `level` to the top (`dup` = 1, `over` = 2, `dup-at`).
+pub(in crate::engine) fn dup_at(e: &mut Engine, level: usize) -> Result<(), ErrorKind> {
     let i = index_of_level(e, level).ok_or(ErrorKind::StackUnderflow)?;
     let v = e.stack[i].clone();
     e.stack.push(v);
+    Ok(())
+}
+
+/// Copy every value from the top down **to** `level` — levels `1..=level`, order
+/// preserved (`dup` = 1, `dup2` = 2, `dup-to`).
+///
+/// The other half of the dup family: `dup-at` names one item by depth, `dup-to`
+/// names a run by width. They agree at level 1, which is what lets a bare `dup`
+/// belong to both. Derivable as `dup-at level` applied `level` times, but that
+/// is `level` calls against one slice copy.
+pub(in crate::engine) fn dup_to(e: &mut Engine, level: usize) -> Result<(), ErrorKind> {
+    let start = index_of_level(e, level).ok_or(ErrorKind::StackUnderflow)?;
+    e.stack.extend_from_within(start..);
     Ok(())
 }
 
@@ -70,23 +91,39 @@ pub(in crate::engine) fn rolld_at(e: &mut Engine, level: usize) -> Result<(), Er
 
 #[rustfmt::skip]
 pub(super) static PRIMITIVES: &[Primitive] = &[
-    Primitive { name: "dup",    run: |e| pick_at(e, 1) },  // a -- a a
+    // Copy. `-at` takes the one item at a level, `-to` the whole run down to it,
+    // and the shorthands say which by shape: traditional names for `-at`, a
+    // numeric suffix for `-to`. NB `pick` is Factor's fixed level 3, *not*
+    // Forth's indexed one — `2 pick` here pushes a 2 and then copies.
+    Primitive { name: "dup-at", run: |e| indexed(e, dup_at) },
+    Primitive { name: "dup-to", run: |e| indexed(e, dup_to) },
+    Primitive { name: "dup",    run: |e| dup_at(e, 1) },   // a -- a a
+    Primitive { name: "over",   run: |e| dup_at(e, 2) },   // a b -- a b a
+    Primitive { name: "pick",   run: |e| dup_at(e, 3) },   // a b c -- a b c a
+    Primitive { name: "dup2",   run: |e| dup_to(e, 2) },   // a b -- a b a b
+    Primitive { name: "dup3",   run: |e| dup_to(e, 3) },   // a b c -- a b c a b c
+
+    // Remove. `2drop` is the width form the dup family spells `dup-to`, still
+    // hardcoded because there is no `drop-to` yet.
+    Primitive { name: "dropn",  run: |e| indexed(e, drop_at) },
     Primitive { name: "drop",   run: |e| drop_at(e, 1) },  // a --
-    Primitive { name: "swap",   run: |e| swap_at(e, 1) },  // a b -- b a
-    Primitive { name: "over",   run: |e| pick_at(e, 2) },  // a b -- a b a
-    Primitive { name: "rot",    run: |e| roll_at(e, 3) },  // a b c -- b c a
-    Primitive { name: "unrot",  run: |e| rolld_at(e, 3) }, // a b c -- c a b
     Primitive { name: "nip",    run: |e| drop_at(e, 2) },  // a b -- b
-    Primitive { name: "tuck",   run: tuck },               // a b -- b a b
-    Primitive { name: "dupd",   run: dupd },               // a b -- a a b
-    Primitive { name: "2dup",   run: two_dup },            // a b -- a b a b
     Primitive { name: "2drop",  run: two_drop },           // a b --
-    // Indexed: the 1-based level is popped off the stack (`n rolln`).
-    Primitive { name: "pickn",  run: |e| indexed(e, pick_at) },
+
+    // Exchange. Self-inverse, so there is no `un` half.
+    Primitive { name: "swapn",  run: |e| indexed(e, swap_at) },
+    Primitive { name: "swap",   run: |e| swap_at(e, 1) },  // a b -- b a
+
+    // Move, and its inverse. No bare form: both are identity at level 1, which
+    // is why the shorthands sit at 3.
     Primitive { name: "rolln",  run: |e| indexed(e, roll_at) },
     Primitive { name: "rolldn", run: |e| indexed(e, rolld_at) },
-    Primitive { name: "dropn",  run: |e| indexed(e, drop_at) },
-    Primitive { name: "swapn",  run: |e| indexed(e, swap_at) },
+    Primitive { name: "rot",    run: |e| roll_at(e, 3) },  // a b c -- b c a
+    Primitive { name: "unrot",  run: |e| rolld_at(e, 3) }, // a b c -- c a b
+
+    // Rearrangements no index names, and the machine's stack reset.
+    Primitive { name: "tuck",   run: tuck },               // a b -- b a b
+    Primitive { name: "dupd",   run: dupd },               // a b -- a a b
     Primitive { name: "clear",  run: Engine::clear },
 ];
 
@@ -105,17 +142,6 @@ fn dupd(e: &mut Engine) -> Result<(), ErrorKind> {
     let b = e.pop()?;
     let a = e.pop()?;
     e.push(a.clone());
-    e.push(a);
-    e.push(b);
-    Ok(())
-}
-
-/// `2dup` ( a b -- a b a b ): copy the top two, order preserved.
-fn two_dup(e: &mut Engine) -> Result<(), ErrorKind> {
-    let b = e.pop()?;
-    let a = e.pop()?;
-    e.push(a.clone());
-    e.push(b.clone());
     e.push(a);
     e.push(b);
     Ok(())

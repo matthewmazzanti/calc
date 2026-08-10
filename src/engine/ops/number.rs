@@ -30,7 +30,7 @@
 //! **Integer-preserving where it can be**: `+ - * neg abs %` on two `Int`s,
 //! `min`/`max` (which return the winning operand, not a recomputed float), `^`
 //! with a non-negative `Int` exponent, and `floor ceil round trunc`, which
-//! *produce* an `Int` so a rounded value can go straight into `nth` or `pickn`.
+//! *produce* an `Int` so a rounded value can go straight into `nth` or `dup-at`.
 //! Every transcendental yields a float; `/` and `inv` always do.
 
 use std::rc::Rc;
@@ -422,7 +422,7 @@ fn defined(y: f64, operands: &[f64]) -> Result<f64, ErrorKind> {
 }
 
 /// Round by `f`, yielding an `Int` where the result fits in one — `3.7 floor` is
-/// `3`, not `3.0`, so a rounded value can feed `nth` or `pickn` directly. An
+/// `3`, not `3.0`, so a rounded value can feed `nth` or `dup-at` directly. An
 /// `Int` is already integral and passes through untouched. A float too large for
 /// an `i64` keeps its `Num` form rather than saturating to a wrong integer.
 fn round_with(e: &mut Engine, f: impl FnOnce(f64) -> f64) -> Result<(), ErrorKind> {

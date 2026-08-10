@@ -5,7 +5,7 @@
 # here is everything *definable* over the primitive core — so the Rust tables
 # shrink to the words that genuinely cannot be written down: the ones that touch
 # the stack machine, the environment, or the float unit. The derived stack
-# shuffles (`over rot nip tuck dupd 2dup 2drop`), the combinators (`dip keep bi`),
+# shuffles (`over rot nip tuck dupd dup2 2drop`), the combinators (`dip keep bi`),
 # and the flow words (`when unless cond`) all belong here eventually.
 
 # `each` ( lst f -- ... ) — apply `f` to each element of `lst`, in order.

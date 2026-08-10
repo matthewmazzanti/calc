@@ -240,8 +240,8 @@ impl LineEditor {
 /// has to know what it is re-aiming.
 #[derive(Debug, Clone)]
 pub(super) enum Action {
-    /// Copy the value at a level to the top. Level 1 is `dup`.
-    Pick(usize),
+    /// Copy the value at a level to the top. Level 1 is `dup`, level 2 `over`.
+    Dup(usize),
     /// Remove the value at a level. Level 1 is `drop`.
     Drop(usize),
     /// Exchange a level with the one just below it. Level 1 is `swap`.
@@ -261,7 +261,7 @@ impl Action {
     /// Apply the change to an engine.
     fn run(&self, engine: &mut Engine) -> Outcome {
         match self {
-            Self::Pick(level) => engine.pick_at(*level).map_err(CalcError::from),
+            Self::Dup(level) => engine.dup_at(*level).map_err(CalcError::from),
             Self::Drop(level) => engine.drop_at(*level).map_err(CalcError::from),
             Self::Swap(level) => engine.swap_at(*level).map_err(CalcError::from),
             Self::Roll(level) => engine.roll_at(*level).map_err(CalcError::from),
@@ -275,7 +275,7 @@ impl Action {
     /// move, so it repeats as it was.
     fn at(&self, level: usize) -> Self {
         match self {
-            Self::Pick(_) => Self::Pick(level),
+            Self::Dup(_) => Self::Dup(level),
             Self::Drop(_) => Self::Drop(level),
             Self::Swap(_) => Self::Swap(level),
             Self::Roll(_) => Self::Roll(level),
@@ -293,8 +293,10 @@ impl Action {
 impl std::fmt::Display for Action {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Pick(1) => f.write_str("dup"),
-            Self::Pick(level) => write!(f, "pickn {level}"),
+            Self::Dup(1) => f.write_str("dup"),
+            Self::Dup(2) => f.write_str("over"),
+            Self::Dup(3) => f.write_str("pick"),
+            Self::Dup(level) => write!(f, "dup-at {level}"),
             Self::Drop(1) => f.write_str("drop"),
             Self::Drop(level) => write!(f, "dropn {level}"),
             Self::Swap(1) => f.write_str("swap"),
@@ -484,7 +486,7 @@ impl App {
             KeyCode::Char('u') => self.undo(),
             // Copy the selected value to the top.
             KeyCode::Enter => {
-                self.update(Action::Pick(self.cursor));
+                self.update(Action::Dup(self.cursor));
             }
             // Repeat the last change, vim's `.`.
             KeyCode::Char('.') => self.repeat(),
@@ -505,7 +507,7 @@ impl App {
             // once). With an empty buffer it duplicates the top of stack.
             KeyCode::Enter => {
                 if self.input.text().trim().is_empty() {
-                    self.update(Action::Pick(1));
+                    self.update(Action::Dup(1));
                 } else {
                     self.commit_input();
                 }
@@ -1085,6 +1087,19 @@ mod tests {
         ch(&mut app, 'h'); // rot is rolln 3, so at level 3 it is plain `rot`
         assert_eq!(cmd(&app), "rot");
         assert_eq!(app.stack(), &[2.0, 3.0, 1.0]);
+    }
+
+    #[test]
+    fn a_cursor_dup_is_labelled_by_its_level() {
+        // Dup has a shorthand at every level up to 3, so the label walks `dup`
+        // -> `over` -> `pick` and only then falls back to the indexed word.
+        let mut app = stacked("1 2 3 4");
+        for expected in ["dup", "over", "pick", "dup-at 4"] {
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(cmd(&app), expected);
+            ch(&mut app, 'u'); // back to the four-value stack
+            ch(&mut app, 'j'); // and one level deeper
+        }
     }
 
     #[test]
