@@ -358,11 +358,15 @@ Six areas that need a spec. Sketched here with the decisions each one carries, n
 
 ### 9.1 Stack operations
 
-The irreducible core is `dup drop swap over rot`, plus conveniences (`nip tuck dupd -rot 2dup 2drop`).
+The irreducible core is the eight indexed words — `dup-at`/`dup-to`, `drop-at`/`drop-to`,
+`swap-at`/`swap-to`, `rot-to`/`unrot-to` — where `-at` is the operation positioned at a level and
+`-to` the one spanning the top down to it. Every other shuffle is one of them at a constant level:
+`dup over pick dup2 dup3`, `drop nip drop2 drop3`, `swap swap3`, `rot unrot`.
 
-**Open: `pick` and `roll`.** Forth and RPL have indexed-depth access; Factor deliberately omits it, on
-the grounds that anything reaching three deep should be named. Since frames and `set` exist here,
-omitting them is affordable — and it keeps the stack from becoming an array you index into.
+**Settled: indexed depth access is in.** Forth and RPL have it; Factor deliberately omits it, on the
+grounds that anything reaching three deep should be named. It earns its place here because the TUI's
+cursor edits are indexed by construction — the cursor *is* a level — so the machine needed the
+operation regardless, and naming it made the fixed shuffles fall out as constants of it.
 
 **`dip` is near-forced.** With `>r`/`r>` excluded, it's the only way to reach past the top. Factor
 needs a retain stack to implement it; here it's definable in-language, since frames provide the stash:

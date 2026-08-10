@@ -559,9 +559,13 @@ fall out. Naturally its own milestone.
 
 ### V6 — vocabulary, mostly in-language
 
-A **startup-parsed prelude** bound into `base`: move the derived stack words
-(`over rot unrot nip tuck dupd 2dup 2drop`) out of the Rust table, leaving a true
-primitive core. Add the combinators (`dip keep bi bi* bi@`) and flow control
+A **startup-parsed prelude** bound into `base`: move the derived stack words out
+of the Rust table, leaving a true primitive core. The `-at`/`-to` split makes
+that division mechanical rather than a judgement call — the primitives are the
+eight indexed words (`dup-at`/`dup-to`, `drop-at`/`drop-to`, `swap-at`/`swap-to`,
+`rot-to`/`unrot-to`) plus `clear`, and every other shuffle is one of them at a
+constant level (`dup over pick dup2 dup3 drop nip drop2 drop3 swap swap3 rot
+unrot`). Add the combinators (`dip keep bi bi* bi@`) and flow control
 (`if when unless cond`) as ordinary words over a real boolean. `apply_value` is
 already the single "run any callable" seam, so primitive-vs-function stays
 transparent.

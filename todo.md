@@ -38,7 +38,8 @@
   precedent: complex and vector/matrix objects are first-class stack values.
 - [x] **Fix parameterized commands — read the level from the stack.** Done on
   the `concatenative-language` branch. Ops are un-parameterized: the indexed
-  words (`pickn`/`rolln`/`rolldn`/`dropn`/`swapn`) pop their 1-based level off
+  words (`dup-at`/`dup-to`/`drop-at`/`drop-to`/`swap-at`/`swap-to`/`rot-to`/
+  `unrot-to`) pop their 1-based level off
   the stack (via `Engine::indexed`), and the fixed shuffles (`dup`/`swap`/`rot`
   …) are their own no-arg builtins. The cursor UI took the "separate path"
   answer: it calls the `*_at(level)` engine methods directly rather than

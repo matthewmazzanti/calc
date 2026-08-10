@@ -81,8 +81,10 @@ exponent = ("e" | "E") ("+" | "-")? digit+
 ```
 
 Small and deliberate, because **a name is defined negatively — a run this grammar doesn't claim.** That
-is forced by a vocabulary holding `2dup`, `bi*`, and `+`: no identifier grammar admits all three, which
-is why Forth, Factor, and Lisp all define names this way. The cost is that every literal shape deletes
+is forced by a name space holding `2dup`, `bi*`, and `+`: no identifier grammar admits all three, which
+is why Forth, Factor, and Lisp all define names this way. No *builtin* starts with a digit any more —
+`2dup`/`2drop` became `dup2`/`drop2` — but the shape stays reachable, since `'2dup {…} =` binds it, and
+that is what the grammar has to keep admitting. The cost is that every literal shape deletes
 names, so the grammar has to be one we chose rather than one inherited — `inf`, `nan`, `1/2`, and `0x1f`
 are names here, and making any of them a number later is a deliberate change to what a name can be.
 
@@ -615,7 +617,9 @@ rule.
 
 ### 12.1 Stack operations
 
-Core: `dup drop swap over rot`, plus `nip tuck dupd unrot 2dup 2drop`.
+Core: the eight indexed words (`dup-at`/`dup-to`, `drop-at`/`drop-to`, `swap-at`/`swap-to`,
+`rot-to`/`unrot-to`), with every fixed shuffle one of them at a constant level: `dup over pick dup2
+dup3`, `drop nip drop2 drop3`, `swap swap3`, `rot unrot`.
 
 **`dip` is near-forced.** With `>r`/`r>` excluded it's the only way to reach past the top, and frames
 provide the stash:
