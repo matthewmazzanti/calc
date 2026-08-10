@@ -37,17 +37,17 @@ fn new_terminal(height: u16) -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
 /// is fixed at creation, so we clear the current region and re-anchor a fresh
 /// viewport of the new height at the same top row.
 fn resize_terminal(
-    mut terminal: Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     height: u16,
-) -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
+) -> io::Result<()> {
     let top = terminal.get_frame().area().y;
     execute!(
         io::stdout(),
         MoveTo(0, top),
         Clear(ClearType::FromCursorDown)
     )?;
-    drop(terminal);
-    new_terminal(height)
+    *terminal = new_terminal(height)?;
+    Ok(())
 }
 
 /// Set up the inline viewport, run the event loop, and restore the terminal.
@@ -62,22 +62,31 @@ pub fn run() -> io::Result<()> {
     }));
 
     let mut app = App::new();
-    let terminal = new_terminal(desired_height(&app))?;
-    let result = event_loop(terminal, &mut app);
+    let mut terminal = new_terminal(desired_height(&app))?;
+    let result = event_loop(&mut terminal, &mut app);
 
-    let _ = execute!(io::stdout(), SetCursorStyle::DefaultUserShape);
+    // Leave the shell prompt on a fresh line below the final frame. The cursor
+    // is on the *command line*, which is the frame's **top** row, so a bare
+    // newline lands the prompt inside the frame and overwrites a stack row.
+    // Drop to the last row first; the newline then falls off the bottom of the
+    // frame, scrolling if that is also the bottom of the screen.
+    let frame = terminal.get_frame().area();
+    let _ = execute!(
+        io::stdout(),
+        SetCursorStyle::DefaultUserShape,
+        MoveTo(0, frame.y + frame.height - 1)
+    );
     disable_raw_mode()?;
-    // Leave the shell prompt on a fresh line below the final frame.
     println!();
     result
 }
 
-fn event_loop(mut terminal: Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::Result<()> {
+fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::Result<()> {
     let mut height = desired_height(app);
     loop {
         let wanted = desired_height(app);
         if wanted != height {
-            terminal = resize_terminal(terminal, wanted)?;
+            resize_terminal(terminal, wanted)?;
             height = wanted;
         }
 
