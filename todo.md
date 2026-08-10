@@ -73,12 +73,19 @@
 - [ ] **Variables / let bindings** — survey Forth (and RPL/HP48 local vars,
   `LSTO`/`→`) for approaches before committing to a model. Question: named
   registers vs. a proper binding scope; how they interact with undo.
-- [ ] **Constants** — `pi`, `e`, `tau`; maybe `phi`. (Recommend starting with
-  `pi`/`e`/`tau`.)
-- [ ] **Functions** — the requested `sin cos sqrt exp log ln`, plus recommend:
-  `tan`, inverses (`asin acos atan`), `abs`, `inv` (1/x), `pow`/`^`, `floor
-  ceil round`. Note: trig needs an **angle mode** (rad/deg), which is exactly
-  the kind of state the `Engine` struct was set up to hold.
+- [x] **Constants** — `pi`, `e`, `tau`, in `ops/number.rs`'s `constants` table
+  (plain values, not primitives, so they are shadowable like any binding).
+  `phi` was the "maybe" and stayed out.
+- [x] **Functions** — all of them: `sin cos tan`, the inverses `asin acos
+  atan`, `sqrt exp log ln`, `abs`, `inv`, `^`, `floor ceil round`. Beyond the
+  list too: `atan2 log2 logb max min neg trunc`.
+  - [ ] **Angle mode** — still open, and deliberately not taken yet. Trig is
+    radians, with `to_deg`/`to_rad` as explicit conversions, which needs no
+    engine state and no mode indicator in the UI — a `180 to_rad sin` says what
+    it means where a hidden mode does not. `Engine` was set up to hold state
+    like this (its docs cite angle mode as the example), so the door is open;
+    the question is whether entering degrees directly is common enough to be
+    worth a mode you can forget you are in.
 
 ## TUI
 - [x] **Basic readline editing** — a `LineEditor` (text + a caret byte-offset)
