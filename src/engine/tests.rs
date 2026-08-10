@@ -775,12 +775,29 @@ fn indexed_words_take_their_level_off_the_stack() {
     assert_eq!(run("1 2 3 2 drop-at").stack(), &[1.0, 3.0]);
     // `drop-to` clears the whole run down to that level, not the one item at it.
     assert_eq!(run("1 2 3 2 drop-to").stack(), &[1.0]);
-    assert_eq!(run("1 2 3 2 swapn").stack(), &[2.0, 1.0, 3.0]);
+    assert_eq!(run("1 2 3 2 swap-at").stack(), &[1.0, 3.0, 2.0]);
+    assert_eq!(run("1 2 3 3 swap-to").stack(), &[3.0, 2.0, 1.0]);
 }
 
 #[test]
-fn a_swapn_at_the_bottom_has_nothing_below() {
-    assert_eq!(run_err("1 2 3 3 swapn"), ErrorKind::StackUnderflow);
+fn the_swap_family_reaches_for_the_top_not_the_neighbour() {
+    // Both ends of the span, or the whole span reversed. They agree up to the
+    // arity — level 1 is the identity for both, level 2 is the usual swap, and
+    // level 3 has only one item between the ends — and part company at 4.
+    assert_eq!(run("1 2 1 swap-at").stack(), run("1 2").stack());
+    assert_eq!(run("1 2 1 swap-to").stack(), run("1 2").stack());
+    assert_eq!(run("1 2 2 swap-at").stack(), run("1 2 swap").stack());
+    assert_eq!(run("1 2 2 swap-to").stack(), run("1 2 swap").stack());
+    assert_eq!(run("1 2 3 3 swap-at").stack(), run("1 2 3 swap3").stack());
+
+    assert_eq!(run("1 2 3 4 4 swap-at").stack(), &[4.0, 2.0, 3.0, 1.0]);
+    assert_eq!(run("1 2 3 4 4 swap-to").stack(), &[4.0, 3.0, 2.0, 1.0]);
+
+    // Reaching for the top means there is no "nothing below" case: any level
+    // the stack actually has works, where exchanging with the neighbour below
+    // used to fail at the bottom.
+    assert_eq!(run("1 2 3 3 swap-at").stack(), &[3.0, 2.0, 1.0]);
+    assert_eq!(run_err("1 2 3 4 swap-at"), ErrorKind::StackUnderflow);
 }
 
 #[test]
@@ -813,12 +830,13 @@ fn a_level_out_of_range_underflows() {
 #[test]
 fn indexed_words_are_named_for_their_index() {
     // The naming decision: an indexed shuffle says so in its name. The dup pair
-    // spells out which target it takes — `-at` one item, `-to` a run — and the
-    // rest still carry the older `n` suffix. They're bound in the prelude and
+    // spells out which target it takes — `-at` positioned at a level, `-to`
+    // spanning the top down to it — and roll still carries the older `n` suffix,
+    // having only the one axis. They're bound in the prelude and
     // render as their word (a captured primitive Displays by name).
     let base = prelude();
     for name in [
-        "dup-at", "dup-to", "drop-at", "drop-to", "rolln", "rolldn", "swapn",
+        "dup-at", "dup-to", "drop-at", "drop-to", "swap-at", "swap-to", "rolln", "rolldn",
     ] {
         let bound = base.get(name).expect("indexed word bound in the prelude");
         assert_eq!(bound.to_string(), name);

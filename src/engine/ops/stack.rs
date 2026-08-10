@@ -1,7 +1,8 @@
 //! Stack-shuffle words, and the level-indexed surgery they are all built on.
 //!
-//! This module *owns* the surgery — `dup_at`/`dup_to`/`drop_at`/`drop_to`/`swap_at`/
-//! `roll_at`/`rolld_at`, levels 1-based with level 1 the top of stack. [`Engine`]
+//! This module *owns* the surgery — `dup_at`/`dup_to`/`drop_at`/`drop_to`/
+//! `swap_at`/`swap_to`/`roll_at`/`rolld_at`, levels 1-based with level 1 the top
+//! of stack. [`Engine`]
 //! re-exposes what the TUI's cursor edits drive, so a caller outside the
 //! vocabulary can ask for one directly; the definitions are here, with the words.
 //!
@@ -10,11 +11,12 @@
 //! of `rolln`. The table is grouped by family with the indexed forms at the head
 //! of each, so a group reads as one operation and the names it answers to.
 //!
-//! Two ways to name a target, and `dup`/`drop` have both: `-at` takes the single
-//! item *at* a level (`over` is `2 dup-at`, `nip` is `2 drop-at`), `-to` takes
-//! the whole run from the top down *to* it (`dup2` is `2 dup-to`, `drop2` is
-//! `2 drop-to`). They coincide at level 1, which is why bare `dup` and `drop`
-//! need no qualifier.
+//! Two ways to name a target: `-at` is the operation *positioned at* a level
+//! (`over` is `2 dup-at`, `nip` is `2 drop-at`), `-to` is the one *spanning* the
+//! top down to it (`dup2` is `2 dup-to`, `drop2` is `2 drop-to`). Where both
+//! exist they coincide at the family's arity, and that is where its bare word
+//! sits: `dup`/`drop` at 1, `swap` at 2 — `rot` at 3, though roll has no `-to`
+//! at all, being a span operation already.
 //!
 //! `tuck`/`dupd` are pop/push rearrangements no index names, and
 //! `clear` is the machine's stack reset.
@@ -76,11 +78,28 @@ pub(in crate::engine) fn drop_to(e: &mut Engine, level: usize) -> Result<(), Err
     Ok(())
 }
 
-/// Exchange the value at `level` with the one just below it. `swap` = 1.
+/// Exchange the value **at** `level` with the top, leaving everything between
+/// them where it is — `a … b -- b … a`. `swap` = 2; level 1 is the identity.
+///
+/// Reaching for the top rather than for the neighbour below is what makes level
+/// 1 the degenerate case instead of level `depth`: there is always a top, so
+/// this cannot fail for any level the stack has.
 pub(in crate::engine) fn swap_at(e: &mut Engine, level: usize) -> Result<(), ErrorKind> {
     let i = index_of_level(e, level).ok_or(ErrorKind::StackUnderflow)?;
-    let j = index_of_level(e, level + 1).ok_or(ErrorKind::StackUnderflow)?;
-    e.stack.swap(i, j);
+    let top = e.stack.len() - 1; // a valid level implies a non-empty stack
+    e.stack.swap(i, top);
+    Ok(())
+}
+
+/// Reverse the values from the top down **to** `level` — `a b c -- c b a` at 3.
+/// `swap` = 2; level 1 is the identity.
+///
+/// The width form, and it needs only `level` values where exchanging two blocks
+/// of `level` would need twice that — so it is defined for every n, not just the
+/// ones with room for a partner.
+pub(in crate::engine) fn swap_to(e: &mut Engine, level: usize) -> Result<(), ErrorKind> {
+    let start = index_of_level(e, level).ok_or(ErrorKind::StackUnderflow)?;
+    e.stack[start..].reverse();
     Ok(())
 }
 
@@ -125,9 +144,13 @@ pub(super) static PRIMITIVES: &[Primitive] = &[
     Primitive { name: "drop2",  run: |e| drop_to(e, 2) },  // a b --
     Primitive { name: "drop3",  run: |e| drop_to(e, 3) },  // a b c --
 
-    // Exchange. Self-inverse, so there is no `un` half.
-    Primitive { name: "swapn",  run: |e| indexed(e, swap_at) },
-    Primitive { name: "swap",   run: |e| swap_at(e, 1) },  // a b -- b a
+    // Exchange, both self-inverse so there is no `un` half. The bare word sits
+    // at 2, not 1 — a family's shorthand lands on its arity, and level 1 here is
+    // the identity. `-at` moves just the two ends, `-to` reverses the span.
+    Primitive { name: "swap-at", run: |e| indexed(e, swap_at) },
+    Primitive { name: "swap-to", run: |e| indexed(e, swap_to) },
+    Primitive { name: "swap",   run: |e| swap_at(e, 2) },  // a b -- b a
+    Primitive { name: "swap3",  run: |e| swap_to(e, 3) },  // a b c -- c b a
 
     // Move, and its inverse. No bare form: both are identity at level 1, which
     // is why the shorthands sit at 3.

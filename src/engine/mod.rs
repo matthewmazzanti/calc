@@ -612,7 +612,7 @@ impl Engine {
         ops::stack::drop_at(self, level)
     }
 
-    /// Exchange the value at `level` with the one just below it. `swap` = 1.
+    /// Exchange the value at `level` with the top (`swap` = 2, `swap-at`).
     pub fn swap_at(&mut self, level: usize) -> Result<(), ErrorKind> {
         ops::stack::swap_at(self, level)
     }

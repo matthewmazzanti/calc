@@ -244,7 +244,7 @@ pub(super) enum Action {
     Dup(usize),
     /// Remove the value at a level. Level 1 is `drop`, level 2 `nip`.
     Drop(usize),
-    /// Exchange a level with the one just below it. Level 1 is `swap`.
+    /// Exchange a level with the top. Level 2 is `swap`; level 1 is a no-op.
     Swap(usize),
     /// Move the value at a level up to the top. Level 3 is `rot`.
     Roll(usize),
@@ -301,7 +301,8 @@ impl std::fmt::Display for Action {
             Self::Drop(2) => f.write_str("nip"),
             Self::Drop(level) => write!(f, "drop-at {level}"),
             Self::Swap(1) => f.write_str("swap"),
-            Self::Swap(level) => write!(f, "swapn {level}"),
+            Self::Swap(2) => f.write_str("swap"),
+            Self::Swap(level) => write!(f, "swap-at {level}"),
             Self::Roll(3) => f.write_str("rot"),
             Self::Roll(level) => write!(f, "rolln {level}"),
             Self::Rolld(3) => f.write_str("unrot"),
@@ -1447,13 +1448,17 @@ mod tests {
 
     #[test]
     fn a_failed_change_does_not_load_the_register() {
-        // Only a change that happened is repeatable. The swap underflows on a
-        // one-value stack, so `.` still holds the drop — had the failure loaded
-        // the register, `.` would attempt a swap and leave the stack alone.
+        // Only a change that happened is repeatable. The line fails, so `.`
+        // still holds the drop before it — had the failure loaded the register,
+        // `.` would run the bad line again and leave the stack alone.
         let mut app = stacked("1 2");
         ch(&mut app, 'x'); // drop -> [1]
-        ch(&mut app, 's'); // swap wants two values: underflow
+
+        ch(&mut app, 'i');
+        typ(&mut app, "nope"); // an unbound word
+        press(&mut app, KeyCode::Enter);
         assert!(matches!(app.notice, Some(Notice::Error(_))));
+        press(&mut app, KeyCode::Esc);
 
         ch(&mut app, '.');
         assert!(app.stack().is_empty()); // the drop ran again
