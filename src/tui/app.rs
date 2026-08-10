@@ -246,11 +246,12 @@ pub(super) enum Action {
     Drop(usize),
     /// Exchange a level with the top. Level 2 is `swap`; level 1 is a no-op.
     Swap(usize),
-    /// Move the value at a level up to the top. Level 3 is `rot`.
-    Roll(usize),
-    /// Move the top value down to a level — the inverse of [`Action::Roll`].
-    /// Level 3 is `unrot`.
-    Rolld(usize),
+    /// Rotate the span down to a level upward, bringing it to the top. Level 3
+    /// is `rot`.
+    Rot(usize),
+    /// Rotate it the other way — the inverse of [`Action::Rot`]. Level 3 is
+    /// `unrot`.
+    Unrot(usize),
     /// A line that was parsed and run — kept as the program, not the text.
     /// `^P` is the way back to what you typed; this is the way back to what it
     /// did, so a repeat costs no re-parse and can't fail differently.
@@ -264,8 +265,8 @@ impl Action {
             Self::Dup(level) => engine.dup_at(*level).map_err(CalcError::from),
             Self::Drop(level) => engine.drop_at(*level).map_err(CalcError::from),
             Self::Swap(level) => engine.swap_at(*level).map_err(CalcError::from),
-            Self::Roll(level) => engine.roll_at(*level).map_err(CalcError::from),
-            Self::Rolld(level) => engine.rolld_at(*level).map_err(CalcError::from),
+            Self::Rot(level) => engine.rot_to(*level).map_err(CalcError::from),
+            Self::Unrot(level) => engine.unrot_to(*level).map_err(CalcError::from),
             Self::Cmd(program) => engine.apply(program),
         }
     }
@@ -278,15 +279,15 @@ impl Action {
             Self::Dup(_) => Self::Dup(level),
             Self::Drop(_) => Self::Drop(level),
             Self::Swap(_) => Self::Swap(level),
-            Self::Roll(_) => Self::Roll(level),
-            Self::Rolld(_) => Self::Rolld(level),
+            Self::Rot(_) => Self::Rot(level),
+            Self::Unrot(_) => Self::Unrot(level),
             Self::Cmd(program) => Self::Cmd(program.clone()),
         }
     }
 }
 
 /// The info-bar label. A shuffle reads as the fixed word at the level that word
-/// names — `drop` *is* `drop-at 1`, `rot` *is* `rolln 3`, which is why the level
+/// names — `drop` *is* `drop-at 1`, `rot` *is* `rot-to 3`, which is why the level
 /// is matched in the pattern — and as the `n`-suffixed word plus the level
 /// anywhere else. A `Cmd` reads as its canonical program text, which is not
 /// necessarily the text that was typed.
@@ -303,10 +304,10 @@ impl std::fmt::Display for Action {
             Self::Swap(1) => f.write_str("swap"),
             Self::Swap(2) => f.write_str("swap"),
             Self::Swap(level) => write!(f, "swap-at {level}"),
-            Self::Roll(3) => f.write_str("rot"),
-            Self::Roll(level) => write!(f, "rolln {level}"),
-            Self::Rolld(3) => f.write_str("unrot"),
-            Self::Rolld(level) => write!(f, "rolldn {level}"),
+            Self::Rot(3) => f.write_str("rot"),
+            Self::Rot(level) => write!(f, "rot-to {level}"),
+            Self::Unrot(3) => f.write_str("unrot"),
+            Self::Unrot(level) => write!(f, "unrot-to {level}"),
             Self::Cmd(program) => {
                 for (i, element) in program.iter().enumerate() {
                     if i > 0 {
@@ -474,14 +475,14 @@ impl App {
             KeyCode::Char('s') => {
                 self.update(Action::Swap(self.cursor));
             }
-            // `h`/`l` are the roll pair, and inverses of each other: `h` brings
+            // `h`/`l` are the rot pair, and inverses of each other: `h` brings
             // the selected value up to the top, `l` sends the top back down to
             // the selection. On the cursor's own level both are no-ops.
             KeyCode::Char('h') => {
-                self.update(Action::Roll(self.cursor));
+                self.update(Action::Rot(self.cursor));
             }
             KeyCode::Char('l') => {
-                self.update(Action::Rolld(self.cursor));
+                self.update(Action::Unrot(self.cursor));
             }
             // Ctrl-R redoes, vim-style.
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => self.redo(),
@@ -869,7 +870,7 @@ mod tests {
         ch(&mut app, 'j'); // cursor at level 3, where the top should land
         ch(&mut app, 'l');
         assert_eq!(app.stack(), &[3.0, 1.0, 2.0]);
-        assert_eq!(cmd(&app), "unrot"); // unrot *is* rolldn 3
+        assert_eq!(cmd(&app), "unrot"); // unrot *is* unrot-to 3
     }
 
     #[test]
@@ -1068,7 +1069,7 @@ mod tests {
     #[test]
     fn a_cursor_edit_is_labelled_by_the_word_that_names_it() {
         // The fixed shuffle is the one defined at that level — `drop` *is*
-        // `drop-at 1`, `rot` *is* `rolln 3` — so the same key labels differently
+        // `drop-at 1`, `rot` *is* `rot-to 3` — so the same key labels differently
         // depending on where the cursor sits.
         let mut app = stacked("1 2 3");
         ch(&mut app, 'x'); // cursor at the top
@@ -1086,7 +1087,7 @@ mod tests {
         assert_eq!(app.cursor, 2);
         ch(&mut app, 'j');
 
-        ch(&mut app, 'h'); // rot is rolln 3, so at level 3 it is plain `rot`
+        ch(&mut app, 'h'); // rot is rot-to 3, so at level 3 it is plain `rot`
         assert_eq!(cmd(&app), "rot");
         assert_eq!(app.stack(), &[2.0, 3.0, 1.0]);
     }

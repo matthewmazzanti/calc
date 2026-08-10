@@ -770,8 +770,8 @@ fn indexed_words_take_their_level_off_the_stack() {
     assert_eq!(run("1 2 3 3 dup-at").stack(), &[1.0, 2.0, 3.0, 1.0]);
     // `dup-to` takes the whole run down to that level, not the one item at it.
     assert_eq!(run("1 2 3 2 dup-to").stack(), &[1.0, 2.0, 3.0, 2.0, 3.0]);
-    assert_eq!(run("1 2 3 3 rolln").stack(), &[2.0, 3.0, 1.0]);
-    assert_eq!(run("1 2 3 3 rolldn").stack(), &[3.0, 1.0, 2.0]);
+    assert_eq!(run("1 2 3 3 rot-to").stack(), &[2.0, 3.0, 1.0]);
+    assert_eq!(run("1 2 3 3 unrot-to").stack(), &[3.0, 1.0, 2.0]);
     assert_eq!(run("1 2 3 2 drop-at").stack(), &[1.0, 3.0]);
     // `drop-to` clears the whole run down to that level, not the one item at it.
     assert_eq!(run("1 2 3 2 drop-to").stack(), &[1.0]);
@@ -801,9 +801,9 @@ fn the_swap_family_reaches_for_the_top_not_the_neighbour() {
 }
 
 #[test]
-fn rolldn_inverts_rolln() {
+fn unrot_to_inverts_rot_to() {
     assert_eq!(
-        run("1 2 3 4 3 rolln 3 rolldn").stack(),
+        run("1 2 3 4 3 rot-to 3 unrot-to").stack(),
         &[1.0, 2.0, 3.0, 4.0]
     );
 }
@@ -811,7 +811,7 @@ fn rolldn_inverts_rolln() {
 #[test]
 fn a_non_integer_level_is_rejected_not_rounded() {
     assert_eq!(
-        run_err("1 2 3 2.5 rolln"),
+        run_err("1 2 3 2.5 rot-to"),
         ErrorKind::TypeError {
             expected: "integer",
             found: "float"
@@ -824,19 +824,19 @@ fn a_level_out_of_range_underflows() {
     assert_eq!(run_err("1 2 5 dup-at"), ErrorKind::StackUnderflow);
     assert_eq!(run_err("1 2 5 dup-to"), ErrorKind::StackUnderflow);
     // A level of 0 is not a valid 1-based level either.
-    assert_eq!(run_err("1 2 0 rolln"), ErrorKind::StackUnderflow);
+    assert_eq!(run_err("1 2 0 rot-to"), ErrorKind::StackUnderflow);
 }
 
 #[test]
 fn indexed_words_are_named_for_their_index() {
     // The naming decision: an indexed shuffle says so in its name. The dup pair
     // spells out which target it takes — `-at` positioned at a level, `-to`
-    // spanning the top down to it — and roll still carries the older `n` suffix,
-    // having only the one axis. They're bound in the prelude and
+    // spanning the top down to it. Rot is `-to` only, being a span operation
+    // whose ends-only form is already called `swap-at`. They're bound in the prelude and
     // render as their word (a captured primitive Displays by name).
     let base = prelude();
     for name in [
-        "dup-at", "dup-to", "drop-at", "drop-to", "swap-at", "swap-to", "rolln", "rolldn",
+        "dup-at", "dup-to", "drop-at", "drop-to", "swap-at", "swap-to", "rot-to", "unrot-to",
     ] {
         let bound = base.get(name).expect("indexed word bound in the prelude");
         assert_eq!(bound.to_string(), name);

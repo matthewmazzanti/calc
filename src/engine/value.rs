@@ -107,7 +107,7 @@ impl Value {
     }
 
     /// The integer value, or a [`ErrorKind::TypeError`]. A float is rejected
-    /// outright (no rounding), so `3.5 roll` and `3.5 nth` error rather than
+    /// outright (no rounding), so `3.5 rot-to` and `3.5 nth` error rather than
     /// guessing.
     ///
     /// Only the *type* check is shared — the range policy is the caller's,

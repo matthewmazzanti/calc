@@ -57,7 +57,7 @@ fn length(e: &mut Engine) -> Result<(), ErrorKind> {
 }
 
 /// `nth` ( [a b c] i -- x ): the 0-based `i`th element. List indexing is 0-based
-/// (other-language convention), unlike the 1-based `dup-at`/`rolln` — so the
+/// (other-language convention), unlike the 1-based `dup-at`/`rot-to` — so the
 /// index is type-checked by [`Value::as_int`](crate::engine::Value) but *not*
 /// clamped the way a stack level is: a negative is out of range, not level 0.
 fn nth(e: &mut Engine) -> Result<(), ErrorKind> {

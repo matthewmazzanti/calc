@@ -1,21 +1,21 @@
 //! Stack-shuffle words, and the level-indexed surgery they are all built on.
 //!
 //! This module *owns* the surgery — `dup_at`/`dup_to`/`drop_at`/`drop_to`/
-//! `swap_at`/`swap_to`/`roll_at`/`rolld_at`, levels 1-based with level 1 the top
+//! `swap_at`/`swap_to`/`rot_to`/`unrot_to`, levels 1-based with level 1 the top
 //! of stack. [`Engine`]
 //! re-exposes what the TUI's cursor edits drive, so a caller outside the
 //! vocabulary can ask for one directly; the definitions are here, with the words.
 //!
 //! **The indexed word is the general form; every fixed shuffle is one of them
 //! with its level written in** — `drop` is level 1 of `drop-at`, `rot` is level 3
-//! of `rolln`. The table is grouped by family with the indexed forms at the head
+//! of `rot-to`. The table is grouped by family with the indexed forms at the head
 //! of each, so a group reads as one operation and the names it answers to.
 //!
 //! Two ways to name a target: `-at` is the operation *positioned at* a level
 //! (`over` is `2 dup-at`, `nip` is `2 drop-at`), `-to` is the one *spanning* the
 //! top down to it (`dup2` is `2 dup-to`, `drop2` is `2 drop-to`). Where both
 //! exist they coincide at the family's arity, and that is where its bare word
-//! sits: `dup`/`drop` at 1, `swap` at 2 — `rot` at 3, though roll has no `-to`
+//! sits: `dup`/`drop` at 1, `swap` at 2, `rot` at 3 — though rot has no `-at`
 //! at all, being a span operation already.
 //!
 //! `tuck`/`dupd` are pop/push rearrangements no index names, and
@@ -105,17 +105,23 @@ pub(in crate::engine) fn swap_to(e: &mut Engine, level: usize) -> Result<(), Err
     Ok(())
 }
 
-/// Move the value at `level` up to the top. `rot` = 3, `rolln`.
-pub(in crate::engine) fn roll_at(e: &mut Engine, level: usize) -> Result<(), ErrorKind> {
+/// Rotate the span from the top down **to** `level` upward, bringing level
+/// `level` to the top (`rot` = 3, `rot-to`).
+///
+/// A span operation, which is why there is no `-at` half: moving a level to the
+/// top while leaving the middle untouched is impossible — the displaced top has
+/// to go somewhere, and the only place that disturbs nothing else is where the
+/// level came from. That op exists and is called [`swap_at`].
+pub(in crate::engine) fn rot_to(e: &mut Engine, level: usize) -> Result<(), ErrorKind> {
     let i = index_of_level(e, level).ok_or(ErrorKind::StackUnderflow)?;
     let v = e.stack.remove(i);
     e.stack.push(v);
     Ok(())
 }
 
-/// Move the top value down to `level` — the inverse of [`roll_at`].
-/// `unrot` = 3, `rolldn`.
-pub(in crate::engine) fn rolld_at(e: &mut Engine, level: usize) -> Result<(), ErrorKind> {
+/// Rotate the same span downward, sending the top to `level` — the inverse of
+/// [`rot_to`] (`unrot` = 3, `unrot-to`).
+pub(in crate::engine) fn unrot_to(e: &mut Engine, level: usize) -> Result<(), ErrorKind> {
     let dest = index_of_level(e, level).ok_or(ErrorKind::StackUnderflow)?;
     // `dest` is where the top must land. Popping first leaves every index
     // ≤ dest unchanged (dest ≤ len - 1), so we can insert straight in.
@@ -154,12 +160,12 @@ pub(super) static PRIMITIVES: &[Primitive] = &[
     Primitive { name: "swap",   run: |e| swap_at(e, 2) },  // a b -- b a
     Primitive { name: "swap3",  run: |e| swap_to(e, 3) },  // a b c -- c b a
 
-    // Move, and its inverse. No bare form: both are identity at level 1, which
-    // is why the shorthands sit at 3.
-    Primitive { name: "rolln",  run: |e| indexed(e, roll_at) },
-    Primitive { name: "rolldn", run: |e| indexed(e, rolld_at) },
-    Primitive { name: "rot",    run: |e| roll_at(e, 3) },  // a b c -- b c a
-    Primitive { name: "unrot",  run: |e| rolld_at(e, 3) }, // a b c -- c a b
+    // Rotate the span, either way. `-to` only: the ends-only form of "bring a
+    // level to the top" is `swap-at`, so there is no `rot-at` to write.
+    Primitive { name: "rot-to", run: |e| indexed(e, rot_to) },
+    Primitive { name: "unrot-to", run: |e| indexed(e, unrot_to) },
+    Primitive { name: "rot",    run: |e| rot_to(e, 3) },   // a b c -- b c a
+    Primitive { name: "unrot",  run: |e| unrot_to(e, 3) }, // a b c -- c a b
 
     // Rearrangements no index names, and the machine's stack reset.
     Primitive { name: "tuck",   run: tuck },               // a b -- b a b

@@ -617,15 +617,16 @@ impl Engine {
         ops::stack::swap_at(self, level)
     }
 
-    /// Move the value at `level` up to the top. `rot` = 3, `rolln`.
-    pub fn roll_at(&mut self, level: usize) -> Result<(), ErrorKind> {
-        ops::stack::roll_at(self, level)
+    /// Rotate the span down to `level` upward, bringing it to the top
+    /// (`rot` = 3, `rot-to`).
+    pub fn rot_to(&mut self, level: usize) -> Result<(), ErrorKind> {
+        ops::stack::rot_to(self, level)
     }
 
-    /// Move the top value down to `level` — the inverse of [`Engine::roll_at`].
-    /// `unrot` = 3, `rolldn`.
-    pub fn rolld_at(&mut self, level: usize) -> Result<(), ErrorKind> {
-        ops::stack::rolld_at(self, level)
+    /// Rotate it the other way, sending the top down to `level` — the inverse
+    /// of [`Engine::rot_to`] (`unrot` = 3, `unrot-to`).
+    pub fn unrot_to(&mut self, level: usize) -> Result<(), ErrorKind> {
+        ops::stack::unrot_to(self, level)
     }
 }
 
