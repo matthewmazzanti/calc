@@ -444,73 +444,6 @@ impl Engine {
         }
     }
 
-    /// The `Vec` index for a 1-based level (level 1 == top of stack), or `None`
-    /// if the level is out of range. Callers turn `None` into a `StackUnderflow`
-    /// with a `let-else` early return. A mark counts as an ordinary level — the
-    /// shuffles move and copy marks like any other value, so a collection is not
-    /// a sealed scope.
-    fn index_of_level(&self, level: usize) -> Option<usize> {
-        let len = self.stack.len();
-        (1..=len).contains(&level).then(|| len - level)
-    }
-
-    /// Copy the value at `level` to the top (`dup` = 1, `over` = 2, `pickn`).
-    pub(crate) fn pick_at(&mut self, level: usize) -> Result<(), ErrorKind> {
-        let i = self
-            .index_of_level(level)
-            .ok_or(ErrorKind::StackUnderflow)?;
-        let v = self.stack[i].clone();
-        self.stack.push(v);
-        Ok(())
-    }
-
-    /// Remove the value at `level` (`drop` = 1, `nip` = 2, `dropn`).
-    pub(crate) fn drop_at(&mut self, level: usize) -> Result<(), ErrorKind> {
-        let i = self
-            .index_of_level(level)
-            .ok_or(ErrorKind::StackUnderflow)?;
-        self.stack.remove(i);
-        Ok(())
-    }
-
-    /// Exchange the value at `level` with the one just below it. `swap` = 1.
-    pub(crate) fn swap_at(&mut self, level: usize) -> Result<(), ErrorKind> {
-        let i = self
-            .index_of_level(level)
-            .ok_or(ErrorKind::StackUnderflow)?;
-        let j = self
-            .index_of_level(level + 1)
-            .ok_or(ErrorKind::StackUnderflow)?;
-        self.stack.swap(i, j);
-        Ok(())
-    }
-
-    /// Move the value at `level` up to the top. `rot` = 3, `rolln`.
-    pub(crate) fn roll_at(&mut self, level: usize) -> Result<(), ErrorKind> {
-        let i = self
-            .index_of_level(level)
-            .ok_or(ErrorKind::StackUnderflow)?;
-        let v = self.stack.remove(i);
-        self.stack.push(v);
-        Ok(())
-    }
-
-    /// Move the top value down to `level` — the inverse of `roll_at`.
-    /// `unrot` = 3, `rolldn`.
-    pub(crate) fn rolld_at(&mut self, level: usize) -> Result<(), ErrorKind> {
-        let dest = self
-            .index_of_level(level)
-            .ok_or(ErrorKind::StackUnderflow)?;
-        // `dest` is where the top must land. Popping first leaves every index
-        // ≤ dest unchanged (dest ≤ len - 1), so we can insert straight in.
-        let v = self
-            .stack
-            .pop()
-            .expect("level ≥ 1 implies a non-empty stack");
-        self.stack.insert(dest, v);
-        Ok(())
-    }
-
     /// `]`: collect the values above the topmost mark into a `List`, consuming
     /// the mark. Fails with `UnmatchedClose` when no collection is open. The
     /// collected values are, by the region discipline, all non-marks — so the
@@ -653,6 +586,50 @@ impl Engine {
     pub(crate) fn bind(&mut self, name: Rc<str>, value: Value) {
         let frame = self.binding_frame();
         self.env.bind(frame, name, value);
+    }
+}
+
+/// **Stack edits driven from outside the language.** Everything above is reached
+/// by *running* something — a program, a word, a value. These are the edits a
+/// caller asks for directly, without a program to run: the TUI's cursor keys,
+/// which name the edit they want so it hits the stack instead of being resolved
+/// as a (rebindable) word.
+///
+/// They are a separate block because that is a separate contract. Levels are
+/// 1-based, level 1 == the top of stack, and each is a single failure away from
+/// leaving the stack untouched — the caller's transaction is what makes a
+/// sequence of them atomic, exactly as for [`Engine::apply`]. The behavior is
+/// defined in [`ops::stack`] alongside the words built on the same surgery;
+/// these are the machine's public face on it.
+impl Engine {
+    /// Copy the value at `level` to the top (`dup` = 1, `over` = 2, `pickn`).
+    pub fn pick_at(&mut self, level: usize) -> Result<(), ErrorKind> {
+        ops::stack::pick_at(self, level)
+    }
+
+    /// Remove the value at `level` (`drop` = 1, `nip` = 2, `dropn`).
+    pub fn drop_at(&mut self, level: usize) -> Result<(), ErrorKind> {
+        ops::stack::drop_at(self, level)
+    }
+
+    /// Exchange the value at `level` with the one just below it. `swap` = 1.
+    pub fn swap_at(&mut self, level: usize) -> Result<(), ErrorKind> {
+        ops::stack::swap_at(self, level)
+    }
+
+    /// Move the value at `level` up to the top. `rot` = 3, `rolln`.
+    pub fn roll_at(&mut self, level: usize) -> Result<(), ErrorKind> {
+        ops::stack::roll_at(self, level)
+    }
+
+    /// Move the top value down to `level` — the inverse of [`Engine::roll_at`].
+    /// `unrot` = 3, `rolldn`.
+    // Exposed for completeness rather than for a caller: this interface is the
+    // set of edits the machine offers, and `roll_at`/`rolld_at` are inverses.
+    // Nothing in the TUI binds it yet — normal mode has no `unrot` key.
+    #[allow(dead_code)]
+    pub fn rolld_at(&mut self, level: usize) -> Result<(), ErrorKind> {
+        ops::stack::rolld_at(self, level)
     }
 }
 

@@ -27,7 +27,8 @@ mod env;
 mod generic;
 mod list;
 mod number;
-mod stack;
+// Owns the level-indexed stack surgery, which `Engine` re-exposes as methods.
+pub(super) mod stack;
 
 /// Every primitive across the group tables, in order — the source the prelude
 /// binds into the global frame. Adding a module is one row.
