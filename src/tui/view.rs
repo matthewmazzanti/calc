@@ -11,7 +11,6 @@ use ratatui::Frame;
 use crate::engine::CalcError;
 
 use super::app::{App, Mode, Notice};
-use super::MAX_STACK_ROWS;
 
 pub(super) fn render(frame: &mut Frame, app: &App) {
     // Command line, then the stack, then the info line (0 rows when empty —
@@ -72,18 +71,25 @@ fn stack_lines(app: &App) -> Vec<Line<'static>> {
     if depth == 0 {
         return vec![Line::from("(empty)").dim()];
     }
-    let last = (app.top() + MAX_STACK_ROWS as usize - 1).min(depth);
-    (app.top()..=last)
-        .map(|level| {
-            let value = &app.stack()[depth - level];
-            let label = format!("{level:>3}: ");
-            if app.mode() == Mode::Normal && level == app.cursor() {
-                Line::from(format!("{label}{value}")).reversed()
-            } else {
-                Line::from(vec![Span::raw(label).dim(), Span::raw(value.to_string())])
-            }
-        })
-        .collect()
+    let values = (app.top()..=app.visible_last()).map(|level| {
+        let value = &app.stack()[depth - level];
+        let label = format!("{level:>3}: ");
+        if app.mode() == Mode::Normal && level == app.cursor() {
+            Line::from(format!("{label}{value}")).reversed()
+        } else {
+            Line::from(vec![Span::raw(label).dim(), Span::raw(value.to_string())])
+        }
+    });
+
+    let above = app.more_above().then(ellipsis).into_iter();
+    let below = app.more_below().then(ellipsis).into_iter();
+    above.chain(values).chain(below).collect()
+}
+
+/// The marker for a stack that continues past the window, indented to sit under
+/// the level labels.
+fn ellipsis() -> Line<'static> {
+    Line::from("  ...").dim()
 }
 
 /// The info line: the current error, a note, or the last command run. Mode is

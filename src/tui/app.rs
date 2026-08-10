@@ -474,6 +474,30 @@ impl App {
         self.top
     }
 
+    /// The deepest level on screen.
+    pub(super) fn visible_last(&self) -> usize {
+        (self.top + MAX_STACK_ROWS as usize - 1).min(self.depth())
+    }
+
+    /// Whether the stack continues past the window, in either direction — each
+    /// is worth a `...` row, and a row to draw it in.
+    pub(super) fn more_above(&self) -> bool {
+        self.top > 1
+    }
+
+    pub(super) fn more_below(&self) -> bool {
+        self.visible_last() < self.depth()
+    }
+
+    /// Rows the stack area needs: one per visible value, plus one for each
+    /// `...`. The markers are *extra* rather than taking a value's place —
+    /// hiding a value to report that values are hidden defeats itself.
+    pub(super) fn stack_rows(&self) -> usize {
+        self.depth().clamp(1, MAX_STACK_ROWS as usize)
+            + usize::from(self.more_above())
+            + usize::from(self.more_below())
+    }
+
     pub(super) fn notice(&self) -> Option<&Notice> {
         self.notice.as_ref()
     }
@@ -1069,6 +1093,39 @@ mod tests {
 
         ch(&mut app, 'k');
         assert_eq!(app.top, 2); // back inside the window, so it stays put
+    }
+
+    #[test]
+    fn the_markers_track_which_way_the_stack_continues() {
+        let rows = MAX_STACK_ROWS as usize;
+        let mut app = deep(15);
+        assert!(!app.more_above()); // at the top of the stack
+        assert!(app.more_below());
+        assert_eq!(app.stack_rows(), rows + 1);
+
+        // Walking one past the window scrolls by one, leaving stack in both
+        // directions. Note it takes a *scroll* to get here: `k` from the bottom
+        // would only move the cursor inside the window, not the window.
+        for _ in 0..rows {
+            ch(&mut app, 'j');
+        }
+        assert_eq!(app.top, 2);
+        assert!(app.more_above());
+        assert!(app.more_below());
+        assert_eq!(app.stack_rows(), rows + 2);
+
+        ch(&mut app, 'G');
+        assert!(app.more_above());
+        assert!(!app.more_below()); // at the bottom
+        assert_eq!(app.stack_rows(), rows + 1);
+    }
+
+    #[test]
+    fn a_stack_inside_the_window_has_no_markers() {
+        let app = deep(3);
+        assert!(!app.more_above());
+        assert!(!app.more_below());
+        assert_eq!(app.stack_rows(), 3);
     }
 
     #[test]

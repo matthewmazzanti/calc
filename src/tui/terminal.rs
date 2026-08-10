@@ -14,14 +14,13 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use super::app::{App, Mode};
 use super::view::render;
-use super::MAX_STACK_ROWS;
 
 /// Height the inline viewport should have: the command line, the info line (only
-/// when it has something to show), and one row per stack value (1..MAX).
+/// when it has something to show), and the stack area — one row per visible
+/// value plus a row for each `...` marker.
 fn desired_height(app: &App) -> u16 {
-    let stack_rows = app.depth().clamp(1, MAX_STACK_ROWS as usize) as u16;
     let chrome = 1 + u16::from(app.has_info());
-    chrome + stack_rows
+    chrome + app.stack_rows() as u16
 }
 
 fn new_terminal(height: u16) -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
