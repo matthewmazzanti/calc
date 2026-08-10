@@ -75,11 +75,15 @@
   keeping the buffer. Prompt is `'`, beam cursor like insert. Still a natural
   home for the structured literals below (complex `(re, im)`, matrix `[…]`) and
   future HP48-style `'…'` symbolic/name entry.
-- [ ] **Command-line history** — recall previous committed entries (up/down),
-  shell- / HP48-`LAST CMD`-style. Distinct from undo (that reverts *stack state*;
-  this recalls *text you typed*). Pairs with readline: recall → edit → re-run.
-  A `LASTARG`-style recall of the args the last command consumed is a related
-  variant.
+- [x] **Command-line history** — a `LineHistory` beside the `LineEditor`: the
+  committed lines plus the position of a `^P`/`^N` walk through them, recalled as
+  typed (not `describe`'s canonical form). Only lines that *ran* are recorded,
+  consecutive duplicates collapse, and the buffer the walk started from is
+  stashed as a draft that `^N` restores on stepping past the newest entry.
+  Capped at 256 like `MAX_UNDO`. Distinct from undo (that reverts *stack state*;
+  this recalls *text you typed*). Still open: arrows as aliases for `^P`/`^N`,
+  incremental search (`^R`), and a `LASTARG`-style recall of the args the last
+  command consumed.
 - [x] **Reclaim the info line** — only reserve its row when there's something to
   show (an error, or a `cmd`); otherwise give the row back to the stack. Ties
   into the dynamic viewport height (`CHROME_ROWS` would become conditional).
