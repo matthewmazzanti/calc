@@ -16,8 +16,10 @@ pub enum MarkKind {
 }
 
 /// A value on the stack. Started as a bare `f64`; now a small sum type so the
-/// stack can hold more than numbers. Grows further later (functions). No longer
-/// `Copy` — `Str`/`List` own heap data.
+/// stack can hold more than numbers — including [`Value::Function`], which is
+/// what makes a word and a value the same kind of thing. No longer `Copy`:
+/// `Str`/`List` own heap data. Still to come is the numeric tower (bignum,
+/// exact reals, complex, matrix); see `todo.md`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     /// An integer. Preserved through `+ - *` and `neg` when both operands are
@@ -27,7 +29,7 @@ pub enum Value {
     /// to it. A real numeric tower (rationals, complex) comes later.
     Num(f64),
     /// A boolean — a genuine type, not Forth's 0/-1. Produced by comparisons
-    /// and the boolean words, and (later) consumed by `if`.
+    /// and the boolean words, and consumed by `if`.
     Bool(bool),
     /// A string. Heap-shared via `Rc`, so a clone (a `dup`, a lookup) is a
     /// refcount bump; concatenation copies-on-write via `Rc::make_mut`. Built by

@@ -63,7 +63,7 @@ fn command_line(app: &App) -> Line<'_> {
 }
 
 /// The stack, shallowest visible level first, deeper levels below, the selected
-/// level highlighted and labels dimmed. A stack taller than [`MAX_STACK_ROWS`]
+/// level highlighted and labels dimmed. A stack taller than `MAX_STACK_ROWS`
 /// scrolls under the window, so the first row is `app.top()` rather than level 1.
 /// Only what lies *below* is marked, and with a count: what lies above is
 /// already counted by the first row's level number.

@@ -412,7 +412,7 @@ pub(super) struct App {
     /// the top of stack). Kept clamped to the stack, or 1 when empty.
     cursor: usize,
     /// Shallowest level on screen — the stack scrolls under a fixed window when
-    /// it outgrows [`MAX_STACK_ROWS`]. Derived from the cursor rather than
+    /// it outgrows `MAX_STACK_ROWS`. Derived from the cursor rather than
     /// stored per state: it is where you are *looking*, not part of the
     /// calculator, so undo doesn't restore it and `:clear` resets it with the
     /// rest of the view.

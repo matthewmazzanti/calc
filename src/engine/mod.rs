@@ -41,13 +41,20 @@ type Stack = Vec<Value>;
 
 /// A primitive operation: a name paired with its dispatch target — a free
 /// function over the [`Engine`]. A primitive is *data*, not an enum tag, so
-/// adding one is a single table row (see the [`ops`] modules) and the prelude,
-/// word resolution, and the TUI all reach it uniformly. `Copy` (a `&'static
-/// str` plus a fn pointer), so it rides in a [`Value`] cheaply. Reached only by
-/// resolving an [`Element::Word`] (a bare word, or the TUI dispatching one
-/// directly), never present in a program. Once functions land, the derived
-/// words (`over`, `rot`, `nip`, …) move out of these tables into an in-language
-/// prelude, leaving only the true primitives.
+/// adding one is a single table row (see the [`ops`] modules), which the prelude
+/// and word resolution both reach uniformly. `Copy` (a `&'static str` plus a fn
+/// pointer), so it rides in a [`Value`] cheaply.
+///
+/// **Reached only by resolving an [`Element::Word`]**, never present in a
+/// program and never dispatched from outside — which is what makes every
+/// primitive rebindable. A caller that wants a specific operation regardless of
+/// the vocabulary calls the machine method it is built on; see the stack-editing
+/// block on [`Engine`].
+///
+/// The derived words (`over`, `pick`, `nip`, …) are next to leave these tables
+/// for the in-language prelude, now that it exists — the `-at`/`-to` split makes
+/// the division mechanical, since every fixed shuffle is an indexed op at a
+/// constant level.
 #[derive(Clone, Copy)]
 pub struct Primitive {
     name: &'static str,
@@ -69,8 +76,8 @@ impl std::fmt::Debug for Primitive {
 }
 
 impl std::fmt::Display for Primitive {
-    /// The canonical word — so a captured primitive prints re-readably, and a
-    /// directly-dispatched op (a TUI operator) can be labelled in the info bar.
+    /// The canonical word, so a captured primitive prints re-readably — `dup`
+    /// fetched as a value and shown on the stack is the word you would type.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.name)
     }
@@ -216,7 +223,7 @@ impl Engine {
     /// index that failed — "here's what was running."
     ///
     /// A failed batch leaves the engine part-way through: the caller took a
-    /// [`State`] first and puts it back (see the module docs).
+    /// copy of the engine first and puts it back (see the module docs).
     pub fn apply(&mut self, program: &[Element]) -> Outcome {
         self.run(Rc::new(program.to_vec()))
     }

@@ -225,8 +225,8 @@ impl std::fmt::Display for CalcError {
 
 impl std::error::Error for CalcError {}
 
-/// The result of [`Engine::apply`]: the engine mutated in place, or a
+/// The result of [`super::Engine::apply`]: the engine mutated in place, or a
 /// [`CalcError`] naming what failed. A failure leaves the engine part-way
-/// through the batch — the caller restores the [`State`](super::State) it took
-/// beforehand.
+/// through the batch — the caller puts back the [`Engine`](super::Engine) copy
+/// it took beforehand.
 pub type Outcome = Result<(), CalcError>;
